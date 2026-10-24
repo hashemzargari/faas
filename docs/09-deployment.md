@@ -16,13 +16,17 @@ Artifacts:
 For a laptop/dev cluster, [docs/08-operations.md](08-operations.md) is the
 short path (`scripts/smoke-cluster.sh`).
 
-> **Production readiness.** The storage engine is real and tested, but several
-> pieces of the *operations* surface that a multi-site install wants are not
-> implemented yet — most importantly a PostgreSQL-backed coordinator, TLS/mTLS
-> on the coordinator, KMIP key custody, and environment/secret-file
-> configuration for the agent. They are listed with workarounds in
-> [§Known product gaps](#known-product-gaps). Deploy with those constraints in
-> mind rather than assuming them away.
+> **Production readiness.** The storage engine is real and tested. TLS/mTLS is
+> now the default on every FASS hop (fail-closed: components refuse to start
+> without certificate material), PostgreSQL is available as the production
+> metadata backend (new — see [§PostgreSQL metadata backend](#postgresql-metadata-backend)),
+> and the agent supports environment/secret-file configuration. What is still
+> missing or only measured in a drill: KMIP key custody, console SSO/RBAC, and
+> production-scale validation of the PostgreSQL backend. Those are listed in
+> [§Known product gaps](#known-product-gaps); measured behaviour (HA failover
+> 150–170 ms detection / 456–482 ms RTO / RPO 0-of-20, and the load ceiling) is
+> in the PostgreSQL section and [`test/load/REPORT.md`](../test/load/REPORT.md).
+> Plaintext remains possible only as an explicit dev opt-out — see §1.1.
 
 ---
 
@@ -35,23 +39,86 @@ short path (`scripts/smoke-cluster.sh`).
 | Console | `fass-console` | 8081 | stateless | 1 |
 | Agent | `fass-agent` | 7100+ (one per disk) | one disk (shards + `state.json`) | one per disk |
 
-Trust boundaries:
+Trust boundaries (TLS is on for all four hops by default; plaintext requires
+explicit `--dev`/`--insecure` and is visible in every `/healthz`):
 
 * **Clients → gateway**: internet/DMZ. TLS terminated by the gateway
-  (`--tls-cert/--tls-key`) or by an L4 LB.
-* **Gateway → coordinator**: control plane (JSON). No TLS in this release: use a
-  private network, VPN or service mesh; never expose port 7000 publicly.
-* **Gateway → agents**: shard traffic on 7100+ (plain HTTP today). Agents also
-  need *inbound* from every gateway, so this must be a routed storage network.
-* **Agent → coordinator**: announce/heartbeat/repair (outbound).
-* **Console → coordinator**: read-mostly JSON; console has no TLS and a single
-  Basic credential — bind it to loopback/private and front it with your TLS
-  reverse proxy + SSO.
+  (`--tls-cert/--tls-key`, S3 over HTTPS) or by an L4/L7 LB in front of it.
+* **Gateway → coordinator**: HTTPS control plane (JSON), verified against the
+  cluster CA; gateway client identity for mTLS. Port 7000 is still a control
+  plane: prefer a private network / NetworkPolicy as well as TLS.
+* **Gateway → agents**: HTTPS shard traffic on 7100+, verified against the
+  cluster CA (`--agent-tls require|auto`, `--require-mtls` for strict mode).
+  Agents need *inbound* from every gateway, so this must be a routed storage
+  network and each agent certificate must cover the name peers dial.
+* **Agent → coordinator**: HTTPS announce/heartbeat/repair (outbound), verified
+  against the cluster CA.
+* **Console → coordinator**: HTTPS. The console itself has no TLS listener and a
+  single Basic credential — bind it to loopback/private and front it with your
+  TLS reverse proxy + SSO. It trusts the cluster CA via `SSL_CERT_FILE`.
 
 The coordinator admin API (`/v1/topology`, `/v1/agents*`, `/v1/rings`,
 `/v1/redundancy-classes`, `/metrics`) is **unauthenticated** by design in v1
-(an internal mTLS service in the target architecture). Keep it on the private
-network.
+(an internal mTLS service in the target architecture). TLS protects it in
+transit, but keep it on the private network and prefer strict mTLS there too.
+
+### 1.1 TLS posture and certificate lifecycle
+
+**Default.** `tls.enabled=true` outside the dev values file. Coordinator,
+gateway and agents fail closed without certificate material; plaintext is an
+explicit dev-only opt-out (`tls.enabled=false` + `tls.allowInsecure=true` in
+Helm, `--dev`/`--insecure` for systemd) and every component reports
+`security.insecure=true` on `/healthz`.
+
+**Where certificates live.**
+
+| Deployment | Location |
+|---|---|
+| Kubernetes | existing Secrets (never chart-generated/inlined) mounted read-only under `/etc/fass/tls/{ca,server,client,s3}` |
+| systemd | `/etc/fass/tls/{ca,coordinator,gateway,gateway-client,agent,agent-client}` with `ReadOnlyPaths=/etc/fass/tls` |
+
+The CA **private key** stays on an operator workstation; only `ca.crt` is
+distributed. Agents and gateways hold server/client certificates; the
+coordinator holds its server certificate and the CA bundle used for client
+verification.
+
+**SAN checklist — the rule that stalls rollouts.** Every name a peer dials must
+be in the certificate, DNS *and* IP:
+
+* coordinator: the DNS names used in `FASS_COORDINATOR_URL`
+  (`<release>-coordinator`, `...svc`, `...svc.cluster.local`, or the external
+  site-A name);
+* gateway: the client-facing S3 name (and LB IP if clients use one);
+* agent: its announced hostname. With Kubernetes `hostNetwork=true` the agent
+  announces `status.hostIP`, so a shared cert needs every node IP; per-node
+  certs (`agents.nodes[].tlsSecret`) are cleaner. With systemd, include the node
+  FQDN **and** its management IP.
+
+An `x509: certificate is valid for X, not Y` error means exactly this: re-issue
+with the missing `--dns`/`--ip`. Generate with
+`fass-gateway pki init|issue-server|issue-client`; there is no `fass-agent pki`
+subcommand yet (agent identities are issued with the same gateway pki tool).
+
+**Expiry and rotation.** Default lifetime is 90 days; a component reloads its
+certificate **in-process** when it enters the renewal window (one third of the
+lifetime, capped at 24 h ⇒ 30 days for a 90-day cert). Rotation is therefore
+"replace the Secret/file atomically"; no restart is needed, and a restart of an
+agent is *undesirable* because it starts a repair clock. Strict-mTLS rollout
+order: TLS everywhere with `requireMTLS=false`, verify
+`security.insecure=false` on every `/healthz`, then enable `requireMTLS` in one
+change. **Caveat:** the console has no client-certificate support yet, so strict
+mTLS requires `console.enabled=false` (or front the console with a proxy that
+terminates mTLS); the chart therefore refuses `tls.requireMTLS=true` while the
+console is enabled.
+
+**If the CA is lost** (private key destroyed, no backup): you cannot issue or
+enroll *new* certificates, and after the current certificates expire the
+existing agents/gateways/coordinator can no longer verify each other. Existing
+agents keep working until expiry — nothing breaks instantly — but plan a full
+re-enrollment with a new CA (and expect a maintenance window) because there is
+no cross-signed CA bundle support in this release. Back up the CA key offline,
+test the restore, and treat it as a first-class secret like the gateway key
+seed. Full command runbook: [docs/08 §4](08-operations.md).
 
 ---
 
@@ -89,7 +156,7 @@ console:
   enabled: true
 agents:
   enabled: true
-  coordinatorURL: http://coordinator.site-a.internal:7000   # agents announce here
+  coordinatorURL: https://coordinator.site-a.internal:7000   # agents announce here
 ```
 
 ```yaml
@@ -98,12 +165,12 @@ coordinator:
   enabled: false
 gateway:
   enabled: true
-  coordinatorURL: http://coordinator.site-a.internal:7000
+  coordinatorURL: https://coordinator.site-a.internal:7000
 console:
   enabled: false
 agents:
   enabled: true
-  coordinatorURL: http://coordinator.site-a.internal:7000
+  coordinatorURL: https://coordinator.site-a.internal:7000
 ```
 
 Constraints:
@@ -112,8 +179,9 @@ Constraints:
   agent `--node-id` must equal the Kubernetes node name (the chart sets this);
 * the coordinator's **Node** ids must also match across releases — create them
   with the bootstrap API in §3.3;
-* cross-site coordinator traffic needs a VPN/private link (no coordinator TLS
-  yet);
+* cross-site coordinator traffic is HTTPS and must be verified against the
+  cluster CA; a VPN/private link is still recommended for the admin API. The
+  coordinator certificate must include the site-A DNS name peers dial;
 * the site-A coordinator is a single point of control (not of data: reads/writes
   continue through gateway caches briefly, but placements/commits need it).
 
@@ -281,12 +349,67 @@ Label nodes by site if you use `nodeSelector` for gateways:
 kubectl label node node-a1 fass.io/nexus=nexus-a
 ```
 
-### 4.3 Create the required Secrets
+### 4.3 Create the CA and certificates (TLS is the default)
 
-The chart never creates Secrets and deliberately fails rendering when a
-reference is missing. Plain placeholders are for illustration only.
+Do this before installing; the chart only references Secrets and fails rendering
+when a TLS reference is empty. The CA key stays on your workstation — it is
+never needed at runtime.
 
 ```bash
+# CA (offline key; distribute only ca.crt)
+fass-gateway pki init --dir ./pki/ca --cn fass-cluster-ca
+
+# Coordinator — SANs must include every DNS name gateways/agents dial.
+# With the in-chart Service those are (adjust release/namespace):
+fass-gateway pki issue-server --ca-dir ./pki/ca --dir ./pki/coordinator \
+  --dns fass-coordinator \
+  --dns fass-coordinator.fass.svc \
+  --dns fass-coordinator.fass.svc.cluster.local
+# For a per-site release add the external name/IP clients use, e.g. --dns coordinator.site-a.example
+
+# Gateway S3 listener (client-facing name + LB IP) and gateway mTLS client identity
+fass-gateway pki issue-server --ca-dir ./pki/ca --dir ./pki/gateway \
+  --dns s3.site-a.example --ip 203.0.113.10
+fass-gateway pki issue-client --ca-dir ./pki/ca --dir ./pki/gateway-client \
+  --identity gateway-1
+
+# One agent certificate per node. The chart runs agents with hostNetwork=true,
+# so an agent announces status.hostIP: include that node IP (and FQDN).
+fass-gateway pki issue-server --ca-dir ./pki/ca --dir ./pki/agent-node-a1 \
+  --ip 10.0.0.11 --dns node-a1.example.internal
+# Shared agent repair client identity (or one per agent if your policy requires it)
+fass-gateway pki issue-client --ca-dir ./pki/ca --dir ./pki/agent-client --identity agent-client
+```
+
+Every name/IP a peer dials must be a SAN (**DNS or IP**) — see §1.1. A missing
+SAN produces `x509: certificate is valid for X, not Y` at the first handshake,
+not at startup.
+
+### 4.4 Create the required Secrets
+
+The chart never creates or generates Secrets. Plain placeholders are for
+illustration only.
+
+```bash
+# Cluster CA public certificate (only ca.crt; never the CA key).
+kubectl -n fass create secret generic fass-ca --from-file=ca.crt=./pki/ca/ca.crt
+
+# Coordinator listener identity (cert and key as tls.crt/tls.key).
+kubectl -n fass create secret generic fass-coordinator-tls \
+  --from-file=tls.crt=./pki/coordinator/tls.crt --from-file=tls.key=./pki/coordinator/tls.key
+
+# Gateway: S3 listener + clientAuth identity for agent/coordinator mTLS.
+kubectl -n fass create secret tls fass-gateway-tls \
+  --cert=./pki/gateway/tls.crt --key=./pki/gateway/tls.key
+kubectl -n fass create secret generic fass-gateway-client-tls \
+  --from-file=tls.crt=./pki/gateway-client/tls.crt --from-file=tls.key=./pki/gateway-client/tls.key
+
+# Agents: one listener Secret per node (values .tlsSecret) + shared repair identity.
+kubectl -n fass create secret generic fass-agent-node-a1-tls \
+  --from-file=tls.crt=./pki/agent-node-a1/tls.crt --from-file=tls.key=./pki/agent-node-a1/tls.key
+kubectl -n fass create secret generic fass-agent-client-tls \
+  --from-file=tls.crt=./pki/agent-client/tls.crt --from-file=tls.key=./pki/agent-client/tls.key
+
 # Gateway tenant key seed: 64 hex chars. LOSING THIS MAKES EXISTING DATA UNREADABLE.
 kubectl -n fass create secret generic fass-gateway-key-seed --from-literal=key-seed="$(openssl rand -hex 32)"
 # (for a real install, import the seed you already custody — do not generate a new one on reinstall)
@@ -296,18 +419,14 @@ kubectl -n fass create secret generic fass-gateway-key-seed --from-literal=key-s
 kubectl -n fass create secret generic fass-coordinator-db-dsn \
   --from-literal=dsn='postgres://fass:CHANGEME@postgres.example:5432/fass?sslmode=require'
 
-# Gateway TLS
-kubectl -n fass create secret tls fass-gateway-tls --cert=gateway.crt --key=gateway.key
-
-# Console HTTP Basic
+# Console HTTP Basic (the console itself is plaintext HTTP behind a TLS proxy).
 kubectl -n fass create secret generic fass-console-auth \
   --from-literal=console-user=admin --from-literal=console-password="$(openssl rand -base64 24)"
 
-# One announce secret per disk — created after registering the disk with the
-# coordinator; see §4.4.
+# One announce secret per disk — created after registering the disk; see §4.5.
 ```
 
-### 4.4 Register nodes and disks, then install
+### 4.5 Register nodes and disks, then install
 
 The coordinator is the source of truth for topology; the chart deploys
 processes, it does not create cluster metadata. With PostgreSQL the chart's
@@ -319,29 +438,30 @@ coordinator pods start (migrations are never applied implicitly on restart;
 Bootstrap order:
 
 ```bash
-COORD=http://coordinator.site-a.internal:7000
+COORD=https://coordinator.site-a.internal:7000
 
 # 1. Swarm
-curl -sS -X POST $COORD/v1/swarms -H 'Content-Type: application/json' \
+CACERT=./pki/ca/ca.crt   # every admin call below is HTTPS and CA-verified
+curl -sS --cacert $CACERT -X POST $COORD/v1/swarms -H 'Content-Type: application/json' \
   -d '{"name":"prod-swarm","region":"eu-west-1"}'
 # → {"swarm_id":"...", ...}
 
 # 2. Nexuses (one per site)
-curl -sS -X POST $COORD/v1/nexuses -H 'Content-Type: application/json' \
+curl -sS --cacert $CACERT -X POST $COORD/v1/nexuses -H 'Content-Type: application/json' \
   -d '{"swarm_id":"<swarm-id>","nexus_id":"nexus-a","name":"site-a","region":"eu-west-1"}'
 # repeat for nexus-b, nexus-c
 
 # 3. Nodes. node_id MUST equal the Kubernetes node name (the chart passes it
 #    as --node-id from agents.nodes[].name).
-curl -sS -X POST $COORD/v1/nodes -H 'Content-Type: application/json' \
+curl -sS --cacert $CACERT -X POST $COORD/v1/nodes -H 'Content-Type: application/json' \
   -d '{"node_id":"node-a1","nexus_id":"nexus-a","hostname":"node-a1","rack":"rack-a1"}'
 
 # 4. Redundancy Class (immutable; geo 2+1 / local 16+4 / aag 2 / 16 MiB chunks)
-curl -sS -X POST $COORD/v1/redundancy-classes -H 'Content-Type: application/json' \
+curl -sS --cacert $CACERT -X POST $COORD/v1/redundancy-classes -H 'Content-Type: application/json' \
   -d '{"name":"prod-rc","params":{"geo_n":2,"geo_k":1,"local_n":16,"local_k":4},"aag":2,"chunk_size":16777216}'
 
 # 5. Per disk: register a pending agent and store its one-time announce secret.
-curl -sS -X POST $COORD/v1/agents/pending -H 'Content-Type: application/json' \
+curl -sS --cacert $CACERT -X POST $COORD/v1/agents/pending -H 'Content-Type: application/json' \
   -d '{"node_id":"node-a1","disk_id":"disk0"}'
 # → {"agent_id":"...","secret":"..."}
 kubectl -n fass create secret generic fass-agent-node-a1-disk0 --from-literal=secret='<secret>'
@@ -354,8 +474,8 @@ helm install fass ./deploy/helm/fass -n fass -f my-three-site.yaml
 
 # Agents announce as `pending`; activation is an explicit operator decision.
 # (The console does this with CSRF-protected POSTs; or via the API.)
-for id in $(curl -sS $COORD/v1/agents | jq -r '.agents[] | select(.state!="active") | .agent_id'); do
-  curl -sS -X POST "$COORD/v1/agents/$id/activate"
+for id in $(curl -sS --cacert $CACERT $COORD/v1/agents | jq -r '.agents[] | select(.state!="active") | .agent_id'); do
+  curl -sS --cacert $CACERT -X POST "$COORD/v1/agents/$id/activate"
 done
 ```
 
@@ -363,7 +483,7 @@ Create the Ring **after** the agents are ACTIVE (the coordinator auto-fills ring
 membership from active agents in the listed Nexuses and sums their capacity):
 
 ```bash
-curl -sS -X POST $COORD/v1/rings -H 'Content-Type: application/json' \
+curl -sS --cacert $CACERT -X POST $COORD/v1/rings -H 'Content-Type: application/json' \
   -d '{"name":"prod-ring","rc_id":"<rc-id>","nexus_ids":["nexus-a","nexus-b","nexus-c"]}'
 ```
 
@@ -372,16 +492,16 @@ Then create tenants/projects/buckets/access keys through the coordinator API
 /v1/access-keys`). S3 access keys are **not** injected into any pod: they are
 client credentials, custody them in your secret manager.
 
-### 4.5 Verify
+### 4.6 Verify
 
 ```bash
 kubectl -n fass get pods -o wide
 kubectl -n fass rollout status deploy -l app.kubernetes.io/component=gateway
 
 fass --endpoint https://s3.site-a.example health
-fass --coordinator $COORD cluster status           # expect N total, N ACTIVE, ring, RC ratio
-curl -fsS $COORD/v1/repair/status | jq .
-curl -fsS -u admin:<pw> http://console:8081/ | grep -c 'Cluster overview'
+SSL_CERT_FILE=./pki/ca/ca.crt fass --coordinator $COORD cluster status   # expect N total, N ACTIVE, ring, RC ratio
+curl --cacert ./pki/ca/ca.crt -fsS $COORD/v1/repair/status | jq .
+curl -fsS -u admin:<pw> http://console:8081/ | grep -c 'Cluster overview'   # console plaintext behind proxy
 ```
 
 ---
@@ -410,6 +530,14 @@ sudo systemctl enable --now fass-gateway
 sudo install -m 0600 -o root -g fass deploy/systemd/examples/agent.env.example /etc/fass/agent-disk0.env
 sudo systemctl enable --now fass-agent@disk0
 ```
+
+The systemd path assumes the TLS layout `/etc/fass/tls/{ca,coordinator,gateway,
+gateway-client,agent,agent-client}` and read-only `ReadOnlyPaths=/etc/fass/tls`;
+step-by-step CA generation, SAN rules, permissions, ordering and the
+restart-free certificate rotation procedure are in
+[deploy/systemd/README.md](../deploy/systemd/README.md). The coordinator must be
+up and trusted before agents start; check each component's `/healthz` security
+block (`insecure=false`) after the rollout.
 
 Logs are in the journal (`journalctl -u fass-coordinator -f`,
 `journalctl -u fass-agent@disk0 -f`); see the README for the disk layout
@@ -444,7 +572,13 @@ convention (`/var/lib/fass/disks/<instance>`), which the units use for
      unhealthy will not receive traffic.
    * Key-seed and RC parameters must remain identical across the rollout.
 
-3. **Agents last, one failure domain at a time.**
+3. **Certificates before binaries, when the release changes TLS.** Issue
+   replacement certificates with SANs for the *new* names first, install them
+   (they reload in-process), verify handshakes, and only then roll binaries. For
+   strict mTLS, roll every component with the old `require_mtls` posture, then
+   flip `tls.requireMTLS`/`--require-mtls` as a separate, reversible change.
+
+4. **Agents last, one failure domain at a time.**
    * Restarting an agent stops its heartbeats: the coordinator marks it SUSPECT
      after 15 s and OFFLINE after 60 s, which starts the repair clock for every
      shard set it hosted.
@@ -457,6 +591,8 @@ convention (`/var/lib/fass/disks/<instance>`), which the units use for
    * Agents persist identity + shards; a binary upgrade does not touch
      `state.json`. The unit's `ExecStartPre` only checks environment/mount; the
      agent itself fails closed on an identity mismatch.
+   * Certificate rotation for agents does **not** need a restart (reload happens
+     in-process); only flag changes require one.
 
 ```bash
 # Kubernetes, coordinator then gateways then agents (one node at a time)
@@ -487,12 +623,15 @@ sudo systemctl restart fass-agent@disk0
   fixed build. Check before/after:
 
   ```bash
-  curl -fsS http://coordinator:7000/v1/healthz | jq .schema_version
+  curl --cacert ca.crt -fsS https://coordinator:7000/v1/healthz | jq .schema_version
   ```
 
 * **Helm**: `helm history fass -n fass` and `helm rollback fass <revision> -n
   fass`. PVCs are retained; the coordinator Deployment uses `Recreate`, so no
   two pods ever mount the store simultaneously.
+* **Certificates**: a binary rollback needs no certificate rollback (old and new
+  binaries speak the same TLS 1.3 profile). Keep the previous certificate
+  Secrets/material until the rollout is confirmed; do not revoke the old CA.
 * Never delete a coordinator PVC as a "reset": that is the cluster metadata
   (buckets, manifests, access keys). Shards alone cannot reconstruct objects.
 
@@ -508,7 +647,10 @@ sudo systemctl restart fass-agent@disk0
 | Spread one shard-set wider than `aag` per node "for safety" | Placement will not use the extra slots; size by **nodes**, not disks. |
 | Restart a whole Nexus during an upgrade | That is a site-loss event; repair starts while you are still upgrading. |
 | Rotate/replace the gateway key seed casually | Existing objects were encrypted under it and become unreadable. Seed custody is a first-class secret. |
-| Expose the coordinator (7000) or console (8081) directly to the internet | Coordinator admin is unauthenticated; console has one shared Basic credential and no TLS. |
+| Expose the coordinator (7000) or console (8081) directly to the internet | TLS protects transport, but coordinator admin is unauthenticated and the console has one shared Basic credential and no TLS listener; front both with a proxy/private network. |
+| Run with `tls.enabled=false`/`--insecure` in production | Plaintext is a dev-only opt-out; every `/healthz` reports `security.insecure=true`. |
+| Rotate the CA without re-issuing every certificate | There is no cross-signed CA bundle: peers verify against one CA. Issue the new CA and roll all certificates in order. |
+| Lose the CA private key | You cannot enroll new agents/gateways; existing ones fail verification when their certs expire. Back it up offline (like the key seed). |
 | Delete `/var/lib/fass` (coordinator) or an agent's `state.json` to "fix" a failure | That deletes metadata/identity. Restore, don't reset. |
 | Upgrade all agents in one `rollout restart` | Starts repair storms and may make a shard set temporarily unreadable beyond `local_k`. |
 
@@ -518,12 +660,15 @@ sudo systemctl restart fass-agent@disk0
 |---|---|---|
 | Cluster health | `fass --coordinator URL cluster status` | agents `N total, N ACTIVE`; no SUSPECT/OFFLINE; RC ratio as designed |
 | Agent states | same output / console `/agents` | all ACTIVE, last heartbeat seconds ago |
-| Repair queue | `curl -s URL/v1/repair/status \| jq .` | `queue.pending` low/steady, `failed=0`, `shardsets.unrecoverable=0` (**non-zero = data loss, page someone**) |
+| Repair queue | `curl --cacert ca.crt -s https://coordinator:7000/v1/repair/status \| jq .` | `queue.pending` low/steady, `failed=0`, `shardsets.unrecoverable=0` (**non-zero = data loss, page someone**) |
 | Ring fullness | `fass --coordinator URL cluster status` | ring FULL < 85%; above that, place a new Ring |
-| Disk pressure | `curl -s http://agent:71xx/metrics \| grep fass_agent_\(free\|used\)_bytes` | free bytes comfortably above reserve |
-| Scrub | `curl -s http://agent:71xx/v1/stats \| jq .` | scrub cursor advancing (period default 7 days); `POST /v1/scrub` kicks an ad-hoc pass |
-| Gateway readiness | `curl -fsS http://gw:9000/readyz` | `{"status":"ready"}` (coordinator reachable) |
-| Coordinator errors | `curl -s URL/metrics \| grep 'status="5'` | no unexplained 5xx growth |
+| Disk pressure | `curl --cacert ca.crt -s https://agent:71xx/metrics \| grep fass_agent_\(free\|used\)_bytes` | free bytes comfortably above reserve |
+| Scrub | `curl --cacert ca.crt -s https://agent:71xx/v1/stats \| jq .` | scrub cursor advancing (period default 7 days); `POST /v1/scrub` kicks an ad-hoc pass |
+| Gateway readiness | `curl -fsS http://gw:9000/readyz` | `{"status":"ready"}` (admin listener is plaintext loopback) |
+| TLS posture | `curl --cacert ca.crt -fsS https://coordinator:7000/healthz \| jq .security` (and each agent `/v1/healthz`) | `insecure=false`, `require_mtls` as intended, `not_after` outside the renewal window |
+| Certificate expiry | `fass --coordinator https://coordinator:7000 cluster status` (agents report `cert_not_after`) | no renewal-window warnings; rotate before expiry |
+| PostgreSQL load ceiling | `test/load/REPORT.md` / `make load` (manual gate) | p99 within 20% of the recorded baseline per op type |
+| Coordinator errors | `curl --cacert ca.crt -s https://coordinator:7000/metrics \| grep 'status="5'` | no unexplained 5xx growth |
 | Console | open `/`; red banner means coordinator unreachable, red repair card means data loss | green/amber; degrade is by design, it should not white-screen |
 
 Capacity growth: when a Ring crosses 85%, create a new Ring for the same RC and
@@ -543,39 +688,47 @@ loudly rather than pretending they are supported.
    create the DSN Secret, and run migrations through the chart hook (or the
    subcommand for systemd). Validate failover and upgrade paths in staging
    before relying on it for the control plane.
-2. **No TLS/mTLS on the coordinator** (docs/07 describes mTLS for production).
-   Coordinator↔gateway/agent traffic must be wrapped by a private network, VPN
-   or service mesh; add TLS flags before exposing a coordinator across sites.
-3. **Agent has no environment/secret-file configuration.** It reads flags only,
-   so (a) the Helm chart renders one pinned Deployment per node instead of one
-   DaemonSet per Nexus (each disk has a distinct one-time announce secret, and
-   Kubernetes cannot vary a `secretKeyRef` per DaemonSet pod), and (b) the
-   systemd unit and pod spec expand the announce secret into the process
-   command line. A `--secret-file` (or env-var configuration) would let the
-   chart collapse to one DaemonSet per Nexus and keep secrets out of argv.
+2. **No certificate manager integration and no cross-signed CA rollover.** The
+   chart/systemd consume existing Secrets/files; issuing/rotating certs is an
+   operator runbook (`fass-gateway pki`), not a cert-manager/ACME integration.
+   There is no CA-bundle rotation: a CA change means re-issuing every identity.
+   Losing the CA key means no new enrollments and eventual verification failure
+   as existing certs expire (existing agents work until then) — see §1.1.
+3. **No `fass-agent pki` subcommand.** Agent certificates are issued with
+   `fass-gateway pki issue-server|issue-client` (same CA tool, documented; not
+   an invented agent command). Related: the Helm chart still renders one pinned
+   Deployment per node instead of one DaemonSet per Nexus because every disk has
+   a distinct one-time announce Secret that Kubernetes cannot vary per pod; the
+   agent's env/secret-file support removed the argv-secret problem but not the
+   per-node secret injection.
 4. **No KMIP/key service.** Only `--key-seed`/`FASS_GATEWAY_KEY_SEED` static
    single-key mode exists; KMIP 1.4 (docs/03 §3.3) is not implemented. Today
    the seed is a manually custodied secret; the chart requires its Secret.
-5. **Console is single-credential Basic auth, no TLS, no RBAC/OIDC.** Bind to
-   loopback/private and front with a TLS reverse proxy + SSO. (Tracked as
-   multi-tenant console work, not a deployment bug.)
+5. **Console is single-credential Basic auth, no TLS listener, no client
+   certificate, no RBAC/OIDC.** It trusts the cluster CA via `SSL_CERT_FILE` and
+   talks to an https coordinator, but it cannot present a client certificate:
+   strict mTLS requires the console to be disabled (or fronted by a proxy).
+   Bind it to loopback/private and front with a TLS reverse proxy + SSO.
+   (Tracked as multi-tenant console work, not a deployment bug.)
 6. **No object-store/Ingress resources in the chart.** The chart exposes
    ClusterIP services and leaves LB/Ingress/TLS-termination choices to the
    platform; this is deliberate, but means "install + expose to clients" is two
    steps.
-7. **`deploy/docker/compose.dev.yml` is stale** relative to the binaries: it
-   passes flags that do not exist (`--dev`, `--dev-topology`, `--default-rc`,
-   agent `--listen`) and environment variables the agent does not read
-   (`FASS_COORDINATOR_URL`, `FASS_AGENT_SECRET`). The working dev path is
-   `scripts/smoke-cluster.sh` / docs/08. (Reported to the Lead; outside this
-   task's write scope.)
+7. **No chart end-to-end test in CI.** `make deploy-lint` renders every values
+   file and diffs the flags/env against the binaries' `--help`, but there is no
+   kind/minikube cluster in this environment, so a real `helm install` has not
+   been exercised here. The docker path (`make dev`) covers the same components
+   with plaintext dev switches; treat first install as a staging exercise.
 
 ## 11. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `helm template` fails with "coordinator.replicas > 1" | tried to run an HA control plane | stay at 1 replica until the Postgres backend lands |
-| Pods `CreateContainerConfigError` / missing Secret | chart references a Secret that does not exist | create the key-seed/TLS/console/agent Secrets listed in §4.3 |
+| `helm template` fails with "coordinator.replicas > 1" | tried to run an HA control plane on the embedded store | set `coordinator.dbDriver=postgres` + a DSN Secret, or keep replicas=1 |
+| Pods `CreateContainerConfigError` / missing Secret | chart references a Secret that does not exist | create the Secrets listed in §4.4 (CA, coordinator, gateway, agent, key seed, console, DSN) |
+| Component exits `refusing to start ... TLS` / `TLS is required` | non-dev start is fail-closed; no cert material | provide the TLS Secrets/paths for that component, or use `--dev`/`--insecure` only in a throwaway dev stack |
+| `x509: certificate is valid for X, not Y` | the dialed name (DNS or IP) is not a SAN | re-issue with the missing `--dns`/`--ip` (see §1.1 SAN checklist); with hostNetwork agents include each node IP |
+| Handshake fails right after replacing certificates | file replaced non-atomically, or the process cached the old cert outside the renewal window | install cert/key atomically; reload happens in-process inside the renewal window (no restart needed) |
 | Agent pod CrashLoopBackOff, log "identity mismatch"/"refusing" | disk reused with a different `state.json` identity | use the identity that owns the disk; never delete `state.json` to bypass |
 | Agent announces `pending` and stays there | activation is explicit | `POST /v1/agents/{id}/activate` (or the console) |
 | Placement fails `507 … not enough eligible nexuses/agents` | declared topology < RC requirement, or agents not ACTIVE | check `nodes ≥ ceil((local_n+local_k)/aag)`, agents ACTIVE, ring spans `geo_n+geo_k` Nexuses |
@@ -636,12 +789,18 @@ drill" gap **for the control-plane metadata path**. It does not close these:
 #    production; the server defaults to --db-migrate-on-start=false.
 fass-coordinator migrate --db-dsn "postgres://fass@db1:5432/fass?sslmode=verify-full"
 
-# 2. Run the coordinator against it.
+# 2. Run the coordinator against it. TLS is fail-closed outside --dev, so a real
+#    deployment always passes its listener certificate (plus mTLS if strict).
 fass-coordinator \
   --db-driver=postgres \
   --db-dsn "postgres://fass@db1:5432/fass?sslmode=verify-full" \
   --db-max-open-conns 40 --db-max-idle-conns 10 \
-  --db-statement-timeout 5s
+  --db-statement-timeout 5s \
+  --tls-cert /etc/fass/tls/coordinator/tls.crt \
+  --tls-key  /etc/fass/tls/coordinator/tls.key \
+  --tls-client-ca /etc/fass/tls/ca/ca.crt --require-mtls
+#    (drop --tls-client-ca/--require-mtls during a server-auth-only rollout;
+#     --dev is the only way to run plaintext and is for throwaway dev only)
 ```
 
 A bad DSN or a missing schema fails at startup with an actionable error; it never
@@ -722,8 +881,10 @@ Reference run, reproducible with `go test -tags=ha -count=1 ./test/ha/ -v`
 Ranges are across three consecutive reference runs, not a statistical sample.
 
 These are single-run numbers from a dev-mode coordinator (embedded bootstrap,
-plaintext listener) on one machine, with tiny objects; they measure failover
-*mechanics*, not a production SLO. Reproduce:
+plaintext listener at the time of the drill) on one machine, with tiny objects;
+they measure failover *mechanics*, not a production SLO. TLS changes handshakes,
+not the metadata commit/loss mechanics, but failover under a TLS/mTLS deployment
+has not been re-measured — see "Not tested". Reproduce:
 
 ```bash
 # Requires docker (starts and cleans up its own containers/network/volume).
@@ -753,35 +914,80 @@ transactions that hold back vacuum; a coordinator with a stuck statement (the
 for the table size on the actual cluster; the migration values are a starting
 point, not a universal answer.
 
-### Load-test results (PostgreSQL adapter, measured 2026-10-24)
+### Load-test results and write-path attribution (PostgreSQL adapter, 2026-10-24)
 
-First ceiling measurement of the PostgreSQL-backed coordinator under a mixed S3
-workload (disposable `postgres:16` with `shared_buffers=256MB`, coordinator,
-12 agents, 2 gateways; 60 s measured window after 20 s warmup). Full per-phase
-table, JSON artifact, contention analysis and gate results:
-[`test/load/REPORT.md`](../test/load/REPORT.md). Reproduce with `make load`
-(or `go test -tags=load -count=1 ./test/load/ -v`).
+Ceiling measurement of the PostgreSQL-backed coordinator under a mixed S3 workload
+(disposable `postgres:16` with `shared_buffers=256MB`, coordinator, 12 agents,
+2 gateways; 20 s warmup + 60 s measured, then contention/read-only/diagnostic
+phases). Full tables, JSON artifacts and gate results:
+[`test/load/REPORT.md`](../test/load/REPORT.md). Reproduce with `make load`.
 
-**Headline numbers (one reference run; ±2× run-to-run variance on a shared box —
-report a ceiling, not an SLO):**
+**Mixed phase, per payload class and op (reference run `run-20261024T133436Z.json`):**
 
-| op | p50 | p99 | throughput |
-|---|---:|---:|---:|
-| PUT (4 KiB / 1 MiB / occasional 12 MiB) | 662 ms | 958 ms | 48 ops/s (10.9 MiB/s) |
-| GET (hot + random) | 44 ms | 168 ms | 315 ops/s (66.5 MiB/s) |
-| ListObjectsV2 (paged) | 342 ms | 588 ms | 17 ops/s |
-| version listing (coordinator API) | 120 ms | 228 ms | 16 ops/s |
-| read-only GET phase | 19 ms | 109 ms | 690 ops/s |
+| op | n | p50 | p99 | throughput |
+|---|---:|---:|---:|---:|
+| PUT 4 KiB | 2 509 | 659 ms | 1 415 ms | 42 ops/s |
+| PUT 1 MiB | 280 | 687 ms | 998 ms | 4.7 ops/s |
+| PUT 12 MiB | 30 | 880 ms | 1 232 ms | 0.5 ops/s |
+| GET (hot + random) | 18 263 | 45 ms | 207 ms | 304 ops/s (65 MiB/s) |
+| ListObjectsV2 (paged) | 930 | 380 ms | 917 ms | 15.5 ops/s |
+| version listing (coordinator API) | 889 | 129 ms | 296 ms | 15 ops/s |
+| read-only GET phase | 7 580 | 18 ms | 81 ms | 758 ops/s |
 
 **Hard gates all passed:** 200/200 sampled PUT→GET byte-identical; **0**
-non-retryable 5xx (and 0 retryable 503 in this run); **0 deadlocks**, max 39 lock
-waiters capped by the 40-connection pool during the 200-way single-key contention
-storm (serialized-by-design signature, not a convoy); max 41/200 PostgreSQL
-connections (no exhaustion); `kv` dead tuples 33 → 963 peak → **17** after
-autovacuum (reclaimed); no repair/scrub interference.
+non-retryable 5xx; **0 deadlocks** (max 38 lock waiters, capped by the 40-conn
+pool, during the 200-way contention storm); max 42/200 PostgreSQL connections;
+`kv` dead tuples 21 → 867 peak → 171 after autovacuum (reclaimed); no repair/scrub
+interference.
 
-**What this does not show:** a longer/sustained churn run (bloat under hours of
-tombstones), degraded/failed-disk conditions, WAN latency between sites, or
-failover under load. HA-under-load is the natural next drill: the workload
-harness can be combined with the `test/ha` crash/promote sequence to measure the
-client-visible error/latency spike across the measured 456–482 ms failover window.
+#### Attribution: the bottleneck is the coordinator commit, not disk fsync
+
+The earlier hypothesis (each PUT writes 12 fsync-bound shards) is **not supported
+by the measurements**:
+
+| phase | p50 |
+|---|---:|
+| coordinator `/v1/placement` | 32 ms |
+| coordinator `/v1/objects:commit` | **523 ms** |
+| agent shard PUT (transport wall time, incl. fsync) | **0.31 ms** (p99 5.7 ms) |
+| client PUT total (all classes) | 663 ms |
+| remainder (EC encode + shard wave + gateway overhead) | ~108 ms (16%) |
+
+At ~62 shard writes/s per agent, the agents are idle by comparison: 12 fsyncs of
+a 4 KiB object is write amplification, but it does not explain the latency. The
+time is spent while the PUT waits on **`/v1/objects:commit`**.
+
+Three diagnostic phases (4 KiB PUTs, same gateways/agents) narrow it further:
+
+| scenario | PUT p50 | coordinator commit p50 |
+|---|---:|---:|
+| 1 writer, no contention | **6.4 ms** | **2.0 ms** |
+| 16 writers, same bucket | 45 ms | — |
+| 16 writers, 16 separate buckets | 26 ms | **14.8 ms** |
+
+Commit service time is ~2 ms with no contention; shared-row serialization amplifies
+it by ~7× at 16 writers even across separate buckets. The commit transaction uses
+`SELECT … FOR UPDATE` on the bucket row and on a **single global version-sequence
+counter row**, so every PUT contends on shared rows. At the mixed phase's higher
+concurrency the queue grows further (commit throughput ≈ 62/s vs the box's raw
+commit capacity measured by the Lead at ~5 300/s), but the 523 ms p50 at 60
+concurrent workers is larger than the 16-writer diagnostic predicts — so the
+remaining gap needs statement-level/adapter timing before it is fully attributed.
+
+**Fix candidates in expected-value order (none implemented yet — measurement
+first):**
+1. Stop serializing every commit on the global version-seq counter (per-key
+   sequence, database sequence, or ordering by latest record): the multi-bucket
+   diagnostic shows contention remains even with zero bucket sharing.
+2. Drop `FOR UPDATE` from read-only reads in the commit transaction (bucket
+   metadata, version-id idempotency lookup); only the latest row needs locking.
+3. Reduce DB round trips per commit (batch the version + latest + blob + sequence
+   writes).
+4. Agent-side fsync batching is **not** justified by this data (shard writes are
+   ~0.3 ms); small-object RC routing via SDP may still help capacity/cost, but it
+   would not fix the observed latency.
+
+**Not shown by this test:** long/sustained churn (bloat over hours), degraded
+disks/WAN latency, failover under load. HA-under-load remains the next drill:
+combine this harness with `test/ha`'s crash/promote sequence to measure the client
+spike across the measured 456–482 ms failover window.

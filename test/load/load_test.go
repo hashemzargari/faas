@@ -116,6 +116,44 @@ func pct(sorted []float64, p float64) float64 {
 	return sorted[idx]
 }
 
+// combined merges latency samples of several op kinds (e.g. the three PUT
+// classes) into one summary, keeping each class visible separately too.
+func (m *meter) combined(kinds ...string) latSummary {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out latSummary
+	var vals []float64
+	for _, kind := range kinds {
+		if st := m.stats[kind]; st != nil {
+			out.N += st.N
+			out.Errors += st.Errors
+			out.Err503 += st.Err503
+			out.Err5xx += st.Err5xx
+			out.Err4xx += st.Err4xx
+			out.NetErrs += st.NetErrs
+			out.Bytes += st.Bytes
+		}
+		for _, d := range m.lat[kind] {
+			vals = append(vals, float64(d.Microseconds())/1000.0)
+		}
+	}
+	sort.Float64s(vals)
+	out.P50ms = pct(vals, 0.50)
+	out.P95ms = pct(vals, 0.95)
+	out.P99ms = pct(vals, 0.99)
+	if len(vals) > 0 {
+		out.Maxms = vals[len(vals)-1]
+	}
+	if w, ok := m.windows[kinds[0]]; ok {
+		secs := w[1].Sub(w[0]).Seconds()
+		if secs > 0 {
+			out.OpsPerSec = float64(out.N) / secs
+			out.MiBPerSec = float64(out.Bytes) / (1024 * 1024) / secs
+		}
+	}
+	return out
+}
+
 func (m *meter) summaries() map[string]latSummary {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -293,9 +331,16 @@ func TestMixedWorkloadLoad(t *testing.T) {
 				seq++
 				key := fmt.Sprintf("mixed/put/%02d/%06d", i, seq)
 				raw, hash := expectedContent(key, seq)
+				kind := "put_4k"
+				switch {
+				case seq%97 == 0:
+					kind = "put_12m"
+				case seq%10 == 0:
+					kind = "put_1m"
+				}
 				start := time.Now()
 				_, err := client(i).PutObject(c, mixedBucket, key, bytes.NewReader(raw), int64(len(raw)), "application/octet-stream")
-				m.record("put", time.Since(start), int64(len(raw)), err)
+				m.record(kind, time.Since(start), int64(len(raw)), err)
 				if err == nil {
 					ver.put(key, hash)
 				}
@@ -397,10 +442,11 @@ func TestMixedWorkloadLoad(t *testing.T) {
 	close(stop)
 	wg.Wait()
 
-	for _, kind := range []string{"put", "get", "list", "vlist", "churn"} {
+	for _, kind := range []string{"put_4k", "put_1m", "put_12m", "get", "list", "vlist", "churn"} {
 		m.setWindow(kind, measureStart, measureEnd)
 	}
 	mixed := m.summaries()
+	putAgg := m.combined("put_4k", "put_1m", "put_12m")
 	peakMemLow := memAvailableMB()
 
 	// --- contention storm: 200 concurrent commits to one key ------------------
@@ -503,6 +549,21 @@ func TestMixedWorkloadLoad(t *testing.T) {
 	pgPeak = pgSnapshotSnapshot(pgPeak)
 	sampleMu.Unlock()
 
+	// --- diagnostic: is the commit bottleneck the bucket row or the global seq?
+	diag := diagnoseCommitLatency(s, ctx, client)
+
+	// --- per-phase attribution: coordinator + agent request timings ----------
+	phases := analyzeLogs(s, measureStart, measureEnd)
+	phases.PutTotalP50MS = putAgg.P50ms
+	phases.PutMinusCoordMS = putAgg.P50ms - phases.PlacementMS - phases.CommitMS
+	if putAgg.P50ms > 0 {
+		phases.ShardShareOfPutPct = 100 * phases.PutMinusCoordMS / putAgg.P50ms
+	}
+	phases.Notes = []string{
+		"PutMinusCoordinator = client PUT p50 - coordinator placement p50 - coordinator commit p50; it is the EC encode + shard HTTP/fsync wave + gateway overhead (not further split without gateway instrumentation)",
+		"shard PUT duration is the agent transport handler wall time, which includes fsync+rename+dir fsync for that shard",
+	}
+
 	// --- correctness: verify sampled PUTs byte-identically --------------------
 	mismatches := 0
 	verified := 0
@@ -556,7 +617,7 @@ func TestMixedWorkloadLoad(t *testing.T) {
 		}
 	}
 
-	summary := buildReport(s, mixed, readonly, contentionP99, int64(len(contention)), contentionErrs, contentionDur, atomic.LoadInt64(&maxLockWaiters), deadlocksBefore, deadlocksAfterContention, deadlocksAfterRO, len(ver.m), verified, mismatches, pgBase, pgPeak, bloatFinal, baseMem, peakMemLow, minMem, repairOK, metricsBefore, s.coordMetricsText())
+	summary := buildReport(s, mixed, readonly, phases, diag, contentionP99, int64(len(contention)), contentionErrs, contentionDur, atomic.LoadInt64(&maxLockWaiters), deadlocksBefore, deadlocksAfterContention, deadlocksAfterRO, len(ver.m), verified, mismatches, pgBase, pgPeak, bloatFinal, baseMem, peakMemLow, minMem, repairOK, metricsBefore, s.coordMetricsText())
 
 	path, err := writeReport(summary)
 	if err != nil {
@@ -636,6 +697,8 @@ type report struct {
 	Memory       memoryReport          `json:"memory"`
 	Mixed        map[string]latSummary `json:"mixed_phase"`
 	ReadOnly     map[string]latSummary `json:"readonly_phase"`
+	Phases       phaseReport           `json:"phases"`
+	Diagnostics  diagnosticReport      `json:"diagnostics"`
 	Contention   contentionReport      `json:"contention_phase"`
 	Errors       errorsReport          `json:"errors"`
 	Pool         poolReport            `json:"pool"`
@@ -652,6 +715,27 @@ type memoryReport struct {
 	MemAvailableAfterMeasureMB int64 `json:"mem_available_after_measured_phase_mb"`
 	MinAvailableMB             int64 `json:"min_available_mb"`
 	GatewaysDegraded           bool  `json:"gateways_degraded_to_one"`
+}
+
+// phaseReport splits a PUT's observed latency into the two coordinator round
+// trips and the shard-write wave, using the coordinator's and agents' own request
+// logs (no product instrumentation).
+type phaseReport struct {
+	PlacementMS          float64  `json:"placement_p50_ms"`
+	PlacementCount       int      `json:"placement_count"`
+	CommitMS             float64  `json:"commit_p50_ms"`
+	CommitCount          int      `json:"commit_count"`
+	ShardPutCount        int      `json:"shard_put_count"`
+	ShardPutP50MS        float64  `json:"shard_put_p50_ms"`
+	ShardPutP95MS        float64  `json:"shard_put_p95_ms"`
+	ShardPutP99MS        float64  `json:"shard_put_p99_ms"`
+	ShardPutMaxMS        float64  `json:"shard_put_max_ms"`
+	ShardWritesPerAgentS float64  `json:"shard_writes_per_agent_per_s"`
+	ShardBusyMS          float64  `json:"agent_shard_busy_ms_total"`
+	PutTotalP50MS        float64  `json:"put_p50_total_ms"`
+	PutMinusCoordMS      float64  `json:"put_minus_coordinator_p50_ms"`
+	ShardShareOfPutPct   float64  `json:"shard_wave_share_of_put_pct"`
+	Notes                []string `json:"notes"`
 }
 
 type contentionReport struct {
@@ -695,14 +779,16 @@ type verificationReport struct {
 	Mismatches int `json:"mismatches"`
 }
 
-func buildReport(s *stack, mixed, readonly map[string]latSummary, contentionP99 float64, contentionN int64, contentionErrs int64, contentionDur time.Duration, maxLockWaiters int64, deadlocksBefore, deadlocksAfterContention, deadlocksAfterRO int64, corpus, verified, mismatches int, pgBase, pgPeak, bloatFinal pgSnapshot, baseMem, afterMem, minMem int64, repairOK bool, metricsBefore, metricsAfter string) report {
+func buildReport(s *stack, mixed, readonly map[string]latSummary, phases phaseReport, diag diagnosticReport, contentionP99 float64, contentionN int64, contentionErrs int64, contentionDur time.Duration, maxLockWaiters int64, deadlocksBefore, deadlocksAfterContention, deadlocksAfterRO int64, corpus, verified, mismatches int, pgBase, pgPeak, bloatFinal pgSnapshot, baseMem, afterMem, minMem int64, repairOK bool, metricsBefore, metricsAfter string) report {
 	r := report{
-		StartedAt: time.Now().UTC(),
-		Machine:   machineSpec(),
-		Command:   "go test -tags=load -count=1 ./test/load/ -v",
-		Gateways:  len(s.gateways),
-		Mixed:     mixed,
-		ReadOnly:  readonly,
+		StartedAt:   time.Now().UTC(),
+		Machine:     machineSpec(),
+		Command:     "go test -tags=load -count=1 ./test/load/ -v",
+		Gateways:    len(s.gateways),
+		Mixed:       mixed,
+		ReadOnly:    readonly,
+		Phases:      phases,
+		Diagnostics: diag,
 		Contention: contentionReport{
 			Concurrency: int(contentionN), DurationMS: float64(contentionDur.Microseconds()) / 1000.0,
 			P99MS: contentionP99, Errors: contentionErrs,
@@ -881,4 +967,98 @@ func printReport(t *testing.T, r report) {
 	t.Logf("verification: %d/%d sampled byte-identical, mismatches=%d", r.Verification.Verified, r.Verification.CorpusKeys, r.Verification.Mismatches)
 	t.Logf("postgres: max_active=%d max_lock_waiters=%d deadlocks %d->%d; pool max_conns=%d", r.Postgres.MaxActive, r.Postgres.MaxLockWaiters, r.Postgres.DeadlocksStart, r.Postgres.DeadlocksEnd, r.Pool.MaxConnections)
 	t.Logf("bloat: n_dead_tup baseline=%d peak=%d final=%d reclaimed=%v", r.Bloat.Baseline, r.Bloat.Peak, r.Bloat.Final, r.Bloat.Reclaimed)
+}
+
+type diagnosticReport struct {
+	SingleWriterPutP50MS    float64  `json:"single_writer_4k_put_p50_ms"`
+	SingleWriterCommitP50MS float64  `json:"single_writer_commit_p50_ms"`
+	SameBucketPutP50MS      float64  `json:"same_bucket_16_writers_4k_put_p50_ms"`
+	MultiBucketPutP50MS     float64  `json:"multi_bucket_16_writers_4k_put_p50_ms"`
+	MultiBucketCommitP50MS  float64  `json:"multi_bucket_commit_p50_ms"`
+	Notes                   []string `json:"notes"`
+}
+
+// diagnoseCommitLatency runs three short 4 KiB PUT phases to separate "commit
+// service time" from "lock contention on a shared row":
+//
+//	single writer            → service time with no contention
+//	16 writers, one bucket   → contention on the bucket row + global seq counter
+//	16 writers, 16 buckets   → contention on the global seq counter only
+//
+// Coordinator commit p50 is measured from the coordinator's own request log for
+// each phase window.
+func diagnoseCommitLatency(s *stack, ctx context.Context, client func(int) *sdk.Client) diagnosticReport {
+	rep := diagnosticReport{}
+	putOnce := func(c *sdk.Client, bucket, key string, seq int, out *[]time.Duration, mu *sync.Mutex) {
+		raw, _ := expectedContent(key, 4)
+		str := []byte(fmt.Sprintf("%s-%d", key, seq))
+		copy(raw[:len(str)%len(raw)], str)
+		start := time.Now()
+		_, err := c.PutObject(ctx, bucket, key, bytes.NewReader(raw[:4<<10]), 4<<10, "application/octet-stream")
+		if err == nil {
+			mu.Lock()
+			*out = append(*out, time.Since(start))
+			mu.Unlock()
+		}
+	}
+	runPhase := func(name string, dur time.Duration, workers int, bucketFor func(i int) string) ([]time.Duration, phaseReport) {
+		var mu sync.Mutex
+		var lat []time.Duration
+		start := time.Now()
+		var wg sync.WaitGroup
+		stop := make(chan struct{})
+		for i := 0; i < workers; i++ {
+			i := i
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				seq := 0
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					seq++
+					putOnce(client(i), bucketFor(i), fmt.Sprintf("diag/%s/%02d/%06d", name, i, seq), seq, &lat, &mu)
+				}
+			}()
+		}
+		time.Sleep(dur)
+		end := time.Now()
+		close(stop)
+		wg.Wait()
+		return lat, analyzeLogs(s, start, end)
+	}
+	// single writer
+	single, singlePhase := runPhase("single", 4*time.Second, 1, func(int) string { return mixedBucket })
+	rep.SingleWriterPutP50MS = p50ms(single)
+	rep.SingleWriterCommitP50MS = singlePhase.CommitMS
+
+	buckets := make([]string, 16)
+	for i := range buckets {
+		buckets[i] = fmt.Sprintf("load-diag-%02d", i)
+		s.createBucket(buckets[i])
+	}
+	same, _ := runPhase("same", 6*time.Second, 16, func(int) string { return mixedBucket })
+	rep.SameBucketPutP50MS = p50ms(same)
+
+	multi, multiPhase := runPhase("multi", 6*time.Second, 16, func(i int) string { return buckets[i] })
+	rep.MultiBucketPutP50MS = p50ms(multi)
+	rep.MultiBucketCommitP50MS = multiPhase.CommitMS
+	rep.Notes = []string{
+		"single_writer ≈ commit service time with no contention",
+		"same_bucket vs multi_bucket isolates bucket-row lock contention from the global version-seq counter lock",
+		"all phases are 4 KiB single PUTs through the same gateways and agents",
+	}
+	return rep
+}
+
+func p50ms(vals []time.Duration) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	cp := append([]time.Duration(nil), vals...)
+	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
+	return float64(cp[len(cp)/2].Microseconds()) / 1000.0
 }

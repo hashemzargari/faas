@@ -341,7 +341,9 @@ func boot(s *stack) error {
 			"--hostname", "127.0.0.1",
 			"--heartbeat-interval", "1s",
 			"--repair=false", "--scrub=false",
-			"--log-level", "warn",
+			// Debug logging makes every shard request (with duration_ms) visible to
+			// the post-run log analysis; volume is bounded by the short run.
+			"--log-level", "debug",
 		)
 	}
 	deadline = time.Now().Add(90 * time.Second)

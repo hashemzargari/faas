@@ -1,93 +1,98 @@
-# Load test — PostgreSQL adapter (reference run #1)
-
-Command (starts and cleans up its own PostgreSQL container, coordinator, 12 agents
-and 2 gateways):
+# Load test — PostgreSQL adapter: ceiling and write-path attribution
 
 ```bash
-go test -tags=load -count=1 ./test/load/ -v -timeout 15m
+go test -tags=load -count=1 ./test/load/ -v -timeout 15m   # or: make load
 ```
 
-Reference run: `2026-10-24T13:27Z`, macOS-class dev box (`host=… cpus=20`,
-docker `postgres:16`, Go load generator, 15 GB RAM, ~5–6.5 GB free at start).
-Machine spec, every phase, and the Postgres samples are in
-[`results/run-20261024T132716Z.json`](results/run-20261024T132716Z.json).
+Disposable topology per run: `postgres:16` (`shared_buffers=256MB`,
+`max_connections=200`, `autovacuum_naptime=5s`) → coordinator on PostgreSQL →
+12 dev agents (D′ RC, real shard I/O) → **2 gateways** sharing one deterministic
+key seed. Workload: 20 s warmup + **60 s measured** mixed phase (32 PUT /
+16 GET / 8 list / 4 version-churn workers), then a 200-way single-key contention
+storm, a 10 s read-only phase, and three 4 KiB PUT diagnostic phases. Artifacts:
+[`results/run-20261024T133436Z.json`](results/run-20261024T133436Z.json) (latest,
+with commit attribution), plus the earlier run without diagnostics.
 
-Topology: `postgres:16` (`shared_buffers=256MB`, `max_connections=200`,
-`autovacuum_naptime=5s`) → coordinator on PostgreSQL → 12 dev-bootstrap agents
-(D′ RC, real shard I/O) → **2 gateways** sharing one deterministic key seed.
-Workload: 20 s warmup + **60 s measured** mixed phase (32 PUT / 16 GET /
-8 list / 4 version-churn workers), then a 200-way single-key contention storm,
-then 10 s read-only. 12 MiB objects use single PUT via `pkg/sdk` (multipart is
-covered by `test/compat`, not this profile).
+Reference machine: shared dev box, 20 CPUs, 16 GB RAM (~6 GB free at boot, min
+2.4 GB during the run). Run-to-run variance on this box is ±2×; treat the numbers
+as the **measured ceiling**, not an SLO.
 
-## Measured (mixed, 60 s window)
+## Mixed phase by payload class
 
-| op | n | errors | p50 | p95 | p99 | max | rate |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| PUT | 2 856 | 0 | 662 ms | 863 ms | **958 ms** | 1 169 ms | **47.6 ops/s** (10.9 MiB/s) |
-| GET | 18 897 | 0 | 44 ms | 96 ms | **168 ms** | 499 ms | **315 ops/s** (66.5 MiB/s) |
-| ListObjectsV2 (page+continuation) | 1 022 | 0 | 342 ms | 503 ms | **588 ms** | 720 ms | 17 ops/s |
-| ListObjectVersions (coordinator API) | 975 | 0 | 120 ms | 183 ms | **228 ms** | 300 ms | 16 ops/s |
-| version churn (PUT+DELETE marker) | 1 878 | 0 | 122 ms | 216 ms | **259 ms** | 371 ms | 31 ops/s |
+| op | n | p50 | p95 | p99 | throughput |
+|---|---:|---:|---:|---:|---:|
+| PUT 4 KiB | 2 509 | 659 ms | 886 ms | 1 415 ms | 42 ops/s |
+| PUT 1 MiB | 280 | 687 ms | 907 ms | 998 ms | 4.7 ops/s (4.7 MiB/s) |
+| PUT 12 MiB | 30 | 880 ms | 1 055 ms | 1 232 ms | 0.5 ops/s (6.0 MiB/s) |
+| GET | 18 263 | 45 ms | 106 ms | 207 ms | 304 ops/s (65 MiB/s) |
+| ListObjectsV2 (paged) | 930 | 380 ms | 532 ms | 917 ms | 15.5 ops/s |
+| version listing (coordinator API) | 889 | 129 ms | 192 ms | 296 ms | 15 ops/s |
+| churn (PUT + DELETE marker) | 1 830 | 125 ms | 224 ms | 282 ms | 30 ops/s |
+| read-only GET phase | 7 580 | 18 ms | 39 ms | 81 ms | 758 ops/s |
 
-Read-only phase (16 GET workers, 10 s): **690 ops/s, p99 109 ms** (mixed GET p99
-168 ms) — reads are not the bottleneck.
+The median is dominated by 4 KiB PUTs, and the payload size barely moves it
+(4 KiB 659 ms vs 1 MiB 687 ms vs 12 MiB 880 ms): the cost is per request, not per
+byte. That is the write-amplification symptom (12–24 shard writes for a 4 KiB
+object), **but the next section shows the shard writes are not where the time
+goes.**
 
-Run-to-run variance on this shared machine is real: an earlier run of the same
-profile measured 79 PUT/s / p99 1 072 ms and 498 GET/s / p99 142 ms. Treat these
-as the ceiling order of magnitude, not an SLO.
+## Attribution: coordinator commit, not disk fsync
 
-## Contention storm (200 concurrent PUTs to one key)
+| phase | p50 | source |
+|---|---:|---|
+| coordinator `/v1/placement` | **32 ms** | coordinator request log |
+| coordinator `/v1/objects:commit` | **523 ms** | coordinator request log |
+| agent shard PUT (handler wall time, includes fsync+rename+dir fsync) | **0.31 ms** (p95 2.3, p99 5.7, max 27.7) | agent request logs |
+| client PUT total | 663 ms | client |
+| remainder = EC encode + shard wave + gateway overhead | **108 ms (16%)** | derived |
 
-| metric | value |
-|---|---|
-| wall time | 614 ms |
-| p99 | 604 ms |
-| errors | 0 |
-| PostgreSQL deadlocks | **0** (before and after) |
-| max `wait_event_type='Lock'` sessions | **39** (pool = 40) |
+62 shard writes/s per agent is nowhere near the agent's capacity; the shard wave
+is ~16% of PUT latency. **The earlier fsync-bound-shards hypothesis is refuted by
+this data — do not optimize the agents first.**
 
-Interpretation: same-key commits **serialize** (expected: one transaction owns the
-latest row via `FOR UPDATE`), but the waiter count is bounded by the connection
-pool rather than exploding, throughput degrades roughly linearly with concurrency,
-and the deadlock count does **not** grow with load. That is the "serialized by
-design, not a convoy" signature; a convoy would show waiters ≫ pool size and/or
-deadlocks/retries climbing with concurrency.
+Diagnostic phases (4 KiB single PUTs, same gateways/agents) separate service time
+from shared-row contention:
 
-## Pool, bloat, correctness gates
+| scenario | PUT p50 | coordinator commit p50 |
+|---|---:|---:|
+| 1 writer (no contention) | **6.4 ms** | **2.0 ms** |
+| 16 writers, same bucket | 45 ms | — |
+| 16 writers, 16 buckets | 26 ms | **14.8 ms** |
+
+Commit service time is ~2 ms. It grows ~7× across 16 writers **even with several
+buckets**, so the contention is not only the bucket row: the commit transaction
+also serializes on a single global version-sequence counter row (`nextSeq`), and
+it takes `FOR UPDATE` locks for reads that do not need them (bucket metadata,
+version-id lookup). At the mixed phase's 60 concurrent workers the commit p50 is
+523 ms, beyond what the 16-writer diagnostic predicts — the remaining gap needs
+statement-level/adapter timing before it is fully attributed (do not guess).
+
+## Gates
 
 | gate | result |
 |---|---|
-| PostgreSQL connections observed | max **41** of `max_connections=200` (pool 40 + sampler): no pool exhaustion |
-| `kv` dead tuples | baseline 33 → peak **963** → final **17** after autovacuum (`autovacuum_naptime=5s`): reclaimed |
-| PUT→GET verification (200 sampled keys, full SHA-256) | **200/200 byte-identical, 0 mismatches** |
-| non-retryable 5xx | **0** (503-retryable: 0, 4xx: 0) |
-| repair/scrub interference | none (`/v1/repair/status` unrecoverable = 0) |
-| free memory during run | min 2.8 GB; 2 gateways kept (boot 6.5 GB free) |
+| PUT→GET verification (200 sampled keys, SHA-256) | **200/200 byte-identical** |
+| non-retryable 5xx | **0** (retryable 503: 0, 4xx: 0) |
+| PostgreSQL connections | max **42** / 200; no pool exhaustion |
+| contention storm (200 concurrent PUTs, one key) | 617 ms wall, p99 608 ms, **0 deadlocks**, max 38 lock waiters (pool 40) |
+| `kv` dead tuples | 21 → 867 peak → **171** after autovacuum (reclaimed) |
+| repair/scrub interference | none (`unrecoverable` = 0) |
 
-## Findings / next
+## Fix candidates, expected-value order (not implemented)
 
-1. **Writes are latency-bound by the data path, not by the adapter.** PUT p99 is
-   ~1 s while GET p99 is ~168 ms and read-only reaches ~690 GET/s; the commit
-   transaction itself is not the limiting factor at this scale.
-2. **Listing is the slowest control operation** (p99 0.6 s S3 list, 0.23 s
-   coordinator version list) at only ~17 list/s per gateway pair. Worth profiling
-   before calling the adapter done: it decodes every live version record in the
-   prefix range. Not a correctness issue; a ceiling issue.
-3. **No lock-convoy or deadlock signal.** Contention produced 0 deadlocks and a
-   waiter count capped by the pool — the lock-order discipline held under 200-way
-   pressure on one key.
-4. **Bloat is real and reclaimed**, but the measured churn volume was modest
-   (peak 963 dead tuples). A longer churn phase is needed to test autovacuum under
-   sustained tombstone pressure, not to prove reclamation.
-5. **Two client-side network errors** appeared on GET in an earlier run (no
-   server 5xx); they were not reproducible in the reference run. Watch this in
-   future runs — a rising network-error rate would point at connection churn
-   between gateways and the SDK client, not at the metadata adapter.
+1. **Remove the global version-sequence counter lock** from the commit transaction
+   (per-key sequence, DB sequence, or order by latest record). The multi-bucket
+   diagnostic still shows 7× contention with zero bucket sharing.
+2. **Drop `FOR UPDATE` from read-only reads** in the commit path (bucket metadata,
+   version-id idempotency lookup); only the latest row needs the lock.
+3. **Fewer DB round trips per commit** (batch version + latest + manifest + seq
+   writes).
+4. Agent-side fsync batching is **not** justified by this data. Small-object RC
+   routing (SDP) may help capacity/cost, not this latency.
 
-## HA under load (not implemented here)
+## Not shown here
 
-The harness is one step away: run the `test/ha` crash/promote sequence while this
-workload is running and record the client error/latency spike during the
-measured 456–482 ms failover window. That would close "gateway-level failover
-behaviour" and "load" together; deliberately out of scope for task-17.
+Long/sustained churn (bloat over hours), degraded disks/WAN latency, failover
+under load. The next drill is HA-under-load: combine this harness with
+`test/ha`'s crash/promote and measure the client spike across the 456–482 ms
+failover window.
