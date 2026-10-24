@@ -227,6 +227,46 @@ func TestMixedWorkloadLoad(t *testing.T) {
 	pgBase := s.pgSnapshot(t)
 	metricsBefore := s.coordMetricsText()
 
+	// Continuous 1 s Postgres/memory sampler for the whole run (required by the
+	// task: activity/lock waiters/dead tuples must be attributable, not a single
+	// post-hoc guess).
+	var sampleMu sync.Mutex
+	pgPeak := pgBase
+	minMem := memAvailableMB()
+	samplerStop := make(chan struct{})
+	samplerDone := make(chan struct{})
+	go func() {
+		defer close(samplerDone)
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-samplerStop:
+				return
+			case <-tick.C:
+				snap := s.pgSnapshotNoFail()
+				mem := memAvailableMB()
+				sampleMu.Lock()
+				if snap.Active > pgPeak.Active {
+					pgPeak.Active = snap.Active
+				}
+				if snap.LockWaiters > pgPeak.LockWaiters {
+					pgPeak.LockWaiters = snap.LockWaiters
+				}
+				if snap.Connections > pgPeak.Connections {
+					pgPeak.Connections = snap.Connections
+				}
+				if snap.DeadTuples > pgPeak.DeadTuples {
+					pgPeak.DeadTuples = snap.DeadTuples
+				}
+				if mem < minMem {
+					minMem = mem
+				}
+				sampleMu.Unlock()
+			}
+		}
+	}()
+
 	m := newMeter()
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -239,7 +279,6 @@ func TestMixedWorkloadLoad(t *testing.T) {
 	}
 	client := func(i int) *sdk.Client { return s.clients[i%len(s.clients)] }
 
-	startMixed := time.Now()
 	// 32 PUT workers.
 	for i := 0; i < 32; i++ {
 		i := i
@@ -417,7 +456,6 @@ func TestMixedWorkloadLoad(t *testing.T) {
 	}
 
 	// --- read-only phase: compare p99 against mixed ---------------------------
-	deadlocksBeforeRO := s.pgDeadlocks(t)
 	mRO := newMeter()
 	var roWg sync.WaitGroup
 	roStop := make(chan struct{})
@@ -458,6 +496,13 @@ func TestMixedWorkloadLoad(t *testing.T) {
 	readonly := mRO.summaries()
 	deadlocksAfterRO := s.pgDeadlocks(t)
 
+	// Stop continuous sampling now; the bloat wait below is a separate observation.
+	close(samplerStop)
+	<-samplerDone
+	sampleMu.Lock()
+	pgPeak = pgSnapshotSnapshot(pgPeak)
+	sampleMu.Unlock()
+
 	// --- correctness: verify sampled PUTs byte-identically --------------------
 	mismatches := 0
 	verified := 0
@@ -484,7 +529,6 @@ func TestMixedWorkloadLoad(t *testing.T) {
 	// outage-time/churn keys are allowed to be absent; only put corpus is verified.
 
 	// --- bloat / postgres final snapshot -------------------------------------
-	pgPeak := s.pgSnapshot(t)
 	// Wait for autovacuum to reclaim the churn (naptime is 5s in the container).
 	bloatDeadline := time.Now().Add(60 * time.Second)
 	var bloatFinal pgSnapshot
@@ -512,9 +556,7 @@ func TestMixedWorkloadLoad(t *testing.T) {
 		}
 	}
 
-	summary := buildReport(s, mixed, readonly, contentionP99, int64(len(contention)), contentionErrs, contentionDur, atomic.LoadInt64(&maxLockWaiters), deadlocksBefore, deadlocksAfterContention, deadlocksAfterRO, len(ver.m), verified, mismatches, pgBase, pgPeak, bloatFinal, baseMem, peakMemLow, repairOK, metricsBefore, s.coordMetricsText())
-	summary.Memory.MemAvailableAtBootMB = baseMem
-	summary.Memory.MemAvailableAfterMeasureMB = peakMemLow
+	summary := buildReport(s, mixed, readonly, contentionP99, int64(len(contention)), contentionErrs, contentionDur, atomic.LoadInt64(&maxLockWaiters), deadlocksBefore, deadlocksAfterContention, deadlocksAfterRO, len(ver.m), verified, mismatches, pgBase, pgPeak, bloatFinal, baseMem, peakMemLow, minMem, repairOK, metricsBefore, s.coordMetricsText())
 
 	path, err := writeReport(summary)
 	if err != nil {
@@ -608,6 +650,7 @@ type report struct {
 type memoryReport struct {
 	MemAvailableAtBootMB       int64 `json:"mem_available_at_boot_mb"`
 	MemAvailableAfterMeasureMB int64 `json:"mem_available_after_measured_phase_mb"`
+	MinAvailableMB             int64 `json:"min_available_mb"`
 	GatewaysDegraded           bool  `json:"gateways_degraded_to_one"`
 }
 
@@ -652,7 +695,7 @@ type verificationReport struct {
 	Mismatches int `json:"mismatches"`
 }
 
-func buildReport(s *stack, mixed, readonly map[string]latSummary, contentionP99 float64, contentionN int64, contentionErrs int64, contentionDur time.Duration, maxLockWaiters int64, deadlocksBefore, deadlocksAfterContention, deadlocksAfterRO int64, corpus, verified, mismatches int, pgBase, pgPeak, bloatFinal pgSnapshot, baseMem, afterMem int64, repairOK bool, metricsBefore, metricsAfter string) report {
+func buildReport(s *stack, mixed, readonly map[string]latSummary, contentionP99 float64, contentionN int64, contentionErrs int64, contentionDur time.Duration, maxLockWaiters int64, deadlocksBefore, deadlocksAfterContention, deadlocksAfterRO int64, corpus, verified, mismatches int, pgBase, pgPeak, bloatFinal pgSnapshot, baseMem, afterMem, minMem int64, repairOK bool, metricsBefore, metricsAfter string) report {
 	r := report{
 		StartedAt: time.Now().UTC(),
 		Machine:   machineSpec(),
@@ -686,7 +729,7 @@ func buildReport(s *stack, mixed, readonly map[string]latSummary, contentionP99 
 			"12 MiB objects use single PUT via pkg/sdk; multipart is covered by test/compat, not this load profile",
 		},
 	}
-	r.Memory = memoryReport{MemAvailableAtBootMB: baseMem, MemAvailableAfterMeasureMB: afterMem, GatewaysDegraded: len(s.gateways) == 1}
+	r.Memory = memoryReport{MemAvailableAtBootMB: baseMem, MemAvailableAfterMeasureMB: afterMem, MinAvailableMB: minMem, GatewaysDegraded: len(s.gateways) == 1}
 	for _, phase := range []map[string]latSummary{mixed, readonly} {
 		for _, st := range phase {
 			r.Errors.Retryable503 += st.Err503
@@ -732,6 +775,29 @@ func jsonNumber(s string) (float64, error) {
 	_, err := fmt.Sscanf(s, "%f", &f)
 	return f, err
 }
+
+// pgSnapshotNoFail is the sampler's variant: never fails the test on a transient
+// connection error (the run's correctness gates are elsewhere).
+func (s *stack) pgSnapshotNoFail() pgSnapshot {
+	var snap pgSnapshot
+	snap.At = time.Now()
+	if s.pg == nil {
+		return snap
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = s.pg.QueryRowContext(ctx, `SELECT
+		count(*) FILTER (WHERE state='active'),
+		count(*) FILTER (WHERE state='idle'),
+		count(*) FILTER (WHERE wait_event_type='Lock'),
+		count(*)
+		FROM pg_stat_activity WHERE datname='fass'`).
+		Scan(&snap.Active, &snap.Idle, &snap.LockWaiters, &snap.Connections)
+	_ = s.pg.QueryRowContext(ctx, `SELECT COALESCE(SUM(n_dead_tup),0) FROM pg_stat_user_tables WHERE relname='kv'`).Scan(&snap.DeadTuples)
+	return snap
+}
+
+func pgSnapshotSnapshot(p pgSnapshot) pgSnapshot { p.At = time.Now(); return p }
 
 func (s *stack) pgSnapshot(t *testing.T) pgSnapshot {
 	t.Helper()

@@ -752,3 +752,36 @@ transactions that hold back vacuum; a coordinator with a stuck statement (the
 5 s statement timeout should prevent it) will bloat the table. Tune the settings
 for the table size on the actual cluster; the migration values are a starting
 point, not a universal answer.
+
+### Load-test results (PostgreSQL adapter, measured 2026-10-24)
+
+First ceiling measurement of the PostgreSQL-backed coordinator under a mixed S3
+workload (disposable `postgres:16` with `shared_buffers=256MB`, coordinator,
+12 agents, 2 gateways; 60 s measured window after 20 s warmup). Full per-phase
+table, JSON artifact, contention analysis and gate results:
+[`test/load/REPORT.md`](../test/load/REPORT.md). Reproduce with `make load`
+(or `go test -tags=load -count=1 ./test/load/ -v`).
+
+**Headline numbers (one reference run; ±2× run-to-run variance on a shared box —
+report a ceiling, not an SLO):**
+
+| op | p50 | p99 | throughput |
+|---|---:|---:|---:|
+| PUT (4 KiB / 1 MiB / occasional 12 MiB) | 662 ms | 958 ms | 48 ops/s (10.9 MiB/s) |
+| GET (hot + random) | 44 ms | 168 ms | 315 ops/s (66.5 MiB/s) |
+| ListObjectsV2 (paged) | 342 ms | 588 ms | 17 ops/s |
+| version listing (coordinator API) | 120 ms | 228 ms | 16 ops/s |
+| read-only GET phase | 19 ms | 109 ms | 690 ops/s |
+
+**Hard gates all passed:** 200/200 sampled PUT→GET byte-identical; **0**
+non-retryable 5xx (and 0 retryable 503 in this run); **0 deadlocks**, max 39 lock
+waiters capped by the 40-connection pool during the 200-way single-key contention
+storm (serialized-by-design signature, not a convoy); max 41/200 PostgreSQL
+connections (no exhaustion); `kv` dead tuples 33 → 963 peak → **17** after
+autovacuum (reclaimed); no repair/scrub interference.
+
+**What this does not show:** a longer/sustained churn run (bloat under hours of
+tombstones), degraded/failed-disk conditions, WAN latency between sites, or
+failover under load. HA-under-load is the natural next drill: the workload
+harness can be combined with the `test/ha` crash/promote sequence to measure the
+client-visible error/latency spike across the measured 456–482 ms failover window.

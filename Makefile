@@ -35,6 +35,10 @@ compat-clients: build
 compat-clients-tls: build
 	COMPAT_TLS=1 bash scripts/compat.sh
 
+# Data plane mTLS *and* HTTPS on the client-facing S3 edge (custom CA).
+compat-clients-tls-edge: build
+	COMPAT_TLS=1 COMPAT_EDGE_TLS=1 bash scripts/compat.sh
+
 chaos: build
 	$(GOENV) go test -count=1 -tags=chaos ./test/chaos/...
 
@@ -108,3 +112,10 @@ image:
 
 clean:
 	rm -rf bin .gocache
+
+# Load test (task-17): disposable PostgreSQL container + coordinator + 12 agents
+# + 2 gateways, then a 60 s mixed S3 workload, a 200-way contention storm and a
+# read-only phase. Reports JSON under test/load/results/ and the reference table
+# in test/load/REPORT.md. Not part of the default suite.
+load:
+	$(GOENV) go test -count=1 -tags=load -v -timeout 15m ./test/load/...

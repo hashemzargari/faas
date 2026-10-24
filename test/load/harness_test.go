@@ -266,6 +266,9 @@ func boot(s *stack) error {
 	if s.memAtBoot < 3000 {
 		gatewayCount = 1
 	}
+	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+		return fmt.Errorf("work dir: %w", err)
+	}
 
 	// disposable PostgreSQL with a modest footprint (task-17 capacity note).
 	_ = exec.Command("docker", "rm", "-f", pgContainer).Run()
@@ -273,11 +276,13 @@ func boot(s *stack) error {
 	pgArgs := []string{"run", "-d", "--name", pgContainer,
 		"-p", fmt.Sprintf("127.0.0.1:%d:5432", pgPort),
 		"-e", "POSTGRES_PASSWORD=" + pgPass, "-e", "POSTGRES_DB=fass",
+		// Server settings must come *after* the image, or docker parses them as
+		// docker flags (-c is --cpu-shares).
+		pgImage,
 		"-c", "shared_buffers=256MB",
 		"-c", "max_connections=200",
 		"-c", "autovacuum_naptime=5s",
-		"-c", "log_min_duration_statement=2000",
-		pgImage}
+		"-c", "log_min_duration_statement=2000"}
 	if out, err := exec.Command("docker", pgArgs...).CombinedOutput(); err != nil {
 		s.t.Fatalf("start postgres: %v\n%s", err, out)
 	}
@@ -497,8 +502,7 @@ func (s *stack) setVersioning(name string) {
 	if err := json.Unmarshal(body, &cfg); err != nil {
 		s.t.Fatalf("decode bucket: %v", err)
 	}
-	cfg.Versioning = "Enabled"
-	code, body = s.coordJSON("PATCH", "/v1/buckets/"+name, cfg)
+	code, body = s.coordJSON("PATCH", "/v1/buckets/"+name, map[string]string{"versioning": "Enabled"})
 	if code != http.StatusOK {
 		s.t.Fatalf("patch bucket: %d %s", code, body)
 	}
