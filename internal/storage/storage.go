@@ -27,6 +27,7 @@ package storage
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +37,8 @@ import (
 	"strings"
 	"sync"
 )
+
+var spaceCounters = []byte("counters")
 
 var (
 	// ErrNotFound is returned by Get/Scan lookups for a missing key.
@@ -344,6 +347,29 @@ func (tx *WriteTx) Delete(space, key []byte) error {
 		del:   true,
 	})
 	return nil
+}
+
+// NextSequence implements the counter-based sequence for the embedded engine.
+// It reads and writes the counter row inside the same transaction (the embedded
+// engine serialises writers, so this cannot deadlock).
+func (tx *WriteTx) NextSequence(name string) (uint64, error) {
+	raw, err := tx.Get(spaceCounters, []byte(name))
+	switch {
+	case errors.Is(err, ErrNotFound):
+	case err != nil:
+		return 0, err
+	}
+	var cur uint64
+	if len(raw) == 8 {
+		cur = binary.BigEndian.Uint64(raw)
+	}
+	next := cur + 1
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], next)
+	if err := tx.Put(spaceCounters, []byte(name), buf[:]); err != nil {
+		return 0, err
+	}
+	return next, nil
 }
 
 // ---------------------------------------------------------------------------

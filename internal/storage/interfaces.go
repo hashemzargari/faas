@@ -31,4 +31,9 @@ type Writer interface {
 	Reader
 	Put(space, key, val []byte) error
 	Delete(space, key []byte) error
+	// NextSequence allocates the next value of a named monotonic sequence inside
+	// the transaction. Backends may implement it with a lock-free native sequence;
+	// callers must not assume contiguous values, only that allocations are
+	// monotonic within a key's serialization scope.
+	NextSequence(name string) (uint64, error)
 }

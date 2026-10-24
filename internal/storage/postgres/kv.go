@@ -128,6 +128,8 @@ func overlayKey(space, key []byte) string {
 	return string(space) + "\x00" + string(key)
 }
 
+// sequenceNames maps the coordinator's logical counters to PostgreSQL sequences.
+
 // txRead is the read-only transaction implementation.
 type txRead struct {
 	ctx context.Context
@@ -203,6 +205,27 @@ func (t *txWrite) Put(space, key, val []byte) error {
 	t.overlay[overlayKey(space, key)] = m
 	t.muts = append(t.muts, m)
 	return nil
+}
+
+// NextSequence uses a native PostgreSQL sequence: nextval is lock-free and does
+// not create a shared row that every commit must serialise on. Values may have
+// gaps, which is fine — ordering only needs to be monotonic per key, and callers
+// allocate the sequence after taking the key's latest-row lock.
+func (t *txWrite) NextSequence(name string) (uint64, error) {
+	seq, ok := sequenceNames[name]
+	if !ok {
+		return 0, fmt.Errorf("postgres: unknown sequence %q", name)
+	}
+	var v int64
+	if err := t.tx.QueryRowContext(t.ctx, "SELECT nextval($1::regclass)", seq).Scan(&v); err != nil {
+		return 0, fmt.Errorf("postgres: nextval %s: %w", seq, err)
+	}
+	return uint64(v), nil
+}
+
+var sequenceNames = map[string]string{
+	"version":  "fass_version_seq",
+	"deletion": "fass_deletion_seq",
 }
 
 func (t *txWrite) Delete(space, key []byte) error {
@@ -555,4 +578,13 @@ func isUnavailable(err error) bool {
 	return strings.Contains(msg, "failed to connect") || strings.Contains(msg, "connection refused") ||
 		strings.Contains(msg, "conn closed") || strings.Contains(msg, "connection reset") ||
 		strings.Contains(msg, "no connection to the server")
+}
+
+// TimingSnapshot exposes the statement-level timing aggregates (empty unless
+// DebugTimings was enabled).
+func (k *KV) TimingSnapshot() map[string]Metric {
+	if k == nil || k.db == nil {
+		return map[string]Metric{}
+	}
+	return k.db.timings.Snapshot()
 }

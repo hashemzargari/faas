@@ -44,6 +44,9 @@ type Server struct {
 	now     func() time.Time
 	// gcStats, when set, exposes the deletion-GC executor counters on /metrics.
 	gcStats func() map[string]int64
+	// dbTimings exposes PostgreSQL statement timings for load-test attribution
+	// (only set when the coordinator runs with --db-debug-timings).
+	dbTimings func() any
 	// repair is the repair-state authority backing GET /v1/repair/status and the
 	// repair metrics. It is always non-nil so the endpoint works in every build.
 	repair *recovery.Service
@@ -82,6 +85,9 @@ func New(svc *coord.Service, logger *slog.Logger) *Server {
 
 // SetGCStats registers the deletion-GC counter source exposed on /metrics.
 func (s *Server) SetGCStats(fn func() map[string]int64) { s.gcStats = fn }
+
+// SetDBTimings registers the optional PostgreSQL timing snapshot endpoint.
+func (s *Server) SetDBTimings(fn func() any) { s.dbTimings = fn }
 
 // SetRepair replaces the repair-state service (the coordinator configures the
 // per-site budget and starts the background shard-set refresher on it).

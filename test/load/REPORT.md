@@ -96,3 +96,36 @@ Long/sustained churn (bloat over hours), degraded disks/WAN latency, failover
 under load. The next drill is HA-under-load: combine this harness with
 `test/ha`'s crash/promote and measure the client spike across the 456–482 ms
 failover window.
+
+## Fix 1 measurement — native PostgreSQL sequences (2026-10-24)
+
+Change: `nextSeq` now goes through a backend `NextSequence`; PostgreSQL uses
+native `fass_version_seq`/`fass_deletion_seq` (`nextval`, lock-free, migration
+0002) instead of a shared `kv` counter row read with `FOR UPDATE`. Embedded keeps
+its transaction-local counter row (behaviour unchanged). Correctness guard added
+to the parity suite: after N concurrent commits to one key, exactly one latest,
+strictly unique sequence values, and the highest sequence is the latest version;
+it passes on both backends.
+
+Same load profile, before → after:
+
+| metric | before | after fix 1 | delta |
+|---|---:|---:|---:|
+| coordinator commit p50 | 309 ms | **242 ms** | −22% |
+| 4 KiB PUT p50 | 389 ms | **317 ms** | −19% |
+| 4 KiB PUT throughput | 72 ops/s | **84 ops/s** | +17% |
+| 1 MiB PUT p50 | 413 ms | **346 ms** | −16% |
+| multi-bucket 16-writer commit p50 | 11.4 ms | **6.1 ms** | −46% |
+| `tx_begin_pool_acquire` avg | 4.2 ms | 3.6 ms | ≈ |
+| `kv_get_for_update` avg (63k–60k calls) | 32.0 ms | **31.8 ms** | unchanged |
+| read-only GET | 1 115 ops/s | **1 269 ops/s** | +14% |
+
+Gates unchanged: 200/200 byte-identical, 0 non-retryable 5xx, 0 deadlocks, bloat
+reclaimed, `make build/vet/test`, e2e and `test/compat` green.
+
+**Interpretation:** the global sequence row was ~22% of commit latency, but the
+dominant term is still `kv_get_for_update` (~32 ms average across ~60k
+acquisitions), i.e. the remaining `FOR UPDATE` reads in write transactions
+(bucket row, latest row, version-id lookup) queue behind each other. Fix 2
+(plain reads for read-only inputs; lock only the latest row) is still on the
+critical path — do not stop at fix 1.

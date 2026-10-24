@@ -37,6 +37,9 @@ type Config struct {
 	MaxIdleConns    int           // default 10
 	ConnMaxLifetime time.Duration // default 30m
 	StatementTime   time.Duration // default 5s; protects against a slow query pinning a gateway
+	// DebugTimings enables statement-level timing collection (load-test
+	// attribution only; negligible when off).
+	DebugTimings bool
 }
 
 func (c *Config) withDefaults() {
@@ -58,6 +61,7 @@ func (c *Config) withDefaults() {
 type DB struct {
 	*sql.DB
 	statementTime time.Duration
+	timings       *TimingStats
 }
 
 // Open connects and verifies the connection. It does not migrate: schema
@@ -78,6 +82,11 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	if _, ok := connCfg.RuntimeParams["statement_timeout"]; !ok {
 		connCfg.RuntimeParams["statement_timeout"] = fmt.Sprintf("%d", cfg.StatementTime.Milliseconds())
 	}
+	var timings *TimingStats
+	if cfg.DebugTimings {
+		timings = NewTimingStats()
+		connCfg.Tracer = timings.tracer()
+	}
 	db := stdlib.OpenDB(*connCfg)
 	db.SetMaxOpenConns(cfg.MaxOpenConns)
 	db.SetMaxIdleConns(cfg.MaxIdleConns)
@@ -89,7 +98,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("postgres: ping: %w", err)
 	}
-	return &DB{DB: db, statementTime: cfg.StatementTime}, nil
+	return &DB{DB: db, statementTime: cfg.StatementTime, timings: timings}, nil
 }
 
 // InTx runs fn inside a transaction, rolling back on error or panic.
@@ -98,7 +107,9 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 // panic rolls back and re-panics. Never swallow the panic — a half-applied
 // metadata write is worse than a crashed request.
 func (d *DB) InTx(ctx context.Context, fn func(ctx context.Context, tx *sql.Tx) error) (err error) {
+	beginStart := time.Now()
 	tx, err := d.BeginTx(ctx, nil)
+	d.timings.recordBegin(time.Since(beginStart))
 	if err != nil {
 		return fmt.Errorf("postgres: begin: %w", err)
 	}
@@ -114,8 +125,10 @@ func (d *DB) InTx(ctx context.Context, fn func(ctx context.Context, tx *sql.Tx) 
 	if err = fn(ctx, tx); err != nil {
 		return err
 	}
+	commitStart := time.Now()
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("postgres: commit: %w", err)
 	}
+	d.timings.recordCommit(time.Since(commitStart))
 	return nil
 }

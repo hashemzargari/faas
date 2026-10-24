@@ -15,7 +15,7 @@ import (
 //
 // A store written by a newer version is refused rather than silently
 // misinterpreted.
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 var metaSpace = []byte("meta")
 
@@ -89,4 +89,8 @@ func SchemaVersionOf(ctx context.Context, db Store) (int, error) {
 // lazily, so v1 has no work beyond recording the version.
 var migrations = map[int]func(context.Context, Writer) error{
 	1: func(ctx context.Context, tx Writer) error { return nil },
+	// v2: PostgreSQL moved version/deletion counters to native sequences. The
+	// embedded engine keeps its transaction-local counter rows (behaviour is
+	// unchanged there), so v2 is a recorded no-op for it.
+	2: func(ctx context.Context, tx Writer) error { return nil },
 }

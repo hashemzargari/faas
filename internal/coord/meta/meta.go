@@ -486,26 +486,11 @@ func ValidateKey(key string) error {
 // newID is indirected so tests can make identifiers predictable if ever needed.
 var newID = func() string { return id.New() }
 
-// nextSeq allocates the next value of a named monotonic counter inside tx.
+// nextSeq allocates the next value of a named monotonic sequence inside tx. The
+// backend decides how (embedded: transaction-local counter row; PostgreSQL:
+// native sequence), which keeps the serialization point out of the commit path.
 func nextSeq(tx storage.Writer, name string) (uint64, error) {
-	raw, err := tx.Get(spaceCounters, []byte(name))
-	switch {
-	case errors.Is(err, storage.ErrNotFound):
-		// start at 1
-	case err != nil:
-		return 0, err
-	}
-	var cur uint64
-	if len(raw) == 8 {
-		cur = binary.BigEndian.Uint64(raw)
-	}
-	next := cur + 1
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], next)
-	if err := tx.Put(spaceCounters, []byte(name), buf[:]); err != nil {
-		return 0, err
-	}
-	return next, nil
+	return tx.NextSequence(name)
 }
 
 // seqKey appends an 8-byte big-endian sequence number to a composite key so the

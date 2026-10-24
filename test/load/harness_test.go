@@ -60,6 +60,7 @@ type proc struct {
 	cmd  *exec.Cmd
 	log  *os.File
 	path string
+	done bool
 }
 
 var (
@@ -200,9 +201,22 @@ func (s *stack) start(name, bin string, args ...string) {
 	s.procs = append(s.procs, &proc{name: name, cmd: cmd, log: f, path: path})
 }
 
+// stopProfiled gracefully stops the coordinator so the CPU profile is flushed,
+// then returns the profile path.
+func (s *stack) stopProfiled() string {
+	profile := ""
+	for _, p := range s.procs {
+		if p.name == "coordinator" {
+			profile = filepath.Join(s.dir, "cpu.prof")
+		}
+	}
+	s.stop("coordinator")
+	return profile
+}
+
 func (s *stack) stop(name string) {
 	for _, p := range s.procs {
-		if p.name != name || p.cmd.Process == nil {
+		if p.name != name || p.cmd.Process == nil || p.done {
 			continue
 		}
 		_ = p.cmd.Process.Signal(syscall.SIGTERM)
@@ -214,6 +228,7 @@ func (s *stack) stop(name string) {
 			_ = p.cmd.Process.Kill()
 			<-done
 		}
+		p.done = true
 		p.log.Close()
 	}
 }
@@ -221,6 +236,9 @@ func (s *stack) stop(name string) {
 func (s *stack) shutdown() {
 	for i := len(s.procs) - 1; i >= 0; i-- {
 		p := s.procs[i]
+		if p.done {
+			continue
+		}
 		if p.cmd.Process != nil {
 			_ = p.cmd.Process.Signal(syscall.SIGTERM)
 			done := make(chan struct{})
@@ -233,6 +251,7 @@ func (s *stack) shutdown() {
 			}
 			p.log.Close()
 		}
+		p.done = true
 	}
 }
 
@@ -319,6 +338,10 @@ func boot(s *stack) error {
 		"--db-driver=postgres", "--db-dsn="+s.dsn, "--db-migrate-on-start=true",
 		"--gc-interval=1h", "--lifecycle-interval=1h",
 		"--repair-refresh-interval=1h",
+		// Load-test attribution: statement timings + a CPU profile captured for the
+		// lifetime of the coordinator (written on shutdown).
+		"--db-debug-timings",
+		"--cpu-profile="+filepath.Join(s.dir, "cpu.prof"),
 		"--log-format=text",
 	)
 	waitHTTP(s.t, "coordinator", s.coordURL+"/healthz", 60*time.Second)
@@ -560,3 +583,21 @@ func (s *stack) coordMetricUnused(name string) float64 {
 }
 
 var _ = sync.Mutex{}
+
+type timingMetric struct {
+	SumSeconds float64 `json:"sum_seconds"`
+	Count      int64   `json:"count"`
+	AvgMillis  float64 `json:"avg_ms"`
+}
+
+// dbTimings scrapes the coordinator's statement-level timing snapshot.
+func (s *stack) dbTimings() map[string]timingMetric {
+	resp, err := http.Get(s.coordURL + "/v1/debug/db-timings")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var out map[string]timingMetric
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return out
+}

@@ -352,13 +352,34 @@ func testConcurrentCommits(t *testing.T, ctx context.Context, m *meta.Service) {
 			t.Fatalf("versions = %d, want 2 (no lost version): %+v", len(versions), versions)
 		}
 		latest := 0
+		maxSeq := uint64(0)
+		seenSeq := map[uint64]bool{}
 		for _, v := range versions {
 			if v.IsLatest {
 				latest++
 			}
+			if v.Seq == 0 || seenSeq[v.Seq] {
+				t.Fatalf("version sequence value %d is zero or duplicated: %+v", v.Seq, versions)
+			}
+			seenSeq[v.Seq] = true
+			if v.Seq > maxSeq {
+				maxSeq = v.Seq
+			}
 		}
 		if latest != 1 {
 			t.Fatalf("IsLatest = %d, want exactly 1", latest)
+		}
+		// Sequencing is observable through ListObjectVersions: the committed version
+		// with the highest sequence must be the one flagged latest, and no concurrent
+		// commit may lose its version or reuse a sequence value.
+		var newest *meta.VersionInfo
+		for i := range versions {
+			if versions[i].Seq == maxSeq {
+				newest = &versions[i]
+			}
+		}
+		if newest == nil || !newest.IsLatest {
+			t.Fatalf("highest sequence %d is not the latest version: %+v", maxSeq, versions)
 		}
 	})
 

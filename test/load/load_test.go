@@ -14,9 +14,11 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -264,6 +266,7 @@ func TestMixedWorkloadLoad(t *testing.T) {
 
 	pgBase := s.pgSnapshot(t)
 	metricsBefore := s.coordMetricsText()
+	dbBefore := s.dbTimings()
 
 	// Continuous 1 s Postgres/memory sampler for the whole run (required by the
 	// task: activity/lock waiters/dead tuples must be attributable, not a single
@@ -447,6 +450,7 @@ func TestMixedWorkloadLoad(t *testing.T) {
 	}
 	mixed := m.summaries()
 	putAgg := m.combined("put_4k", "put_1m", "put_12m")
+	dbAfter := s.dbTimings()
 	peakMemLow := memAvailableMB()
 
 	// --- contention storm: 200 concurrent commits to one key ------------------
@@ -617,8 +621,14 @@ func TestMixedWorkloadLoad(t *testing.T) {
 		}
 	}
 
+	// Capture the coordinator CPU profile (period = whole run) for the commit path.
+	profilePath := s.stopProfiled()
+	pprofTop := runPProf(t, profilePath)
+
 	summary := buildReport(s, mixed, readonly, phases, diag, contentionP99, int64(len(contention)), contentionErrs, contentionDur, atomic.LoadInt64(&maxLockWaiters), deadlocksBefore, deadlocksAfterContention, deadlocksAfterRO, len(ver.m), verified, mismatches, pgBase, pgPeak, bloatFinal, baseMem, peakMemLow, minMem, repairOK, metricsBefore, s.coordMetricsText())
 
+	summary.DBStats, summary.DBStatsCounts = dbTimingDelta(dbBefore, dbAfter)
+	summary.CPUProfileTop = pprofTop
 	path, err := writeReport(summary)
 	if err != nil {
 		t.Fatalf("write report: %v", err)
@@ -690,24 +700,27 @@ type pgSnapshot struct {
 }
 
 type report struct {
-	StartedAt    time.Time             `json:"started_at"`
-	Machine      string                `json:"machine"`
-	Command      string                `json:"command"`
-	Gateways     int                   `json:"gateways"`
-	Memory       memoryReport          `json:"memory"`
-	Mixed        map[string]latSummary `json:"mixed_phase"`
-	ReadOnly     map[string]latSummary `json:"readonly_phase"`
-	Phases       phaseReport           `json:"phases"`
-	Diagnostics  diagnosticReport      `json:"diagnostics"`
-	Contention   contentionReport      `json:"contention_phase"`
-	Errors       errorsReport          `json:"errors"`
-	Pool         poolReport            `json:"pool"`
-	Bloat        bloatReport           `json:"bloat"`
-	Postgres     postgresReport        `json:"postgres"`
-	Verification verificationReport    `json:"verification"`
-	Repair       bool                  `json:"repair_ok"`
-	Coordinator  map[string]any        `json:"coordinator_metrics"`
-	PhaseNotes   []string              `json:"phase_notes"`
+	StartedAt     time.Time             `json:"started_at"`
+	Machine       string                `json:"machine"`
+	Command       string                `json:"command"`
+	Gateways      int                   `json:"gateways"`
+	Memory        memoryReport          `json:"memory"`
+	Mixed         map[string]latSummary `json:"mixed_phase"`
+	ReadOnly      map[string]latSummary `json:"readonly_phase"`
+	Phases        phaseReport           `json:"phases"`
+	Diagnostics   diagnosticReport      `json:"diagnostics"`
+	Contention    contentionReport      `json:"contention_phase"`
+	Errors        errorsReport          `json:"errors"`
+	Pool          poolReport            `json:"pool"`
+	Bloat         bloatReport           `json:"bloat"`
+	Postgres      postgresReport        `json:"postgres"`
+	Verification  verificationReport    `json:"verification"`
+	Repair        bool                  `json:"repair_ok"`
+	Coordinator   map[string]any        `json:"coordinator_metrics"`
+	DBStats       map[string]float64    `json:"db_statement_avg_ms"`
+	DBStatsCounts map[string]int64      `json:"db_statement_counts"`
+	CPUProfileTop []string              `json:"cpu_profile_top"`
+	PhaseNotes    []string              `json:"phase_notes"`
 }
 
 type memoryReport struct {
@@ -1061,4 +1074,54 @@ func p50ms(vals []time.Duration) float64 {
 	cp := append([]time.Duration(nil), vals...)
 	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
 	return float64(cp[len(cp)/2].Microseconds()) / 1000.0
+}
+
+// dbTimingDelta turns two cumulative timing snapshots into per-op averages for
+// the measured window: average = Δsum / Δcount.
+func dbTimingDelta(before, after map[string]timingMetric) (map[string]float64, map[string]int64) {
+	avg := map[string]float64{}
+	cnt := map[string]int64{}
+	for op, a := range after {
+		b := before[op]
+		dc := a.Count - b.Count
+		if dc <= 0 {
+			continue
+		}
+		ds := a.SumSeconds - b.SumSeconds
+		avg[op] = ds * 1000 / float64(dc)
+		cnt[op] = dc
+	}
+	return avg, cnt
+}
+
+// runPProf captures the top functions from the coordinator CPU profile.
+func runPProf(t *testing.T, profile string) []string {
+	t.Helper()
+	if profile == "" {
+		return nil
+	}
+	if _, err := os.Stat(profile); err != nil {
+		t.Logf("cpu profile not found at %s: %v", profile, err)
+		return nil
+	}
+	cmd := exec.Command("go", "tool", "pprof", "-top", "-nodecount=25",
+		filepath.Join(binDir, "fass-coordinator"), profile)
+	cmd.Env = buildEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Logf("pprof: %v\n%s", err, out)
+		return nil
+	}
+	var lines []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "File:") || strings.HasPrefix(line, "Type:") ||
+			strings.HasPrefix(line, "Time:") || strings.HasPrefix(line, "Duration:") ||
+			strings.HasPrefix(line, "Showing") || strings.HasPrefix(line, "flat ") ||
+			strings.HasPrefix(line, "Total:") || strings.HasPrefix(line, "Dropped") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines
 }

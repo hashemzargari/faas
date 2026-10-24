@@ -16,7 +16,7 @@ import (
 // SchemaVersion is the PostgreSQL schema version this binary expects. It matches
 // storage.SchemaVersion: the embedded and PostgreSQL backends record the same
 // logical metadata version.
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 // migrationFiles is the embedded ordered migration set.
 var migrationFiles embed.FS = migrations.FS

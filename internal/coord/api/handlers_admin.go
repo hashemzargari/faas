@@ -174,6 +174,16 @@ func (s *Server) handleCommitRepair(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleDBTimings exposes PostgreSQL statement timings when the coordinator was
+// started with --db-debug-timings (load-test attribution only).
+func (s *Server) handleDBTimings(w http.ResponseWriter, r *http.Request) {
+	if s.dbTimings == nil {
+		writeError(w, r, coerr.E(404, "NotFound", "db timings are disabled on this coordinator"))
+		return
+	}
+	writeJSON(w, r, http.StatusOK, s.dbTimings())
+}
+
 // handleRepairStatus is the operator-facing repair state (docs/07 §1.6). It is a
 // read of counters maintained by the recovery service plus one topology snapshot:
 // no manifest or shard scan happens on the request path.
