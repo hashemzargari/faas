@@ -408,6 +408,12 @@ type Heartbeat struct {
 	ScrubCursor     string    `json:"scrub_cursor"`
 	InventoryDigest string    `json:"inventory_digest"`
 	Time            time.Time `json:"time"`
+	// Security posture of the agent's shard listener, reported on every
+	// heartbeat so the control plane can answer "is any agent plaintext?" and
+	// "which certificates expire soon?" without asking each agent directly.
+	TLSEnabled   bool       `json:"tls_enabled"`
+	Insecure     bool       `json:"insecure"`
+	CertNotAfter *time.Time `json:"cert_not_after,omitempty"`
 }
 
 type ShardStatus struct {
