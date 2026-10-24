@@ -18,7 +18,7 @@ func isolateEnv(t *testing.T) {
 		"FASS_CONSOLE_TLS_CLIENT_CA", "FASS_CONSOLE_REQUIRE_MTLS",
 		"FASS_CONSOLE_COORDINATOR_CA", "FASS_CONSOLE_COORDINATOR_CLIENT_CERT",
 		"FASS_CONSOLE_COORDINATOR_CLIENT_KEY", "FASS_CONSOLE_COORDINATOR_SERVER_NAME",
-		"FASS_CONSOLE_COORDINATOR_INSECURE",
+		"FASS_CONSOLE_COORDINATOR_INSECURE", "FASS_CONSOLE_INSECURE", "FASS_CONSOLE_DEV",
 	} {
 		t.Setenv(k, "")
 	}
@@ -27,12 +27,12 @@ func isolateEnv(t *testing.T) {
 func TestParseConfigDefaults(t *testing.T) {
 	isolateEnv(t)
 	t.Setenv("FASS_CONSOLE_PASSWORD", "pw")
-	cfg, err := parseConfig([]string{"--coordinator-insecure"})
+	cfg, err := parseConfig([]string{"--insecure"})
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
-	if !cfg.coordinatorInsecure {
-		t.Error("--coordinator-insecure should be recorded")
+	if !cfg.insecure {
+		t.Error("--insecure should be recorded")
 	}
 	if cfg.listen != "127.0.0.1:8081" {
 		t.Errorf("listen = %q", cfg.listen)
@@ -64,7 +64,7 @@ func TestParseConfigFlagsOverrideEnv(t *testing.T) {
 		"--listen", "127.0.0.1:9999",
 		"--console-user", "flag-user",
 		"--read-only=false",
-		"--coordinator-insecure",
+		"--insecure",
 	})
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
@@ -81,7 +81,7 @@ func TestParseConfigReadOnlyEnv(t *testing.T) {
 	isolateEnv(t)
 	t.Setenv("FASS_CONSOLE_PASSWORD", "pw")
 	t.Setenv("FASS_CONSOLE_READ_ONLY", "false")
-	t.Setenv("FASS_CONSOLE_COORDINATOR_INSECURE", "true")
+	t.Setenv("FASS_CONSOLE_INSECURE", "true")
 	cfg, err := parseConfig(nil)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
@@ -94,7 +94,7 @@ func TestParseConfigReadOnlyEnv(t *testing.T) {
 func TestParseConfigRejectsBadCoordinator(t *testing.T) {
 	isolateEnv(t)
 	t.Setenv("FASS_CONSOLE_PASSWORD", "pw")
-	if _, err := parseConfig([]string{"--coordinator", "coordinator:7000", "--coordinator-insecure"}); err == nil {
+	if _, err := parseConfig([]string{"--coordinator", "coordinator:7000", "--insecure"}); err == nil {
 		t.Fatal("expected a scheme validation error")
 	}
 }
@@ -103,7 +103,7 @@ func TestParseConfigPlaintextCoordinatorNeedsExplicitOptIn(t *testing.T) {
 	isolateEnv(t)
 	t.Setenv("FASS_CONSOLE_PASSWORD", "pw")
 	_, err := parseConfig(nil)
-	if err == nil || !strings.Contains(err.Error(), "--coordinator-insecure") {
+	if err == nil || !strings.Contains(err.Error(), "--insecure") {
 		t.Fatalf("expected an explicit plaintext opt-in error, got %v", err)
 	}
 }
@@ -125,10 +125,10 @@ func TestParseConfigTLSPairs(t *testing.T) {
 		args []string
 		want string
 	}{
-		{"server cert without key", []string{"--coordinator-insecure", "--tls-cert", "c.pem"}, "--tls-cert and --tls-key"},
-		{"client cert without key", []string{"--coordinator-insecure", "--coordinator-client-cert", "c.pem"}, "--coordinator-client-cert and --coordinator-client-key"},
-		{"require-mtls without listener TLS", []string{"--coordinator-insecure", "--require-mtls", "--tls-client-ca", "ca.pem"}, "--require-mtls needs --tls-cert"},
-		{"require-mtls without client CA", []string{"--coordinator-insecure", "--require-mtls", "--tls-cert", "c.pem", "--tls-key", "k.pem"}, "--require-mtls needs --tls-client-ca"},
+		{"server cert without key", []string{"--insecure", "--tls-cert", "c.pem"}, "--tls-cert and --tls-key"},
+		{"client cert without key", []string{"--insecure", "--coordinator-client-cert", "c.pem"}, "--coordinator-client-cert and --coordinator-client-key"},
+		{"require-mtls without listener TLS", []string{"--insecure", "--require-mtls", "--tls-client-ca", "ca.pem"}, "--require-mtls needs --tls-cert"},
+		{"require-mtls without client CA", []string{"--insecure", "--require-mtls", "--tls-cert", "c.pem", "--tls-key", "k.pem"}, "--require-mtls needs --tls-client-ca"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

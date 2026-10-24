@@ -66,7 +66,7 @@ type SecurityInfo struct {
 // Warning returns the persistent banner text for an insecure posture, or "".
 func (s SecurityInfo) Warning() string {
 	if s.CoordinatorInsecure {
-		return "the coordinator connection is PLAINTEXT (--coordinator-insecure); dev-only, do not use outside a throwaway cluster."
+		return "the coordinator connection is PLAINTEXT (--insecure/--dev); dev-only, do not use outside a throwaway cluster."
 	}
 	return ""
 }

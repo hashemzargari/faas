@@ -165,7 +165,7 @@ done
 
 # 5. Console (writes enabled; omit --read-only=false for read-only).
 ./bin/fass-console --listen=127.0.0.1:8081 \
-  --coordinator=http://127.0.0.1:7000 --coordinator-insecure \
+  --coordinator=http://127.0.0.1:7000 --insecure \
   --console-user=admin --console-password=change-me \
   --read-only=false >.dev/console.log 2>&1 &
 ```
@@ -371,7 +371,7 @@ export FASS_CONSOLE_PASSWORD='change-me'
 # Dev/plaintext coordinator: the opt-in is explicit and shows in the banner.
 ./bin/fass-console \
   --listen=127.0.0.1:8081 \
-  --coordinator=http://127.0.0.1:7000 --coordinator-insecure \
+  --coordinator=http://127.0.0.1:7000 --insecure \
   --console-user=admin \
   --console-password="$FASS_CONSOLE_PASSWORD" \
   --read-only=false          # omit / =true for read-only (the default)
@@ -396,9 +396,17 @@ TLS flags: `--tls-cert/--tls-key` serve the console over HTTPS; optional
 (browser UX is poor — prefer a proxy/SSO for humans). `--coordinator-ca` is
 **required** for an `https://` coordinator; `--coordinator-client-cert/-key` are
 presented to a `--require-mtls` coordinator; `--coordinator-server-name`
-overrides the verified name. An `http://` coordinator requires the explicit
-`--coordinator-insecure`; either plaintext choice is reported in `/healthz`
+overrides the verified name. Plaintext is **all-or-nothing**: an `http://`
+coordinator requires the explicit `--insecure` (or `--dev`) opt-out — there is
+no per-hop insecure flag. Either plaintext choice is reported in `/healthz`
 (`"security":{"insecure":true,...}`) and as a persistent banner.
+
+**Removed in this release:** the per-hop `--coordinator-insecure` flag (and
+`FASS_CONSOLE_COORDINATOR_INSECURE`) is gone from the documented interface. It
+is still accepted for one release as a deprecated alias that logs a warning and
+maps to `--insecure`, so existing scripts fail loudly instead of mysteriously;
+switch them to `--insecure`/`--dev`. The gateway's plaintext transition flag is
+likewise gone: plaintext is all-or-nothing through `--dev`/`--insecure`.
 
 The password is mandatory; the process refuses to start without one. When the
 console listener is plaintext, Basic auth is sent in clear text — terminate TLS

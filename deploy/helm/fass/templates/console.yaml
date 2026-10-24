@@ -131,7 +131,8 @@ spec:
             - name: SSL_CERT_FILE
               value: {{ printf "/etc/fass/tls/ca/%s" .Values.tls.caKey | quote }}
             {{- else }}
-            - name: FASS_CONSOLE_COORDINATOR_INSECURE
+            # Plaintext is all-or-nothing; this is the single console opt-out.
+            - name: FASS_CONSOLE_INSECURE
               value: "true"
             {{- end }}
           ports:

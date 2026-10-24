@@ -52,7 +52,13 @@ type config struct {
 	coordinatorClientCert string
 	coordinatorClientKey  string
 	coordinatorServerName string
-	coordinatorInsecure   bool
+
+	// Plaintext is all-or-nothing: --insecure (or --dev) is the single opt-out.
+	// --coordinator-insecure is a deprecated one-release alias.
+	insecure                      bool
+	dev                           bool
+	deprecatedCoordinatorInsecure bool
+	deprecationWarnings           []string
 }
 
 func main() {
@@ -72,6 +78,13 @@ func run(args []string) error {
 		return err
 	}
 
+	for _, warning := range cfg.deprecationWarnings {
+		logger.Warn(warning)
+	}
+	if cfg.insecure || cfg.dev {
+		logger.Warn("plaintext control-plane traffic is ALLOWED (--insecure/--dev); dev-only and reported on /healthz")
+	}
+
 	coordinatorClient, err := coordinatorHTTPClient(cfg)
 	if err != nil {
 		return err
@@ -85,7 +98,7 @@ func run(args []string) error {
 		return err
 	}
 	if coordScheme == "http" {
-		logger.Warn("PLAINTEXT coordinator connection: --coordinator-insecure is set; this is dev-only")
+		logger.Warn("PLAINTEXT coordinator connection: --insecure/--dev is set; this is dev-only")
 	}
 	if serverTLS == nil {
 		logger.Warn("console listener is plaintext HTTP; front it with a TLS reverse proxy")
@@ -178,15 +191,17 @@ func parseConfig(args []string) (config, error) {
 		logLevel:    envOr("FASS_LOG_LEVEL", "info"),
 		logFormat:   envOr("FASS_LOG_FORMAT", "text"),
 
-		tlsCert:               envOr("FASS_CONSOLE_TLS_CERT", ""),
-		tlsKey:                envOr("FASS_CONSOLE_TLS_KEY", ""),
-		tlsClientCA:           envOr("FASS_CONSOLE_TLS_CLIENT_CA", ""),
-		requireMTLS:           envBool("FASS_CONSOLE_REQUIRE_MTLS"),
-		coordinatorCA:         envOr("FASS_CONSOLE_COORDINATOR_CA", ""),
-		coordinatorClientCert: envOr("FASS_CONSOLE_COORDINATOR_CLIENT_CERT", ""),
-		coordinatorClientKey:  envOr("FASS_CONSOLE_COORDINATOR_CLIENT_KEY", ""),
-		coordinatorServerName: envOr("FASS_CONSOLE_COORDINATOR_SERVER_NAME", ""),
-		coordinatorInsecure:   envBool("FASS_CONSOLE_COORDINATOR_INSECURE"),
+		tlsCert:                       envOr("FASS_CONSOLE_TLS_CERT", ""),
+		tlsKey:                        envOr("FASS_CONSOLE_TLS_KEY", ""),
+		tlsClientCA:                   envOr("FASS_CONSOLE_TLS_CLIENT_CA", ""),
+		requireMTLS:                   envBool("FASS_CONSOLE_REQUIRE_MTLS"),
+		coordinatorCA:                 envOr("FASS_CONSOLE_COORDINATOR_CA", ""),
+		coordinatorClientCert:         envOr("FASS_CONSOLE_COORDINATOR_CLIENT_CERT", ""),
+		coordinatorClientKey:          envOr("FASS_CONSOLE_COORDINATOR_CLIENT_KEY", ""),
+		coordinatorServerName:         envOr("FASS_CONSOLE_COORDINATOR_SERVER_NAME", ""),
+		insecure:                      envBool("FASS_CONSOLE_INSECURE"),
+		dev:                           envBool("FASS_CONSOLE_DEV"),
+		deprecatedCoordinatorInsecure: envBool("FASS_CONSOLE_COORDINATOR_INSECURE"),
 	}
 	fs.StringVar(&cfg.listen, "listen", cfg.listen, "HTTP listen address (env FASS_CONSOLE_LISTEN)")
 	fs.StringVar(&cfg.coordinator, "coordinator", cfg.coordinator, "coordinator base URL (env FASS_COORDINATOR_URL)")
@@ -202,7 +217,9 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.coordinatorClientCert, "coordinator-client-cert", cfg.coordinatorClientCert, "client certificate presented to a coordinator with --require-mtls (env FASS_CONSOLE_COORDINATOR_CLIENT_CERT)")
 	fs.StringVar(&cfg.coordinatorClientKey, "coordinator-client-key", cfg.coordinatorClientKey, "client key for --coordinator-client-cert (env FASS_CONSOLE_COORDINATOR_CLIENT_KEY)")
 	fs.StringVar(&cfg.coordinatorServerName, "coordinator-server-name", cfg.coordinatorServerName, "server name verified against the coordinator certificate (default: host from --coordinator)")
-	fs.BoolVar(&cfg.coordinatorInsecure, "coordinator-insecure", cfg.coordinatorInsecure, "explicitly allow a plaintext http:// coordinator (dev only; visible in the banner and /healthz)")
+	fs.BoolVar(&cfg.insecure, "insecure", cfg.insecure, "explicitly allow plaintext control-plane traffic (http:// coordinator); dev only, visible in /healthz")
+	fs.BoolVar(&cfg.dev, "dev", cfg.dev, "dev mode: allow a plaintext http:// coordinator (same effect as --insecure here)")
+	fs.BoolVar(&cfg.deprecatedCoordinatorInsecure, "coordinator-insecure", cfg.deprecatedCoordinatorInsecure, "DEPRECATED, use --insecure or --dev (accepted for one release; logs a warning)")
 	fs.StringVar(&cfg.logLevel, "log-level", cfg.logLevel, "debug|info|warn|error")
 	fs.StringVar(&cfg.logFormat, "log-format", cfg.logFormat, "json|text")
 	showVersion := fs.Bool("version", false, "print version and exit")
@@ -239,16 +256,21 @@ func parseConfig(args []string) (config, error) {
 	if (cfg.coordinatorClientCert == "") != (cfg.coordinatorClientKey == "") {
 		return config{}, errors.New("--coordinator-client-cert and --coordinator-client-key must be set together")
 	}
+	if cfg.deprecatedCoordinatorInsecure {
+		cfg.insecure = true
+		cfg.deprecationWarnings = append(cfg.deprecationWarnings,
+			"--coordinator-insecure is deprecated and will be removed in the next release; use --insecure (or --dev) — plaintext is all-or-nothing")
+	}
 	if strings.HasPrefix(cfg.coordinator, "https://") {
 		if cfg.coordinatorCA == "" {
 			return config{}, errors.New("refusing to use an https:// coordinator without --coordinator-ca: " +
 				"set the CA bundle that verifies the coordinator certificate (FASS_CONSOLE_COORDINATOR_CA); " +
-				"plaintext http:// requires --coordinator-insecure and is dev-only")
+				"plaintext http:// requires --insecure or --dev and is dev-only")
 		}
-	} else if !cfg.coordinatorInsecure {
-		return config{}, errors.New("refusing a plaintext http:// coordinator without --coordinator-insecure: " +
-			"use https:// with --coordinator-ca, or pass --coordinator-insecure for a dev-only deployment " +
-			"(the console banner and /healthz will report it)")
+	} else if !cfg.insecure && !cfg.dev {
+		return config{}, errors.New("refusing a plaintext http:// coordinator without --insecure or --dev: " +
+			"plaintext is all-or-nothing (no per-hop switch); use https:// with --coordinator-ca, or pass " +
+			"--insecure/--dev for a dev-only deployment (the console banner and /healthz will report it)")
 	}
 	return cfg, nil
 }
