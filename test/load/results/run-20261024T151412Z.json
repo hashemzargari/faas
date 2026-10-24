@@ -1,0 +1,270 @@
+{
+  "started_at": "2026-10-24T15:14:12.138422468Z",
+  "machine": "host=hertz-14x cpus=20 docker=postgres:16 go=load",
+  "command": "go test -tags=load -count=1 ./test/load/ -v",
+  "gateways": 2,
+  "memory": {
+    "mem_available_at_boot_mb": 6381,
+    "mem_available_after_measured_phase_mb": 5363,
+    "min_available_mb": 4931,
+    "gateways_degraded_to_one": false
+  },
+  "mixed_phase": {
+    "churn": {
+      "n": 1680,
+      "errors": 0,
+      "err_503_retryable": 0,
+      "err_5xx_non_retryable": 0,
+      "err_4xx": 0,
+      "err_network": 0,
+      "bytes": 22871,
+      "p50_ms": 103.195,
+      "p95_ms": 405.717,
+      "p99_ms": 631.201,
+      "max_ms": 1039.865,
+      "ops_per_sec": 27.999972945959474,
+      "mib_per_sec": 0.0003635244035987849
+    },
+    "get": {
+      "n": 20258,
+      "errors": 0,
+      "err_503_retryable": 0,
+      "err_5xx_non_retryable": 0,
+      "err_4xx": 0,
+      "err_network": 0,
+      "bytes": 4555464704,
+      "p50_ms": 37.476,
+      "p95_ms": 103.176,
+      "p99_ms": 230.777,
+      "max_ms": 989.35,
+      "ops_per_sec": 337.63300710669466,
+      "mib_per_sec": 72.40709149739475
+    },
+    "list": {
+      "n": 4283,
+      "errors": 0,
+      "err_503_retryable": 0,
+      "err_5xx_non_retryable": 0,
+      "err_4xx": 0,
+      "err_network": 0,
+      "bytes": 0,
+      "p50_ms": 84.984,
+      "p95_ms": 159.171,
+      "p99_ms": 210.691,
+      "max_ms": 468.422,
+      "ops_per_sec": 71.3832643616336,
+      "mib_per_sec": 0
+    },
+    "put_12m": {
+      "n": 88,
+      "errors": 0,
+      "err_503_retryable": 0,
+      "err_5xx_non_retryable": 0,
+      "err_4xx": 0,
+      "err_network": 0,
+      "bytes": 1107296256,
+      "p50_ms": 432.268,
+      "p95_ms": 869.947,
+      "p99_ms": 1115.596,
+      "max_ms": 1129.295,
+      "ops_per_sec": 1.4666652495502581,
+      "mib_per_sec": 17.5999829946031
+    },
+    "put_1m": {
+      "n": 863,
+      "errors": 0,
+      "err_503_retryable": 0,
+      "err_5xx_non_retryable": 0,
+      "err_4xx": 0,
+      "err_network": 0,
+      "bytes": 904921088,
+      "p50_ms": 205.301,
+      "p95_ms": 486.547,
+      "p99_ms": 677.52,
+      "max_ms": 989.283,
+      "ops_per_sec": 14.383319435930373,
+      "mib_per_sec": 14.383319435930373
+    },
+    "put_4k": {
+      "n": 7745,
+      "errors": 0,
+      "err_503_retryable": 0,
+      "err_5xx_non_retryable": 0,
+      "err_4xx": 0,
+      "err_network": 0,
+      "bytes": 31723520,
+      "p50_ms": 171.173,
+      "p95_ms": 480.845,
+      "p99_ms": 688.433,
+      "max_ms": 1050.77,
+      "ops_per_sec": 129.0832086109858,
+      "mib_per_sec": 0.5042312836366633
+    },
+    "vlist": {
+      "n": 3289,
+      "errors": 0,
+      "err_503_retryable": 0,
+      "err_5xx_non_retryable": 0,
+      "err_4xx": 0,
+      "err_network": 0,
+      "bytes": 0,
+      "p50_ms": 34.705,
+      "p95_ms": 69.146,
+      "p99_ms": 99.62,
+      "max_ms": 310.119,
+      "ops_per_sec": 54.8166137019409,
+      "mib_per_sec": 0
+    }
+  },
+  "readonly_phase": {
+    "get": {
+      "n": 13095,
+      "errors": 0,
+      "err_503_retryable": 0,
+      "err_5xx_non_retryable": 0,
+      "err_4xx": 0,
+      "err_network": 0,
+      "bytes": 3089711104,
+      "p50_ms": 9.828,
+      "p95_ms": 23.226,
+      "p99_ms": 74.818,
+      "max_ms": 160.656,
+      "ops_per_sec": 1309.4601709356568,
+      "mib_per_sec": 294.64885034270844
+    }
+  },
+  "phases": {
+    "placement_p50_ms": 18.771,
+    "placement_count": 9590,
+    "commit_p50_ms": 26.592,
+    "commit_count": 9500,
+    "shard_put_count": 114873,
+    "shard_put_p50_ms": 48.754,
+    "shard_put_p95_ms": 302.059,
+    "shard_put_p99_ms": 522.176,
+    "shard_put_max_ms": 961.486,
+    "shard_writes_per_agent_per_s": 159.54567917763902,
+    "agent_shard_busy_ms_total": 9887244.972,
+    "put_p50_total_ms": 176.763,
+    "put_minus_coordinator_p50_ms": 131.40000000000003,
+    "shard_wave_share_of_put_pct": 74.33682388282618,
+    "notes": [
+      "PutMinusCoordinator = client PUT p50 - coordinator placement p50 - coordinator commit p50; it is the EC encode + shard HTTP/fsync wave + gateway overhead (not further split without gateway instrumentation)",
+      "shard PUT duration is the agent transport handler wall time, which includes fsync+rename+dir fsync for that shard"
+    ]
+  },
+  "diagnostics": {
+    "single_writer_4k_put_p50_ms": 7.47,
+    "single_writer_commit_p50_ms": 1.135,
+    "same_bucket_16_writers_4k_put_p50_ms": 28.068,
+    "multi_bucket_16_writers_4k_put_p50_ms": 34.566,
+    "multi_bucket_commit_p50_ms": 3.202,
+    "notes": [
+      "single_writer ≈ commit service time with no contention",
+      "same_bucket vs multi_bucket isolates bucket-row lock contention from the global version-seq counter lock",
+      "all phases are 4 KiB single PUTs through the same gateways and agents"
+    ]
+  },
+  "contention_phase": {
+    "concurrency": 200,
+    "duration_ms": 613.562,
+    "p99_ms": 610.488,
+    "errors": 0,
+    "deadlocks_delta": 0,
+    "max_pg_lock_waiters": 39,
+    "deadlocks_after_readonly": 0
+  },
+  "errors": {
+    "503_retryable": 0,
+    "5xx_non_retryable": 0,
+    "4xx": 0,
+    "network": 0
+  },
+  "pool": {
+    "max_connections_observed": 41
+  },
+  "bloat": {
+    "baseline_dead_tuples": 23,
+    "peak_dead_tuples": 504,
+    "final_dead_tuples": 38,
+    "reclaimed": true
+  },
+  "postgres": {
+    "max_active_connections": 27,
+    "max_lock_waiters": 39,
+    "deadlocks_start": 0,
+    "deadlocks_end": 0
+  },
+  "verification": {
+    "corpus_keys": 12450,
+    "verified": 200,
+    "mismatches": 0
+  },
+  "repair_ok": true,
+  "coordinator_metrics": {
+    "fass_coordinator_http_request_duration_seconds_count": 0,
+    "fass_coordinator_http_requests_total": 0,
+    "scraped": false
+  },
+  "gateway_shard_stats": null,
+  "db_statement_avg_ms": {
+    "blob_get": 1.5800677093111093,
+    "blob_put": 2.113150967371737,
+    "kv_get": 1.238521630201921,
+    "kv_get_for_update": 1.7964514567646668,
+    "kv_put": 1.4454460739536135,
+    "kv_scan_range": 11.885999380966679,
+    "kv_scan_space": 1.3814986239161595,
+    "other": 1.106038475456505,
+    "tx_begin_pool_acquire": 3.7951328268464994,
+    "tx_commit": 6.602543953885677
+  },
+  "db_statement_counts": {
+    "blob_get": 41037,
+    "blob_put": 13332,
+    "kv_get": 222562,
+    "kv_get_for_update": 30068,
+    "kv_put": 44582,
+    "kv_scan_range": 26648,
+    "kv_scan_space": 98377,
+    "other": 432416,
+    "tx_begin_pool_acquire": 15570,
+    "tx_commit": 15570
+  },
+  "cpu_profile_top": [
+    "Build ID: 9481aa2ab1fdc5ec772b0e83ec38fc46e2a33e04",
+    "32.31s  9.18%  9.18%     32.31s  9.18%  internal/runtime/syscall/linux.Syscall6",
+    "13.05s  3.71% 12.89%     13.22s  3.76%  encoding/json/internal/jsonwire.ConsumeSimpleString (inline)",
+    "8.76s  2.49% 15.38%     14.97s  4.25%  runtime.tryDeferToSpanScan",
+    "7.47s  2.12% 17.51%      7.47s  2.12%  crypto/internal/fips140/sha256.blockSHANI",
+    "6.92s  1.97% 19.47%      6.92s  1.97%  runtime.memmove",
+    "6.72s  1.91% 21.38%      6.72s  1.91%  runtime.futex",
+    "5.63s  1.60% 22.98%      5.63s  1.60%  runtime.memclrNoHeapPointers",
+    "5.54s  1.57% 24.56%      5.61s  1.59%  encoding/json/internal/jsonwire.ConsumeWhitespace (inline)",
+    "5.15s  1.46% 26.02%     16.61s  4.72%  runtime.scanObject",
+    "5.13s  1.46% 27.48%     18.97s  5.39%  encoding/json/jsontext.(*decoderState).ReadValue",
+    "4.58s  1.30% 28.78%      4.58s  1.30%  runtime.spanClass.sizeclass (inline)",
+    "4.20s  1.19% 29.97%     25.76s  7.32%  encoding/json/jsontext.(*decoderState).consumeValue",
+    "4.18s  1.19% 31.16%      5.51s  1.57%  runtime.findObject",
+    "4.04s  1.15% 32.31%      4.04s  1.15%  runtime.procyieldAsm",
+    "3.80s  1.08% 33.39%      3.80s  1.08%  internal/runtime/maps.memHashAES",
+    "3.51s     1% 34.39%      3.51s     1%  memeqbody",
+    "3.50s  0.99% 35.38%      9.18s  2.61%  encoding/json/v2.makeString",
+    "3.37s  0.96% 36.34%     15.14s  4.30%  encoding/json/jsontext.(*decoderState).consumeObject",
+    "2.99s  0.85% 37.19%     35.63s 10.13%  encoding/json/v2.makeStructArshaler.func3",
+    "2.83s   0.8% 37.99%      6.94s  1.97%  runtime.scanObjectsSmall",
+    "2.44s  0.69% 38.69%      2.44s  0.69%  runtime.madvise",
+    "2.36s  0.67% 39.36%      2.36s  0.67%  runtime.usleep",
+    "2.28s  0.65% 40.01%      2.28s  0.65%  runtime.typePointers.nextFast (inline)",
+    "2.18s  0.62% 40.63%      4.45s  1.26%  runtime.gcmarknewobject",
+    "2.08s  0.59% 41.22%      2.08s  0.59%  runtime.nextFreeFast"
+  ],
+  "error_strings": null,
+  "phase_notes": [
+    "mixed: 32 PUT / 16 GET / 8 list (6 S3, 2 coordinator version-list) / 4 version-churn workers, 20s warmup + 60s measured",
+    "contention: 200 concurrent PUTs to one key; pg_stat_activity sampled at 100ms for lock waiters",
+    "readonly: 16 GET workers for 10s, compared against mixed GET p99",
+    "bloat: n_dead_tup sampled after measured phases and after a wait for autovacuum (naptime=5s)",
+    "12 MiB objects use single PUT via pkg/sdk; multipart is covered by test/compat, not this load profile"
+  ]
+}

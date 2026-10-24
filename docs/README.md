@@ -19,7 +19,12 @@ reasoning is part of the deliverable.
 | [03 — Data plane specification](03-data-plane.md) | Chunking, hierarchical erasure coding, key hierarchy and AES-256-GCM framing, the placement engine, repair/scrub/GC/rebalance, and the durability math |
 | [04 — Service specifications](04-services.md) | Every service: contracts, ports, config, state, failure modes, SLOs — Gateway, Coordinator (6 sub-services), Agent, Cache, Key service, Console, CLI, Bridge, Operator |
 | [05 — S3 API specification](05-s3-api.md) | The full compatibility matrix (42 supported / 55 not), header-by-header behaviour, versioning/object-lock/ACL/tagging/lifecycle semantics, limits, errors, and the seven deliberate divergences |
-| [06 — Delivery plan](06-delivery-plan.md) | Repo layout, milestones M0–M8 with exit criteria, parallel workstreams, test strategy, performance targets, risks, and the questions I need answered |
+| [06 — Delivery plan](06-delivery-plan.md) | Repo layout, milestones M0–M8 with exit criteria, parallel workstreams, test strategy, performance targets, risks, and the decisions taken (kept as the record, including superseded ones) |
+| [07 — Wire API](07-wire-api.md) | The internal HTTP contract between gateway, coordinator and agents |
+| [08 — Operations](08-operations.md) | Runbooks: TLS/PKI and rotation, agent config, bridge operations, `/healthz` posture checks, troubleshooting |
+| [09 — Deployment](09-deployment.md) | Sizing a Redundancy Class, install/upgrade/rollback order, measured HA and load numbers, known operational gaps |
+| [10 — Record codec](10-record-codec.md) | Proposal only, deliberately not implemented: versioned binary metadata records with a measured do-not-ship-unless bar |
+| [Known issues](KNOWN_ISSUES.md) | The confidence record: fixed defects with evidence, open issues, and what is explicitly **not** validated |
 
 Supporting research: [Cubbit DS3 API report](research/cubbit-ds3-api-report.md) · [Cubbit DS3 Composer architecture report](research/cubbit-ds3-composer-report.md)
 
@@ -51,17 +56,17 @@ Supporting research: [Cubbit DS3 API report](research/cubbit-ds3-api-report.md) 
 
 ## Design at a glance
 
-| Question | Answer |
-|---|---|
-| Language | Go 1.24+ (Cubbit's own gateway binary is `gods3`) |
-| Shard transport | QUIC + mTLS, one stream per shard |
-| Control transport | gRPC/protobuf |
-| Erasure coding | `klauspost/reedsolomon`, GF(2⁸), two tiers |
-| Metadata | PostgreSQL primary + sync standby; dependency-free embedded journal store for dev mode |
-| Encryption | AES-256-GCM framed at 1 MiB, HKDF per-chunk keys, envelope-wrapped file keys, KMIP 1.4 |
-| Default redundancy | `geo 2+1`, `local 16+4`, `aag 2` ⇒ 1.875× overhead, survives 1 site |
-| S3 surface | 42 operations supported, 55 explicitly `501` — the Cubbit-published matrix |
-| Durability target | 11 nines **given** repair MTTR ≤ 4 h (the code alone doesn't give you this — the ops loop does) |
+| Question | Designed | As built |
+|---|---|---|
+| Language | Go 1.24+ (Cubbit's own gateway binary is `gods3`) | Go 1.25 (`go.mod`), stdlib-first, two vendored dependencies (`klauspost/reedsolomon`, `jackc/pgx`) |
+| Shard transport | QUIC + mTLS, one stream per shard | **HTTP/1.1 over TLS 1.3 with mTLS**; the contract is transport-agnostic so QUIC can replace it (docs/07) |
+| Control transport | gRPC/protobuf | **HTTP + JSON** against frozen wire types in `internal/contract` (schema-regression tested) |
+| Erasure coding | `klauspost/reedsolomon`, GF(2⁸), two tiers | same — `internal/ec`, geo × local, flat = `geo(1,0)` |
+| Metadata | PostgreSQL primary + sync standby | PostgreSQL as a transactional KV store (ADR-3b); a dependency-free embedded journal store for dev mode — **not SQLite** (D-C) |
+| Encryption | AES-256-GCM framed at 1 MiB, HKDF per-chunk keys, envelope-wrapped file keys, KMIP 1.4 | AES-256-GCM framed at 1 MiB, HKDF-SHA256 per-chunk keys, envelope-wrapped file keys. **KMIP is not implemented** — the tenant seed is supplied as a hex value with manual custody |
+| Default redundancy | `geo 2+1`, `local 16+4`, `aag 2` ⇒ 1.875× overhead, survives 1 site | same; the dev cluster uses `geo 2+1 / local 3+1` with 6 MiB chunks because a 2-agent-per-Nexus topology cannot satisfy the production RC |
+| S3 surface | 42 operations supported, 55 explicitly `501` — the Cubbit-published matrix | same, and set-verified operation-by-operation against Cubbit's published table |
+| Durability target | 11 nines **given** repair MTTR ≤ 4 h (the code alone doesn't give you this — the ops loop does) | unchanged as a target; see [KNOWN_ISSUES](KNOWN_ISSUES.md) for what is and is not validated |
 
 ---
 
@@ -74,6 +79,11 @@ Supporting research: [Cubbit DS3 API report](research/cubbit-ds3-api-report.md) 
 
 ---
 
-## Next step
+## Current state
 
-Approve [06 §7 questions](06-delivery-plan.md) (Q1–Q7), then the first commit is M0: module skeleton, frozen protos, `docker compose up` with one coordinator, one gateway, six agents, and a green CI — followed immediately by the single-tier object path (M3) so there is something demonstrable early.
+The plan above is implemented and gated (see the root [README](../README.md) for commands and
+measured numbers, and [KNOWN_ISSUES](KNOWN_ISSUES.md) for the honest confidence record). This
+directory is deliberately kept as the **design record**: decisions that were later revised —
+ADR-3b's transactional-KV metadata shape, the dev topology arithmetic, the QUIC/gRPC transport
+choices, the SQLite dev mode — remain visible with their outcomes noted, because "what we
+planned and why we changed it" is part of the deliverable.
