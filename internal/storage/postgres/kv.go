@@ -668,7 +668,12 @@ func isUnavailable(err error) bool {
 	var pg *pgconn.PgError
 	if errors.As(err, &pg) {
 		// Class 08: connection exception; 57P01-57P03: server shutdown/recovery.
-		if strings.HasPrefix(pg.Code, "08") || pg.Code == "57P01" || pg.Code == "57P02" || pg.Code == "57P03" {
+		// 57014: query cancelled (statement_timeout/lock_timeout) - the database is
+		// alive but under pressure, so the caller should retry rather than treat it
+		// as a permanent server error. 40*: transaction rollback (serialization
+		// failure 40001, deadlock 40P01) - also retryable by definition.
+		if strings.HasPrefix(pg.Code, "08") || pg.Code == "57P01" || pg.Code == "57P02" || pg.Code == "57P03" ||
+			pg.Code == "57014" || strings.HasPrefix(pg.Code, "40") {
 			return true
 		}
 	}

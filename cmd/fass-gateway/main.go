@@ -203,11 +203,14 @@ func run(args []string) error {
 		return err
 	}
 
+	registry := metrics.New()
+
 	off, err := offloader.New(offloader.Deps{
 		Coord:    coord,
 		Shards:   shardClient,
 		Keyrings: keyrings,
 		Logger:   logger,
+		Metrics:  registry,
 		Config: offloader.Config{
 			ChunkSize:           cfg.chunkSize,
 			MaxConcurrentChunks: cfg.workers,
@@ -238,7 +241,6 @@ func run(args []string) error {
 		logger.Info("smart data placement loaded", "rules", placement.Rules(), "file", cfg.sdpPolicy)
 	}
 
-	registry := metrics.New()
 	verifier := authz.New(coord, authz.Options{ClockSkew: 15 * time.Minute})
 
 	s3cfg := s3.Config{
