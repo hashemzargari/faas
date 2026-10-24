@@ -233,6 +233,18 @@ if [[ -n "$AWS_BIN" ]]; then
   if cmp -s "$T/in.bin" "$T/out/aws.bin"; then pass "get byte-identical"; else fail "get byte-identical"; fi
   if "${A[@]}" s3api list-buckets >/dev/null 2>&1; then pass "list buckets (strict SDK parse)"; else fail "list buckets"; fi
 
+  # Zero-byte objects: we tested writing them and listing them, but no harness
+  # ever read one back - which is how a 500 on GET of an empty object survived
+  # a fully green suite until a real migration found it.
+  : >"$T/empty.bin"
+  "${A[@]}" s3 cp "$T/empty.bin" s3://compat-aws/zero/empty.bin --only-show-errors >/dev/null 2>"$T/aws-zero.err"
+  "${A[@]}" s3 cp s3://compat-aws/zero/empty.bin "$T/out/aws-empty.bin" --only-show-errors >/dev/null 2>>"$T/aws-zero.err"
+  if [[ -f "$T/out/aws-empty.bin" && ! -s "$T/out/aws-empty.bin" ]]; then
+    pass "zero-byte object round trip (GET returns empty body)"
+  else
+    fail "zero-byte object round trip: $(tail -1 "$T/aws-zero.err")"
+  fi
+
   # Tree sync: a directory with a mix of sizes, synced up and back. This is the
   # shape real backup tools use; it stresses listing, deletes and multipart
   # together rather than one file at a time.
@@ -273,6 +285,16 @@ if [[ -n "$RCLONE_BIN" ]]; then
   mkdir -p "$T/out/rclone"
   "${RCLONE[@]}" copy c:compat-aws/rclone/in.bin "$T/out/rclone" -q 2>/dev/null
   if cmp -s "$T/in.bin" "$T/out/rclone/in.bin"; then pass "copy down byte-identical"; else fail "copy down byte-identical"; fi
+  # Zero-byte objects: written and listed by every harness, but never read back
+  # until a real migration found a 500 on GET of an empty object.
+  mkdir -p "$T/zero" && : >"$T/zero/empty.bin"
+  if "${RCLONE[@]}" copy "$T/zero" c:compat-aws/rclone-zero -q 2>"$T/rclone-zero.err" &&
+     "${RCLONE[@]}" copy c:compat-aws/rclone-zero/empty.bin "$T/zero-down" -q 2>>"$T/rclone-zero.err" &&
+     [[ -f "$T/zero-down/empty.bin" && ! -s "$T/zero-down/empty.bin" ]]; then
+    pass "zero-byte object round trip"
+  else
+    fail "zero-byte object round trip: $(tail -1 "$T/rclone-zero.err")"
+  fi
   if "${RCLONE[@]}" sync "$T/tree" c:compat-aws/rclone-sync --s3-upload-cutoff 5M --s3-chunk-size 5M -q 2>"$T/rclone-sync.err"; then
     pass "sync up (tree incl. multipart)"
   else
