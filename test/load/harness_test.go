@@ -42,17 +42,21 @@ const (
 )
 
 type stack struct {
-	t         *testing.T
-	bin       string
-	dir       string
-	logDir    string
-	dsn       string
-	coordURL  string
-	gateways  []string
-	clients   []*sdk.Client
-	procs     []*proc
-	pg        *sql.DB
-	memAtBoot int64
+	t        *testing.T
+	bin      string
+	dir      string
+	logDir   string
+	dsn      string
+	coordURL string
+	gateways []string
+	// gatewayAdmins are the /metrics endpoints of the gateways, so the report
+	// can show why a shard fetch failed (checksum/size/transport), not just that
+	// the GET returned 500.
+	gatewayAdmins []string
+	clients       []*sdk.Client
+	procs         []*proc
+	pg            *sql.DB
+	memAtBoot     int64
 }
 
 type proc struct {
@@ -86,6 +90,13 @@ func TestMain(m *testing.M) {
 			os.Exit(m.Run())
 		}
 	}
+	// The stack uses fixed work/log directories under os.TempDir (so failures can
+	// be preserved). Remove them before the run as well as after: back-to-back
+	// `go test -tags=load` invocations otherwise reuse the previous run's agent
+	// disks and coordinator data, which shows up as bogus 507 "no eligible agent"
+	// errors during warmup.
+	_ = os.RemoveAll(filepath.Join(os.TempDir(), "fass-load-work"))
+	_ = os.RemoveAll(filepath.Join(os.TempDir(), "fass-load-logs"))
 	tmp, err := os.MkdirTemp("", "fass-load-*")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "load:", err)
@@ -108,6 +119,8 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	_ = exec.Command("docker", "rm", "-f", pgContainer).Run()
 	_ = os.RemoveAll(tmp)
+	_ = os.RemoveAll(filepath.Join(os.TempDir(), "fass-load-work"))
+	_ = os.RemoveAll(filepath.Join(os.TempDir(), "fass-load-logs"))
 	os.Exit(code)
 }
 
@@ -456,6 +469,7 @@ func boot(s *stack) error {
 		waitHTTP(s.t, name, fmt.Sprintf("http://127.0.0.1:%d/healthz", admin), 60*time.Second)
 		endpoint := fmt.Sprintf("http://127.0.0.1:%d", port)
 		s.gateways = append(s.gateways, endpoint)
+		s.gatewayAdmins = append(s.gatewayAdmins, fmt.Sprintf("http://127.0.0.1:%d", admin))
 		client, err := sdk.New(endpoint, region, payload.AccessKeyID, payload.Secret)
 		if err != nil {
 			return fmt.Errorf("sdk %s: %w", endpoint, err)

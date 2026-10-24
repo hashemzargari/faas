@@ -31,6 +31,18 @@ type fakeCoord struct {
 	calls       int
 	excluded    []contract.AgentID
 	committed   *contract.CommitRequest
+	manifest    *contract.Manifest
+}
+
+// GetManifest backs the read path's bounded re-resolve-retry. Tests that do not
+// care about retries get their committed manifest back (or a stable empty one).
+func (f *fakeCoord) GetManifest(ctx context.Context, bucket, key string, version contract.VersionID) (contract.Manifest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.manifest != nil {
+		return *f.manifest, nil
+	}
+	return contract.Manifest{BucketID: "", Key: key, VersionID: version}, nil
 }
 
 func (f *fakeCoord) ResolvePlacement(ctx context.Context, req contract.PlacementRequest) (contract.Placement, error) {
@@ -80,8 +92,14 @@ type fakeAgents struct {
 	shards  map[string][]byte // endpoint|set|group|index -> payload
 	failPut map[string]bool   // endpoint -> fail every PUT
 	corrupt map[string]bool   // endpoint -> return corrupted bytes
-	gets    int
-	puts    int
+	// block, when set for a shard key, holds GetShard until the channel is closed
+	// (or the context is done). Tests use it to keep a hedged parity fetch in
+	// flight while quorum has already been reached by data shards.
+	block map[string]chan struct{}
+	// delay slows specific shard GETs so tests can order fetch phases.
+	delay map[string]time.Duration
+	gets  int
+	puts  int
 }
 
 func newFakeAgents() *fakeAgents {
@@ -89,6 +107,8 @@ func newFakeAgents() *fakeAgents {
 		shards:  make(map[string][]byte),
 		failPut: make(map[string]bool),
 		corrupt: make(map[string]bool),
+		block:   make(map[string]chan struct{}),
+		delay:   make(map[string]time.Duration),
 	}
 }
 
@@ -121,10 +141,22 @@ func (a *fakeAgents) PutShard(ctx context.Context, endpoint string, req contract
 }
 
 func (a *fakeAgents) GetShard(ctx context.Context, endpoint string, id contract.ShardSetID, group, index int) (io.ReadCloser, contract.ShardInfo, error) {
+	key := shardKey(endpoint, id, group, index)
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.gets++
-	data, ok := a.shards[shardKey(endpoint, id, group, index)]
+	data, ok := a.shards[key]
+	ch := a.block[key]
+	delay := a.delay[key]
+	a.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	if ch != nil {
+		// Deliberately ignore cancellation: the test needs the write to still be
+		// pending when quorum closes, which is the window where an early return
+		// would let the caller copy the slice concurrently with it.
+		<-ch
+	}
 	if !ok {
 		return nil, contract.ShardInfo{}, contract.ErrNotFound
 	}
@@ -683,5 +715,145 @@ func TestEmptyObjectReadsAsEmptyBody(t *testing.T) {
 	}
 	if buf.Len() != 0 {
 		t.Fatalf("zero-byte read wrote %d bytes", buf.Len())
+	}
+}
+
+// TestReadSurvivesOneShortShard pins the failure mode we must never regress: a
+// single shard that is one byte short (or otherwise rejected) must not collapse
+// the whole chunk into "0/3 geo groups". The group has local_n+local_k shards,
+// so one bad shard is still fully recoverable.
+func TestReadSurvivesOneShortShard(t *testing.T) {
+	e := newEnv(t)
+	payload := randomPayload(t, 1<<20)
+	m := e.write(t, payload)
+
+	ref := m.Chunks[0]
+	slot := ref.Slots[0]
+	key := shardKey(slot.Endpoint, ref.ShardSetID, 0, 0)
+	e.agents.mu.Lock()
+	full := e.agents.shards[key]
+	if len(full) < 2 {
+		e.agents.mu.Unlock()
+		t.Fatalf("fake shard too small: %d", len(full))
+	}
+	e.agents.shards[key] = append([]byte(nil), full[:len(full)-1]...) // short by one byte
+	e.agents.mu.Unlock()
+
+	if got := e.read(t, m, nil); !bytes.Equal(got, payload) {
+		t.Fatalf("read failed after one short shard: got %d bytes, want %d", len(got), len(payload))
+	}
+}
+
+// TestReadWithSingleReadSlotNeverDropsShards is the regression guard for the
+// load-gate failure: with a one-slot shard-read semaphore (the worst possible
+// starvation) and an immediate parity hedge, a group must still attempt every
+// launched shard and join every writer before its slice is handed back. The old
+// loop returned as soon as quorum closed, letting readChunk copy the shard slice
+// while hedge goroutines were still writing it; a torn element made CanDecode
+// see a phantom missing group (or a corrupted shard) while agents served 200s.
+func TestReadWithSingleReadSlotNeverDropsShards(t *testing.T) {
+	e := newEnv(t)
+	// Worst-case starvation: one shard GET at a time, hedge parity immediately.
+	e.off.readSem = make(chan struct{}, 1)
+	e.off.cfg.HedgeAfter = time.Nanosecond
+	payload := randomPayload(t, 512<<10)
+	m := e.write(t, payload)
+	for i := 0; i < 100; i++ {
+		if got := e.read(t, m, nil); !bytes.Equal(got, payload) {
+			t.Fatalf("read %d corrupted or short: got %d bytes, want %d", i, len(got), len(payload))
+		}
+	}
+}
+
+// TestFetchGroupWaitsForHedgedParity pins the load-gate root cause: once one
+// shard is in flight, fetchGroup must not hand its slice back (and let readChunk
+// copy it) while a hedged parity goroutine is still running. Here the data
+// shards satisfy quorum immediately, the hedge launches one parity fetch which is
+// held open; returning early would let the copy race that write.
+func TestFetchGroupWaitsForHedgedParity(t *testing.T) {
+	agents := newFakeAgents()
+	a := &Offloader{cfg: Config{ShardReadParallel: 4, ShardReadTimeout: time.Second, ShardReadRetries: 0, HedgeAfter: time.Nanosecond}, shards: agents, readSem: make(chan struct{}, 4)}
+
+	params := ec.Params{GeoN: 2, GeoK: 1, LocalN: 4, LocalK: 2}
+	groupSize := params.ShardsPerGroup()
+	slots := make([]contract.Slot, groupSize)
+	for i := range slots {
+		slots[i] = contract.Slot{GeoGroup: 0, LocalIndex: i, Endpoint: fmt.Sprintf("ep-%d", i)}
+	}
+	id := contract.ShardSetID("set-1")
+	shardSize := 32
+	checksums := make([]uint64, groupSize)
+	for i := 0; i < groupSize; i++ {
+		data := bytes.Repeat([]byte{byte(i)}, shardSize)
+		agents.shards[shardKey(slots[i].Endpoint, id, 0, i)] = data
+		checksums[i] = Checksum64(data)
+	}
+	// Make the data shards slower than the hedge so the parity fetch is launched
+	// and in flight before quorum closes.
+	for i := 0; i < params.LocalN; i++ {
+		agents.delay[shardKey(slots[i].Endpoint, id, 0, i)] = 20 * time.Millisecond
+	}
+	// Hold the first parity shard (index localN) open so the hedged goroutine is
+	// guaranteed in flight when quorum closes.
+	blocked := make(chan struct{})
+	agents.block[shardKey(slots[params.LocalN].Endpoint, id, 0, params.LocalN)] = blocked
+
+	done := make(chan struct{})
+	var got [][]byte
+	var ok bool
+	go func() {
+		defer close(done)
+		got, ok = a.fetchGroup(context.Background(), slots, checksums, id, 0, shardSize, params.LocalN, nil)
+	}()
+	select {
+	case <-done:
+		close(blocked)
+		t.Fatal("fetchGroup returned while a hedged parity fetch was still in flight; the returned slice can be copied concurrently with that write")
+	case <-time.After(80 * time.Millisecond):
+	}
+	close(blocked)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetchGroup did not return after the blocked parity fetch was released")
+	}
+	if !ok || len(got) != groupSize {
+		t.Fatalf("fetchGroup = ok:%v len:%d, want ok with %d slots", ok, len(got), groupSize)
+	}
+}
+
+// TestSameObjectVersionRejectsReusedNullVersion pins the retry-safety rule: a
+// suspended bucket reuses version id "null" on overwrite, so a re-resolved
+// manifest can describe a different object under the same id. Chunk refs may only
+// be adopted when identity (size, ETag, encryption envelope, chunk geometry)
+// proves it is the same immutable version.
+func TestSameObjectVersionRejectsReusedNullVersion(t *testing.T) {
+	base := contract.Manifest{
+		VersionID: "null", Size: 1024, ETag: "etag-a",
+		Chunks:     []contract.ChunkRef{{Index: 0, CiphertextLen: 1080}},
+		Encryption: contract.EncryptionMeta{WrappedFileKey: []byte{1, 2, 3}},
+	}
+	if !sameObjectVersion(base, base, 0) {
+		t.Fatal("identical manifests must be considered the same version")
+	}
+	newVersion := base
+	newVersion.Size = 2048
+	newVersion.ETag = "etag-b"
+	newVersion.Chunks = []contract.ChunkRef{{Index: 0, CiphertextLen: 2104}}
+	newVersion.Encryption = contract.EncryptionMeta{WrappedFileKey: []byte{9, 9, 9}}
+	if sameObjectVersion(base, newVersion, 0) {
+		t.Fatal("manifest of an overwritten null version was accepted as the same version")
+	}
+	// Same size/ETag but re-encrypted: still a different version.
+	sameBytes := base
+	sameBytes.Encryption = contract.EncryptionMeta{WrappedFileKey: []byte{4, 5, 6}}
+	if sameObjectVersion(base, sameBytes, 0) {
+		t.Fatal("re-encrypted object under the same version id was accepted")
+	}
+	// Same identity but a different chunk geometry cannot be swapped.
+	geometry := base
+	geometry.Chunks = []contract.ChunkRef{{Index: 0, CiphertextLen: 9999}}
+	if sameObjectVersion(base, geometry, 0) {
+		t.Fatal("chunk with different ciphertext length was accepted")
 	}
 }

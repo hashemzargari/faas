@@ -3,6 +3,7 @@ package offloader
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -86,6 +87,31 @@ func (o *Offloader) Read(ctx context.Context, req ReadRequest, w io.Writer) erro
 			return fmt.Errorf("%w: chunk %d params: %v", ErrManifest, cr.Index, err)
 		}
 		plaintext, err := o.readChunk(ctx, tenant, m.BucketID, req.Bucket, req.Key, aadVersion, ref.AADChunkIndex, codec, ref, enc)
+		if err != nil && errors.Is(err, ErrMissingShards) {
+			// Bounded retry: the data exists on healthy agents, so one retry that
+			// re-resolves the manifest (the coordinator is authoritative for
+			// slots/shard-set ids) should either succeed or prove a real loss.
+			// This is deliberately per-chunk: earlier chunks have already been
+			// streamed, so retrying the whole object would duplicate bytes.
+			if retryErr := sleepCtx(ctx, o.cfg.HedgeAfter); retryErr == nil {
+				if fresh, ferr := o.coord.GetManifest(ctx, req.Bucket, req.Key, m.VersionID); ferr == nil &&
+					cr.Index < len(fresh.Chunks) && sameObjectVersion(m, fresh, cr.Index) {
+					// Only adopt the refreshed chunk when the manifest provably
+					// describes the same version. Suspended buckets reuse the
+					// version id "null", so an overwrite can make GetManifest return
+					// a *different* object under the same id; mixing its chunk refs
+					// into a partially streamed read of the old object would serve
+					// frankenbytes. On identity mismatch we retry with the original
+					// refs (a consistent old-version read) and fail honestly if the
+					// data is genuinely gone.
+					ref = fresh.Chunks[cr.Index]
+					if c2, cerr := ec.New(ref.Params); cerr == nil {
+						codec = c2
+					}
+				}
+				plaintext, err = o.readChunk(ctx, tenant, m.BucketID, req.Bucket, req.Key, aadVersion, ref.AADChunkIndex, codec, ref, enc)
+			}
+		}
 		if err != nil {
 			return err
 		}
@@ -203,6 +229,45 @@ func planChunkRanges(lengths []int64, rng *ByteRange) ([]chunk.ChunkRange, error
 	return out, nil
 }
 
+// sameObjectVersion reports whether two manifests describe the same immutable
+// version, so chunk refs are interchangeable. Checks the object identity (size,
+// ETag) and the encryption envelope (a re-encrypted object can share bytes but
+// not the file key), plus the chunk geometry at the index being retried.
+func sameObjectVersion(a, b contract.Manifest, index int) bool {
+	if a.Size != b.Size || a.ETag != b.ETag || a.VersionID != b.VersionID {
+		return false
+	}
+	if len(a.Chunks) != len(b.Chunks) {
+		return false
+	}
+	if len(a.Encryption.WrappedFileKey) != 0 || len(b.Encryption.WrappedFileKey) != 0 {
+		if !bytes.Equal(a.Encryption.WrappedFileKey, b.Encryption.WrappedFileKey) {
+			return false
+		}
+	}
+	if index < len(a.Chunks) && index < len(b.Chunks) {
+		if a.Chunks[index].CiphertextLen != b.Chunks[index].CiphertextLen {
+			return false
+		}
+	}
+	return true
+}
+
+// sleepCtx waits d or until ctx is done.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func max64(a, b int64) int64 {
 	if a > b {
 		return a
@@ -237,6 +302,7 @@ func (o *Offloader) readChunk(ctx context.Context, tenant contract.TenantID, buc
 		shardSetID = contract.ShardSetIDFor(bucketID, key, contract.VersionID(aadVersion), ref.Index)
 	}
 	shards := make([][]byte, geom.TotalShards)
+	diag := &shardDiag{reasons: map[string]int{}}
 	params := ref.Params
 	groupSize := params.ShardsPerGroup()
 
@@ -257,7 +323,7 @@ func (o *Offloader) readChunk(ctx context.Context, tenant contract.TenantID, buc
 					checksums[i] = ref.Checksums[idx]
 				}
 			}
-			got, ok := o.fetchGroup(ctx, slots, checksums, shardSetID, group, geom.ShardSize, params.LocalN)
+			got, ok := o.fetchGroup(ctx, slots, checksums, shardSetID, group, geom.ShardSize, params.LocalN, diag)
 			if !ok {
 				return
 			}
@@ -271,6 +337,7 @@ func (o *Offloader) readChunk(ctx context.Context, tenant contract.TenantID, buc
 
 	groups, ok := codec.CanDecode(shards, geom)
 	if !ok {
+		diag.logFailure(o, shardSetID, ref, geom, groups, params)
 		return nil, fmt.Errorf("%w: chunk %d: %d/%d geo groups reconstructible, need %d",
 			ErrMissingShards, ref.Index, groups, params.GeoN+params.GeoK, params.GeoN)
 	}
@@ -299,7 +366,7 @@ func (o *Offloader) readChunk(ctx context.Context, tenant contract.TenantID, buc
 // requested first, then parity shards are hedged in after HedgeAfter (or as soon
 // as the data shards finish without quorum). It returns nil,false when the group
 // cannot be reconstructed.
-func (o *Offloader) fetchGroup(ctx context.Context, slots []contract.Slot, checksums []uint64, shardSetID contract.ShardSetID, group, shardSize, localN int) ([][]byte, bool) {
+func (o *Offloader) fetchGroup(ctx context.Context, slots []contract.Slot, checksums []uint64, shardSetID contract.ShardSetID, group, shardSize, localN int, diag *shardDiag) ([][]byte, bool) {
 	out := make([][]byte, len(slots))
 	if len(slots) < localN {
 		return nil, false
@@ -321,13 +388,16 @@ func (o *Offloader) fetchGroup(ctx context.Context, slots []contract.Slot, check
 			case o.readSem <- struct{}{}:
 				defer func() { <-o.readSem }()
 			case <-gctx.Done():
+				if diag != nil {
+					diag.record(fetchFailure{Reason: "semaphore_drop", Group: group, Index: idx, Endpoint: slots[idx].Endpoint})
+				}
 				return
 			}
 			var want uint64
 			if idx < len(checksums) {
 				want = checksums[idx]
 			}
-			data, ok := o.getShardBytes(gctx, slots[idx].Endpoint, shardSetID, group, idx, want, shardSize)
+			data, ok := o.getShardBytes(gctx, slots[idx].Endpoint, shardSetID, group, idx, want, shardSize, diag)
 			if !ok {
 				return
 			}
@@ -354,7 +424,13 @@ func (o *Offloader) fetchGroup(ctx context.Context, slots []contract.Slot, check
 	select {
 	case <-quorum:
 		cancel()
+		// Every launched goroutine writes into `out`, which readChunk copies as
+		// soon as this function returns. Returning before the parity goroutines
+		// (launched by a hedge) have stopped let the copy race with their writes:
+		// a torn slice element made CanDecode see a phantom missing group while
+		// the agents had served every shard. Always join both wait groups.
 		dataWG.Wait()
+		parityWG.Wait()
 		return out, true
 	case <-dataFinished:
 		// Fall through to parity.
@@ -375,12 +451,20 @@ func (o *Offloader) fetchGroup(ctx context.Context, slots []contract.Slot, check
 	}()
 	select {
 	case <-quorum:
+		// Quorum reached: cancel the rest, their results are not needed.
+		cancel()
 	case <-parityFinished:
+		// All parity shards have been attempted. Wait for in-flight *data*
+		// shards too before deciding: cancelling here used to silently drop data
+		// goroutines that were merely queued on the semaphore, turning available
+		// shards into a phantom "not enough shards" failure.
 	case <-gctx.Done():
 	}
-	cancel()
 	dataWG.Wait()
 	parityWG.Wait()
+	if ctx.Err() == nil {
+		cancel()
+	}
 
 	mu.Lock()
 	haveNow := have
@@ -393,31 +477,52 @@ func (o *Offloader) fetchGroup(ctx context.Context, slots []contract.Slot, check
 
 // getShardBytes fetches and validates one shard. ok=false means missing, short,
 // or checksum-mismatched, so the caller can fall back to parity.
-func (o *Offloader) getShardBytes(ctx context.Context, endpoint string, shardSetID contract.ShardSetID, group, index int, wantChecksum uint64, shardSize int) ([]byte, bool) {
+func (o *Offloader) getShardBytes(ctx context.Context, endpoint string, shardSetID contract.ShardSetID, group, index int, wantChecksum uint64, shardSize int, diag *shardDiag) ([]byte, bool) {
+	reason := ""
+	failure := fetchFailure{Group: group, Index: index, Endpoint: endpoint, WantSize: shardSize, WantChecksum: wantChecksum}
 	for attempt := 0; attempt <= o.cfg.ShardReadRetries; attempt++ {
 		if ctx.Err() != nil {
-			return nil, false
+			reason = "ctx"
+			break
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, o.cfg.ShardReadTimeout)
 		rc, info, err := o.shards.GetShard(attemptCtx, endpoint, shardSetID, group, index)
 		if err != nil {
 			cancel()
+			if ctx.Err() != nil {
+				reason = "ctx"
+			} else {
+				reason = "transport"
+				failure.Detail = err.Error()
+			}
 			continue
 		}
 		data, readErr := io.ReadAll(io.LimitReader(rc, int64(shardSize)+1))
 		closeErr := rc.Close()
 		cancel()
-		if readErr != nil || closeErr != nil || len(data) != shardSize {
+		if readErr != nil || closeErr != nil {
+			reason = "read"
+			if readErr != nil {
+				failure.Detail = readErr.Error()
+			}
+			continue
+		}
+		if len(data) != shardSize {
+			reason = "size"
+			failure.GotSize = len(data)
 			continue
 		}
 		computed := Checksum64(data)
+		failure.GotChecksum = computed
 		if wantChecksum != 0 && computed != wantChecksum {
+			reason = "checksum"
 			if o.metrics != nil {
 				o.metrics.Inc("fass_gateway_shard_checksum_mismatch_total", nil)
 			}
 			continue
 		}
 		if info.Checksum != 0 && info.Checksum != computed {
+			reason = "info_checksum"
 			continue
 		}
 		if o.metrics != nil {
@@ -425,8 +530,16 @@ func (o *Offloader) getShardBytes(ctx context.Context, endpoint string, shardSet
 		}
 		return data, true
 	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	failure.Reason = reason
+	if diag != nil {
+		diag.record(failure)
+	}
 	if o.metrics != nil {
 		o.metrics.Inc("fass_gateway_shard_gets_total", map[string]string{"result": "error"})
+		o.metrics.Inc("fass_gateway_shard_get_errors_total", map[string]string{"reason": reason})
 	}
 	return nil, false
 }

@@ -656,6 +656,11 @@ func TestMixedWorkloadLoad(t *testing.T) {
 	if mismatches > 0 {
 		t.Fatalf("CORRECTNESS: %d/%d sampled PUT->GET verifications mismatched", mismatches, verified)
 	}
+	t.Logf("gateway shard stats: %v", summary.GatewayShards)
+	if rejects := summary.GatewayShards["error_checksum"] + summary.GatewayShards["error_info_checksum"] + summary.GatewayShards["error_size"]; rejects > 0 {
+		s.preserveLogs(t, "shard-reject")
+		t.Fatalf("CORRECTNESS: %d shards rejected on size/checksum while agents were healthy (data-read defect, not unavailability)", rejects)
+	}
 	if summary.Errors.NonRetryable5xx > 0 {
 		s.preserveLogs(t, "5xx")
 		t.Fatalf("CORRECTNESS: %d non-retryable 5xx responses (every 500 is a defect)", summary.Errors.NonRetryable5xx)
@@ -734,6 +739,7 @@ type report struct {
 	Verification  verificationReport    `json:"verification"`
 	Repair        bool                  `json:"repair_ok"`
 	Coordinator   map[string]any        `json:"coordinator_metrics"`
+	GatewayShards map[string]int64      `json:"gateway_shard_stats"`
 	DBStats       map[string]float64    `json:"db_statement_avg_ms"`
 	DBStatsCounts map[string]int64      `json:"db_statement_counts"`
 	CPUProfileTop []string              `json:"cpu_profile_top"`
@@ -808,6 +814,69 @@ type verificationReport struct {
 	CorpusKeys int `json:"corpus_keys"`
 	Verified   int `json:"verified"`
 	Mismatches int `json:"mismatches"`
+}
+
+// gatewayShardStats sums the gateway shard-fetch counters across gateways. The
+// reasons are the diagnostic that distinguishes "shard missing" from "bytes
+// rejected" on a 500.
+func (s *stack) gatewayShardStats() map[string]int64 {
+	out := map[string]int64{"gets_ok": 0}
+	for _, admin := range s.gatewayAdmins {
+		resp, err := http.Get(admin + "/metrics")
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		resp.Body.Close()
+		for _, line := range strings.Split(string(body), "\n") {
+			if strings.HasPrefix(line, "#") {
+				continue
+			}
+			switch {
+			case strings.HasPrefix(line, "fass_gateway_shard_gets_total{"):
+				if strings.Contains(line, `result="ok"`) {
+					out["gets_ok"] += metricTailValue(line)
+				} else {
+					out["gets_error_total"] += metricTailValue(line)
+				}
+			case strings.HasPrefix(line, "fass_gateway_shard_get_errors_total{"):
+				if reason := metricLabel(line, "reason"); reason != "" {
+					out["error_"+reason] += metricTailValue(line)
+				}
+			case strings.HasPrefix(line, "fass_gateway_chunk_unreconstructible_total"):
+				out["chunk_unreconstructible"] += metricTailValue(line)
+			case strings.HasPrefix(line, "fass_gateway_shard_checksum_mismatch_total"):
+				out["checksum_mismatch"] += metricTailValue(line)
+			}
+		}
+	}
+	return out
+}
+
+// metricTailValue parses the numeric value after the last space of a Prometheus
+// sample line.
+func metricTailValue(line string) int64 {
+	i := strings.LastIndexByte(line, ' ')
+	if i < 0 {
+		return 0
+	}
+	v, _ := strconv.ParseFloat(strings.TrimSpace(line[i+1:]), 64)
+	return int64(v)
+}
+
+// metricLabel extracts label="value" from a Prometheus sample line.
+func metricLabel(line, name string) string {
+	key := name + `="`
+	i := strings.Index(line, key)
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+len(key):]
+	j := strings.IndexByte(rest, '"')
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
 }
 
 func buildReport(s *stack, mixed, readonly map[string]latSummary, phases phaseReport, diag diagnosticReport, contentionP99 float64, contentionN int64, contentionErrs int64, contentionDur time.Duration, maxLockWaiters int64, deadlocksBefore, deadlocksAfterContention, deadlocksAfterRO int64, corpus, verified, mismatches int, pgBase, pgPeak, bloatFinal pgSnapshot, baseMem, afterMem, minMem int64, repairOK bool, metricsBefore, metricsAfter string) report {
