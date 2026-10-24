@@ -610,11 +610,21 @@ fass-gateway --ca-cert /etc/fass/pki/ca/ca.crt \
 | `--require-mtls` | `FASS_GATEWAY_REQUIRE_MTLS` | strict: no plaintext peers, client certs mandatory |
 | `--coordinator-ca` | `FASS_GATEWAY_COORDINATOR_CA` | CA bundle for the coordinator (defaults to `--ca-cert`) |
 | `--insecure` | `FASS_GATEWAY_INSECURE` | explicit plaintext; warning on every start, visible in `/healthz` |
+| `--coordinator-insecure` | `FASS_GATEWAY_COORDINATOR_INSECURE` | **transitional**: plaintext control plane while the data plane is TLS (see below) |
 | `--tls-cert` / `--tls-key` | `FASS_GATEWAY_TLS_CERT` / `FASS_GATEWAY_TLS_KEY` | serve the S3 edge over HTTPS |
 
 Non-dev gateways refuse to start with `--ca-cert` missing, `--agent-tls=off`
 (without `--insecure`), `--require-mtls` without a client certificate, or a
 plaintext `--coordinator` URL.
+
+> **Control-plane TLS status.** Gateway → coordinator TLS is already supported
+> (`--coordinator https://… --coordinator-ca`, fail-closed for non-dev). Agent →
+> coordinator TLS is the one remaining hop; until it lands, a coordinator
+> listener cannot be switched to TLS without stranding the agents.
+> `--coordinator-insecure` exists *only* to bridge that gap: it is an explicit,
+> loud, opt-in dev/transitional escape hatch, and it is scheduled to be removed
+> from this runbook and from `scripts/compat.sh` on the day agent → coordinator
+> TLS ships. Do not treat it as an operating mode.
 
 **Agent listener flags.** Agents follow the same fail-closed rule: TLS is
 required unless `--insecure` is passed explicitly.
@@ -687,7 +697,11 @@ make compat-clients-tls   # same 16 checks with mTLS on the shard transport
 
 `COMPAT_TLS=1` mints a throwaway CA under the run's temp directory with
 `fass-gateway pki`, starts the 12 agents with `--require-mtls` and the gateway
-with `--agent-tls=require --require-mtls`; the coordinator stays plaintext in
-this dev matrix and the gateway opts in explicitly with `--coordinator-insecure`.
+with `--agent-tls=require --require-mtls`. The coordinator stays plaintext in
+this dev matrix only because agent → coordinator TLS is not wired yet; the
+gateway opts in explicitly with the transitional `--coordinator-insecure` (see
+the control-plane note in §4.1). When that last hop ships, the mode should run
+with `--coordinator https://… --coordinator-ca …` and the flag should disappear
+from both the script and these docs.
 Nothing is written to the repository and the temp directory is removed on
 success (`COMPAT_KEEP=1` keeps the logs).
