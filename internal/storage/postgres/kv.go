@@ -137,7 +137,7 @@ type txRead struct {
 }
 
 func (t *txRead) Get(space, key []byte) ([]byte, error) {
-	return getValue(t.ctx, t.tx, space, key, false)
+	return getValue(t.ctx, t.tx, space, key, lockNone)
 }
 
 func (t *txRead) Has(space, key []byte) bool {
@@ -165,13 +165,30 @@ type txWrite struct {
 }
 
 func (t *txWrite) Get(space, key []byte) ([]byte, error) {
+	return t.get(space, key, lockUpdate)
+}
+
+// GetShared takes a shared row lock: concurrent shared reads in other write
+// transactions do not block each other, but an exclusive writer (bucket
+// deletion) does.
+func (t *txWrite) GetShared(space, key []byte) ([]byte, error) {
+	return t.get(space, key, lockShare)
+}
+
+// GetUnlocked reads without a row lock (arbitration is the caller's unique key or
+// outer retry).
+func (t *txWrite) GetUnlocked(space, key []byte) ([]byte, error) {
+	return t.get(space, key, lockNone)
+}
+
+func (t *txWrite) get(space, key []byte, mode lockMode) ([]byte, error) {
 	if m, ok := t.overlay[overlayKey(space, key)]; ok {
 		if m.del {
 			return nil, storage.ErrNotFound
 		}
 		return append([]byte(nil), m.val...), nil
 	}
-	return getValue(t.ctx, t.tx, space, key, true)
+	return getValue(t.ctx, t.tx, space, key, mode)
 }
 
 func (t *txWrite) Has(space, key []byte) bool {
@@ -295,13 +312,24 @@ func decodeValue(raw []byte) ([]byte, error) {
 	return raw, nil
 }
 
-func getValue(ctx context.Context, tx *sql.Tx, space, key []byte, forUpdate bool) ([]byte, error) {
+type lockMode int
+
+const (
+	lockNone lockMode = iota
+	lockUpdate
+	lockShare
+)
+
+func getValue(ctx context.Context, tx *sql.Tx, space, key []byte, mode lockMode) ([]byte, error) {
 	if string(space) == blobSpace {
 		return getBlob(ctx, tx, key)
 	}
 	q := "SELECT value FROM kv WHERE space = $1 AND key = $2"
-	if forUpdate {
+	switch mode {
+	case lockUpdate:
 		q += " FOR UPDATE"
+	case lockShare:
+		q += " FOR SHARE"
 	}
 	var raw []byte
 	err := tx.QueryRowContext(ctx, q, string(space), key).Scan(&raw)

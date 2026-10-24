@@ -72,15 +72,17 @@ func versionIDKey(bucketID contract.BucketID, key string, v contract.VersionID) 
 	return storage.JoinKeyN([]string{string(bucketID), key, string(v)}, nil)
 }
 
-func bucketInTx(tx storage.Reader, bucketID contract.BucketID) (Bucket, error) {
-	name, err := tx.Get(spaceBucketIDs, []byte(bucketID))
+func bucketInTx(tx storage.Writer, bucketID contract.BucketID) (Bucket, error) {
+	// Shared lock: commits to the same bucket proceed concurrently, while bucket
+	// deletion (exclusive FOR UPDATE) is blocked for the duration of the write.
+	name, err := tx.GetShared(spaceBucketIDs, []byte(bucketID))
 	if errors.Is(err, storage.ErrNotFound) {
 		return Bucket{}, coerr.ErrNoSuchBucket
 	}
 	if err != nil {
 		return Bucket{}, err
 	}
-	rec, err := storage.GetJSON[Bucket](tx, spaceBuckets, name)
+	rec, err := storage.GetJSONShared[Bucket](tx, spaceBuckets, name)
 	if errors.Is(err, storage.ErrNotFound) {
 		return Bucket{}, coerr.ErrNoSuchBucket
 	}

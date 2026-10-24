@@ -31,6 +31,14 @@ type Writer interface {
 	Reader
 	Put(space, key, val []byte) error
 	Delete(space, key []byte) error
+	// GetShared reads inside a write transaction with a shared row lock: other
+	// shared readers proceed concurrently, while an exclusive writer (bucket
+	// deletion) is blocked until this transaction ends. That preserves
+	// read-vs-delete safety without serialising all commits on a shared row.
+	GetShared(space, key []byte) ([]byte, error)
+	// GetUnlocked reads without taking any row lock. Use only where a unique
+	// constraint (or an outer retry) arbitrates concurrent writers.
+	GetUnlocked(space, key []byte) ([]byte, error)
 	// NextSequence allocates the next value of a named monotonic sequence inside
 	// the transaction. Backends may implement it with a lock-free native sequence;
 	// callers must not assume contiguous values, only that allocations are

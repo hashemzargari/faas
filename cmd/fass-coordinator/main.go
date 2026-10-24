@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"syscall"
@@ -63,6 +64,7 @@ func openStore(ctx context.Context, cfg config) (storage.Store, error) {
 			MaxIdleConns:    cfg.dbMaxIdleConns,
 			ConnMaxLifetime: cfg.dbConnMaxLife,
 			StatementTime:   cfg.dbStmtTimeout,
+			DebugTimings:    cfg.dbDebugTimings,
 		}
 		if cfg.dbMigrateOnBoot {
 			db, err := postgres.Open(ctx, pgCfg)
@@ -176,6 +178,9 @@ type config struct {
 	dbMaxIdleConns  int
 	dbConnMaxLife   time.Duration
 	dbStmtTimeout   time.Duration
+	// load-test attribution only: statement timing collector + CPU profile.
+	dbDebugTimings bool
+	cpuProfile     string
 }
 
 func run(args []string) error {
@@ -195,6 +200,20 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if cfg.cpuProfile != "" {
+		f, err := os.Create(cfg.cpuProfile)
+		if err != nil {
+			return fmt.Errorf("cpu profile: %w", err)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			f.Close()
+			return fmt.Errorf("cpu profile: %w", err)
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			f.Close()
+		}()
+	}
 	tlsCfg, insecure, err := coordinatorTLS(cfg)
 	if err != nil {
 		return err
@@ -249,6 +268,11 @@ func run(args []string) error {
 	// Deletion GC: drain tombstoned versions' shards once their grace period has
 	// elapsed. Agent transport is HTTP in v1 (docs/07 §2).
 	server := api.New(svc, logger)
+	if cfg.dbDebugTimings {
+		if kv, ok := store.(*postgres.KV); ok {
+			server.SetDBTimings(func() any { return kv.TimingSnapshot() })
+		}
+	}
 	server.SetTransportSecurity(tlsCfg != nil, cfg.requireMTLS, insecure)
 	repairSvc := recovery.New(recovery.Config{
 		PerSiteBudgetMBps: cfg.repairBudgetMBps,
@@ -385,6 +409,8 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.dbDriver, "db-driver", envString("FASS_COORDINATOR_DB_DRIVER", "embedded"), "persistence backend: embedded (dev WAL store) or postgres")
 	fs.StringVar(&cfg.dbDSN, "db-dsn", envString("FASS_COORDINATOR_DB_DSN", ""), "PostgreSQL DSN (required for --db-driver=postgres); a bad DSN fails at startup, never at the first request")
 	fs.BoolVar(&cfg.dbMigrateOnBoot, "db-migrate-on-start", envBoolDefault("FASS_COORDINATOR_DB_MIGRATE_ON_START", false), "apply PostgreSQL migrations at startup (default false: production must run the migrate subcommand explicitly)")
+	fs.BoolVar(&cfg.dbDebugTimings, "db-debug-timings", envBoolDefault("FASS_COORDINATOR_DB_DEBUG_TIMINGS", false), "expose PostgreSQL statement timings at /v1/debug/db-timings (load-test attribution; not for steady-state production)")
+	fs.StringVar(&cfg.cpuProfile, "cpu-profile", envString("FASS_COORDINATOR_CPU_PROFILE", ""), "write a CPU profile to this path for the lifetime of the process (load-test attribution)")
 	fs.IntVar(&cfg.dbMaxOpenConns, "db-max-open-conns", envInt("FASS_COORDINATOR_DB_MAX_OPEN_CONNS", 40), "PostgreSQL connection pool: maximum open connections")
 	fs.IntVar(&cfg.dbMaxIdleConns, "db-max-idle-conns", envInt("FASS_COORDINATOR_DB_MAX_IDLE_CONNS", 10), "PostgreSQL connection pool: maximum idle connections")
 	fs.DurationVar(&cfg.dbConnMaxLife, "db-conn-max-lifetime", envDuration("FASS_COORDINATOR_DB_CONN_MAX_LIFETIME", 30*time.Minute), "PostgreSQL connection maximum lifetime")

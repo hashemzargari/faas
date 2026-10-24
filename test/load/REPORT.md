@@ -129,3 +129,33 @@ acquisitions), i.e. the remaining `FOR UPDATE` reads in write transactions
 (bucket row, latest row, version-id lookup) queue behind each other. Fix 2
 (plain reads for read-only inputs; lock only the latest row) is still on the
 critical path — do not stop at fix 1.
+
+## Fix 2 measurement — shared bucket locks (2026-10-24)
+
+Change: commit-path bucket metadata reads use a **shared** row lock (`FOR SHARE`)
+instead of exclusive `FOR UPDATE`. Concurrent commits no longer queue on the
+bucket row, while bucket deletion (exclusive `FOR UPDATE`) still serialises
+against in-flight commits — so the delete-vs-commit race is closed without
+serialising writers. Version-id idempotency read was left locked: with the KV
+upsert exposing no unique-violation, an unlocked read would let two concurrent
+retries both write; making it safe needs a `PutIfAbsent` + retry path (deferred,
+noted).
+
+Same profile, cumulative:
+
+| metric | baseline | fix 1 | fix 2 | vs baseline |
+|---|---:|---:|---:|---:|
+| coordinator commit p50 | 309 ms | 242 ms | **56 ms** | −82% |
+| 4 KiB PUT p50 | 389 ms | 317 ms | **148 ms** | −62% |
+| 4 KiB PUT throughput | 72 ops/s | 84 | **123 ops/s** | +70% |
+| 1 MiB PUT p50 | 413 ms | 346 | **188 ms** | −54% |
+| `kv_get_for_update` avg | 31.8 ms | 31.8 | **14.2 ms** | −55% |
+| `tx_begin_pool_acquire` avg | 4.2 ms | 3.6 | 3.6 | ≈ |
+| contention (200 same-key PUTs) | 617 ms | 900 | 1 002 ms | same-key lock unchanged |
+
+Gates: 200/200 byte-identical, 0 non-retryable 5xx, 0 deadlocks, bloat reclaimed
+(48 → 1 018 → 38), max 45/200 DB connections. **Most of the commit latency is
+gone; stop here rather than doing fix 3.** Remaining work as separate tickets:
+`kv_scan_range` is now the second-worst statement (29 ms avg; listing p99 was
+already weakest), the client saw 8 transient network errors (no server 5xx), and
+JSON encode/decode CPU is the next structural cost (binary record codec proposal).

@@ -349,6 +349,14 @@ func (tx *WriteTx) Delete(space, key []byte) error {
 	return nil
 }
 
+// GetShared is the embedded implementation of a shared read: the engine already
+// serialises writers, so it is the same as Get.
+func (tx *WriteTx) GetShared(space, key []byte) ([]byte, error) { return tx.Get(space, key) }
+
+// GetUnlocked is the embedded implementation of an unlocked read: identical to
+// Get because the embedded engine's writer serialisation is the lock.
+func (tx *WriteTx) GetUnlocked(space, key []byte) ([]byte, error) { return tx.Get(space, key) }
+
 // NextSequence implements the counter-based sequence for the embedded engine.
 // It reads and writes the counter row inside the same transaction (the embedded
 // engine serialises writers, so this cannot deadlock).
@@ -381,6 +389,32 @@ func (tx *WriteTx) NextSequence(name string) (uint64, error) {
 func GetJSON[T any](tx Reader, space, key []byte) (T, error) {
 	var out T
 	raw, err := tx.Get(space, key)
+	if err != nil {
+		return out, err
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return out, fmt.Errorf("storage: decode %s/%q: %w", space, key, err)
+	}
+	return out, nil
+}
+
+// GetJSONShared decodes a record read with a shared transaction lock.
+func GetJSONShared[T any](tx Writer, space, key []byte) (T, error) {
+	var out T
+	raw, err := tx.GetShared(space, key)
+	if err != nil {
+		return out, err
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return out, fmt.Errorf("storage: decode %s/%q: %w", space, key, err)
+	}
+	return out, nil
+}
+
+// GetJSONUnlocked decodes a record read without a transaction lock.
+func GetJSONUnlocked[T any](tx Writer, space, key []byte) (T, error) {
+	var out T
+	raw, err := tx.GetUnlocked(space, key)
 	if err != nil {
 		return out, err
 	}
