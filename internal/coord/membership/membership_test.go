@@ -483,3 +483,146 @@ func TestTopologySnapshot(t *testing.T) {
 		t.Fatal("unreachable")
 	}
 }
+
+// TestAnnounceNodeScopedIdentityProtection covers the dev-bootstrap registration
+// model: several pending disks may share a node, each identified by its one-time
+// secret; the agent's generated disk UUID is bound on first announce; and a disk
+// that presents an already-bound public key with a different disk UUID is
+// rejected with the documented 409 identity conflict (the "agent started with
+// another agent's disk" protection).
+func TestAnnounceNodeScopedIdentityProtection(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	nx := f.addNexus(t, "site-a")
+	node := f.addNode(t, nx, "host-1")
+
+	id1, secret1, minted, err := f.svc.EnsurePending(ctx, membership.PendingRegistration{
+		NodeID: node.ID, Slot: "disk-1", CapacityBytes: 1 << 40,
+	})
+	if err != nil || !minted || secret1 == "" {
+		t.Fatalf("pending slot 1: %v minted=%v", err, minted)
+	}
+	id2, secret2, minted, err := f.svc.EnsurePending(ctx, membership.PendingRegistration{
+		NodeID: node.ID, Slot: "disk-2", CapacityBytes: 1 << 40,
+	})
+	if err != nil || !minted || secret2 == "" {
+		t.Fatalf("pending slot 2: %v minted=%v", err, minted)
+	}
+	if id1 == id2 {
+		t.Fatalf("two slots on one node share an agent id")
+	}
+
+	pub1 := pubKey("node-scoped-key-1")
+	if _, err := f.svc.Announce(ctx, announceReq(node, "disk-uuid-1", secret1, 7101, pub1)); err != nil {
+		t.Fatalf("announce slot 1: %v", err)
+	}
+	ag1, err := f.svc.GetAgent(ctx, id1)
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if ag1.DiskID != "disk-uuid-1" {
+		t.Fatalf("agent disk id = %q, want bound disk-uuid-1", ag1.DiskID)
+	}
+
+	// Same public key, different disk UUID on the same node: identity conflict.
+	_, err = f.svc.Announce(ctx, announceReq(node, "disk-uuid-2", secret2, 7101, pub1))
+	assertTaxonomy(t, err, 409, "Agent with the same public key already exists")
+
+	// A different key on the other slot is fine.
+	pub2 := pubKey("node-scoped-key-2")
+	if _, err := f.svc.Announce(ctx, announceReq(node, "disk-uuid-2", secret2, 7101, pub2)); err != nil {
+		t.Fatalf("announce slot 2: %v", err)
+	}
+	ag2, err := f.svc.GetAgent(ctx, id2)
+	if err != nil {
+		t.Fatalf("GetAgent slot 2: %v", err)
+	}
+	if ag2.DiskID != "disk-uuid-2" {
+		t.Fatalf("agent 2 disk id = %q, want disk-uuid-2", ag2.DiskID)
+	}
+
+	// The consumed secret cannot be replayed with a fresh key.
+	_, err = f.svc.Announce(ctx, announceReq(node, "disk-uuid-3", secret1, 7101, pubKey("third-key")))
+	assertTaxonomy(t, err, 403, "Secret not found")
+}
+
+func TestEnsurePendingNeverInvalidatesActiveAgent(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	nx := f.addNexus(t, "site-a")
+	node := f.addNode(t, nx, "host-1")
+
+	agentID, secret, minted, err := f.svc.EnsurePending(ctx, membership.PendingRegistration{
+		NodeID: node.ID, Slot: "disk-1", CapacityBytes: 1 << 40,
+	})
+	if err != nil || !minted {
+		t.Fatalf("EnsurePending: %v minted=%v", err, minted)
+	}
+	if _, err := f.svc.Announce(ctx, announceReq(node, "disk-uuid-1", secret, 7101, pubKey("key-1"))); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	if _, err := f.svc.Activate(ctx, agentID); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	// Re-running the bootstrap for this slot must not mint a secret for the live
+	// agent (the old secret is consumed, and re-minting would enable re-binding).
+	again, secret2, minted2, err := f.svc.EnsurePending(ctx, membership.PendingRegistration{
+		NodeID: node.ID, Slot: "disk-1", CapacityBytes: 1 << 40,
+	})
+	if err != nil {
+		t.Fatalf("EnsurePending re-run: %v", err)
+	}
+	if again != agentID || secret2 != "" || minted2 {
+		t.Fatalf("re-run touched an ACTIVE agent: id=%s secret=%q minted=%v", again, secret2, minted2)
+	}
+	ag, err := f.svc.GetAgent(ctx, agentID)
+	if err != nil || ag.State != membership.StateActive {
+		t.Fatalf("agent invalidated: %+v, %v", ag, err)
+	}
+	if string(ag.PublicKey) != string(pubKey("key-1")) {
+		t.Fatalf("agent identity changed on re-run")
+	}
+
+	// A still-pending slot does get a fresh one-time secret.
+	_, pendingSecret, minted, err := f.svc.EnsurePending(ctx, membership.PendingRegistration{
+		NodeID: node.ID, Slot: "disk-2", CapacityBytes: 1 << 40,
+	})
+	if err != nil || !minted || pendingSecret == "" {
+		t.Fatalf("pending slot should be minted: %v minted=%v", err, minted)
+	}
+}
+
+// TestActivateBeforeAnnounceIsRefused: activating a pending agent that has not
+// announced yet would make it ACTIVE with no endpoint/identity and burn its
+// one-time secret path, so the coordinator refuses it (409 AgentNotAnnounced).
+func TestActivateBeforeAnnounceIsRefused(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	nx := f.addNexus(t, "site-a")
+	node := f.addNode(t, nx, "host-1")
+	agentID, _, err := f.svc.RegisterPending(ctx, membership.PendingRegistration{
+		NodeID: node.ID, DiskID: "disk-1", CapacityBytes: 1 << 40,
+	})
+	if err != nil {
+		t.Fatalf("RegisterPending: %v", err)
+	}
+	_, err = f.svc.Activate(ctx, agentID)
+	if err == nil {
+		t.Fatalf("expected activation of an unannounced agent to be refused")
+	}
+	if got := coerr.StatusOf(err); got != 409 {
+		t.Fatalf("status = %d, want 409 (%v)", got, err)
+	}
+	if !strings.Contains(coerr.MessageOf(err), "has not announced") {
+		t.Fatalf("message = %q", coerr.MessageOf(err))
+	}
+	// The registration is untouched: it can still announce afterwards.
+	ag, getErr := f.svc.GetAgent(ctx, agentID)
+	if getErr != nil {
+		t.Fatalf("GetAgent: %v", getErr)
+	}
+	if ag.State != membership.StatePending || len(ag.SecretHash) == 0 {
+		t.Fatalf("refused activation mutated the agent: %+v", ag)
+	}
+}

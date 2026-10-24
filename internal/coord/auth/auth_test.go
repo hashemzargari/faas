@@ -350,3 +350,131 @@ func TestBucketOwnerEnforcedRejectsACLWrites(t *testing.T) {
 	}
 	_ = a
 }
+
+// TestAuthorizeMissingBucketMatrix is the regression guard for the bug the
+// gateway hit: the ACL stage must not be consulted for a bucket that does not
+// exist. Bucket existence is a handler concern (404); authorisation is IAM,
+// bucket policy and ACLs on existing buckets only.
+func TestAuthorizeMissingBucketMatrix(t *testing.T) {
+	const (
+		missingBucket  = "smoke-bucket"
+		existingBucket = "dev-bucket"
+	)
+	allowCreate := auth.Policy{
+		Name:      "allow-create-bucket",
+		Scope:     auth.ScopeProject,
+		TenantID:  "tenant-1",
+		ProjectID: "project-1",
+		Statements: []auth.Statement{{
+			Effect:    "Allow",
+			Actions:   []string{"s3:CreateBucket"},
+			Resources: []string{"crn:eu-west-1:s3:bucket:tenant_tenant-1/project_project-1/*"},
+		}},
+	}
+	denyAll := auth.Policy{
+		Name:      "deny-all",
+		Scope:     auth.ScopeProject,
+		TenantID:  "tenant-1",
+		ProjectID: "project-1",
+		Statements: []auth.Statement{{
+			Effect:    "Deny",
+			Actions:   []string{"s3:*"},
+			Resources: []string{"*"},
+		}},
+	}
+
+	tests := []struct {
+		name       string
+		root       bool
+		policies   []auth.Policy
+		action     contract.Action
+		bucket     string
+		withBucket bool
+		wantAllow  bool
+	}{
+		{
+			name:      "root may create a bucket that does not exist",
+			root:      true,
+			action:    contract.ActionCreateBucket,
+			bucket:    missingBucket,
+			wantAllow: true,
+		},
+		{
+			name:      "non-root with IAM grant may create a bucket that does not exist",
+			policies:  []auth.Policy{allowCreate},
+			action:    contract.ActionCreateBucket,
+			bucket:    missingBucket,
+			wantAllow: true,
+		},
+		{
+			name:      "non-root without IAM grant may not create a bucket",
+			action:    contract.ActionCreateBucket,
+			bucket:    missingBucket,
+			wantAllow: false,
+		},
+		{
+			name:      "root gets the IAM decision then the handler 404s",
+			root:      true,
+			action:    contract.ActionGetObject,
+			bucket:    missingBucket,
+			wantAllow: true,
+		},
+		{
+			name:      "explicit IAM deny wins even for root on a missing bucket",
+			root:      true,
+			policies:  []auth.Policy{denyAll},
+			action:    contract.ActionCreateBucket,
+			bucket:    missingBucket,
+			wantAllow: false,
+		},
+		{
+			name:       "explicit IAM deny wins on an existing bucket",
+			root:       true,
+			policies:   []auth.Policy{denyAll},
+			action:     contract.ActionGetObject,
+			bucket:     existingBucket,
+			withBucket: true,
+			wantAllow:  false,
+		},
+		{
+			name:       "root may read an existing bucket",
+			root:       true,
+			action:     contract.ActionGetObject,
+			bucket:     existingBucket,
+			withBucket: true,
+			wantAllow:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, m := newAuth(t)
+			ctx := context.Background()
+			if tt.withBucket {
+				createBucket(t, m, existingBucket, "tenant-1", "project-1")
+			}
+			for _, p := range tt.policies {
+				if _, err := a.PutPolicy(ctx, p); err != nil {
+					t.Fatalf("put policy: %v", err)
+				}
+			}
+			key := createKey(t, a, "tenant-1", "project-1", tt.root)
+			dc, err := a.Authorize(ctx, contract.RequestContext{
+				Principal: key.Principal(),
+				Action:    tt.action,
+				Resource: contract.Resource{
+					Region:    "eu-west-1",
+					Kind:      "bucket",
+					TenantID:  "tenant-1",
+					ProjectID: "project-1",
+					Bucket:    tt.bucket,
+				},
+			})
+			if err != nil {
+				t.Fatalf("Authorize: %v", err)
+			}
+			if dc.Allowed != tt.wantAllow {
+				t.Fatalf("allowed = %v (reason %q), want %v", dc.Allowed, dc.Reason, tt.wantAllow)
+			}
+		})
+	}
+}

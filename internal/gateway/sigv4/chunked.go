@@ -127,9 +127,14 @@ func (c *ChunkedReader) nextChunk() error {
 	if _, err := io.ReadFull(c.br, data); err != nil {
 		return fmt.Errorf("%w: short chunk body: %v", ErrCorruptChunkedBody, err)
 	}
-	var crlf [2]byte
-	if _, err := io.ReadFull(c.br, crlf[:]); err != nil || crlf != [2]byte{'\r', '\n'} {
-		return fmt.Errorf("%w: missing CRLF after chunk", ErrCorruptChunkedBody)
+	// Data chunks are followed by CRLF. The terminating zero chunk is not: its
+	// "data" is empty and the trailer section (or a blank line when there are no
+	// trailers) follows the header line directly.
+	if size > 0 {
+		var crlf [2]byte
+		if _, err := io.ReadFull(c.br, crlf[:]); err != nil || crlf != [2]byte{'\r', '\n'} {
+			return fmt.Errorf("%w: missing CRLF after chunk", ErrCorruptChunkedBody)
+		}
 	}
 
 	signed := c.opts.Kind == PayloadStreaming || c.opts.Kind == PayloadStreamingTrailer

@@ -30,35 +30,25 @@ type digestSet struct {
 	md5     hash.Hash
 }
 
-// newDigestSet creates a set including MD5 (for the ETag) and every expected
-// algorithm.
-func newDigestSet(expected []ExpectedChecksum) *digestSet {
-	d := &digestSet{
-		hashers: make(map[ChecksumAlgorithm]hash.Hash, len(expected)+1),
-		md5:     md5.New(),
+// newDigestSet creates a set that computes every supported checksum.
+//
+// All algorithms are computed unconditionally because aws-chunked trailer
+// checksums are only materialised after the body has been consumed: registering
+// hashers lazily from the header checksums would make a trailer-only checksum
+// unverifiable.
+func newDigestSet(_ []ExpectedChecksum) *digestSet {
+	md5Hasher := md5.New()
+	return &digestSet{
+		md5: md5Hasher,
+		hashers: map[ChecksumAlgorithm]hash.Hash{
+			// MD5 doubles as the ETag hasher.
+			ChecksumMD5:    md5Hasher,
+			ChecksumSHA1:   sha1.New(),
+			ChecksumSHA256: sha256.New(),
+			ChecksumCRC32:  crc32.NewIEEE(),
+			ChecksumCRC32C: crc32.New(crc32.MakeTable(crc32.Castagnoli)),
+		},
 	}
-	for _, e := range expected {
-		if _, ok := d.hashers[e.Algorithm]; ok {
-			continue
-		}
-		switch e.Algorithm {
-		case ChecksumMD5:
-			// The ETag hasher doubles as the MD5 verifier.
-			d.hashers[e.Algorithm] = d.md5
-		case ChecksumSHA1:
-			d.hashers[e.Algorithm] = sha1.New()
-		case ChecksumSHA256:
-			d.hashers[e.Algorithm] = sha256.New()
-		case ChecksumCRC32:
-			d.hashers[e.Algorithm] = crc32.NewIEEE()
-		case ChecksumCRC32C:
-			d.hashers[e.Algorithm] = crc32.New(crc32.MakeTable(crc32.Castagnoli))
-		case ChecksumCRC64NVME:
-			// Not implemented: verifying it incorrectly would be worse than
-			// refusing it (docs/05 §4 design rule).
-		}
-	}
-	return d
 }
 
 func (d *digestSet) Update(p []byte) {

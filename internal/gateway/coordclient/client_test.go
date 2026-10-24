@@ -32,7 +32,7 @@ func (r *recorded) record(req *http.Request) {
 	defer r.mu.Unlock()
 	r.requests++
 	r.method = req.Method
-	r.path = req.URL.Path
+	r.path = req.URL.EscapedPath()
 	r.query = req.URL.Query()
 	r.body, _ = io.ReadAll(req.Body)
 }

@@ -901,6 +901,12 @@ func (s *Service) Activate(ctx context.Context, agentID contract.AgentID) ([]con
 		if ag.State == StateActive {
 			return nil
 		}
+		// Activation before the first announce would consume the one-time secret
+		// path and leave the agent active with no endpoint/identity (the slot can
+		// then never announce). Refuse instead of bricking the registration.
+		if len(ag.PublicKey) == 0 {
+			return coerr.E(409, "AgentNotAnnounced", "agent %q has not announced yet; activate it after its first announce", agentID)
+		}
 		now := s.now()
 		ringIDs := append([]contract.RingID(nil), ag.RingIDs...)
 		err = storage.ScanJSON[Ring](tx, spaceRings, nil, func(_ []byte, ring Ring) error {

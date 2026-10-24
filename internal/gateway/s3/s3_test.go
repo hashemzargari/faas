@@ -2,8 +2,11 @@ package s3_test
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/xml"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -700,5 +703,86 @@ func TestPutObjectStreamingSignedChunks(t *testing.T) {
 	srv.ServeHTTP(rec, badReq)
 	if rec.Code == http.StatusOK {
 		t.Fatal("tampered streaming body was accepted")
+	}
+}
+
+// TestPutObjectUnsignedTrailerChecksum exercises the modern SDK default:
+// STREAMING-UNSIGNED-PAYLOAD-TRAILER with an x-amz-checksum-crc32 trailer and a
+// trailer signature. The gateway must decode the framing, verify the trailer
+// signature, and enforce the declared checksum before committing.
+func TestPutObjectUnsignedTrailerChecksum(t *testing.T) {
+	coord := newFakeCoord()
+	if err := coord.CreateBucket(t.Context(), bucketCfg("trailerbkt")); err != nil {
+		t.Fatal(err)
+	}
+	off := &fakeOffloader{coord: coord}
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	verifier := authz.New(coord, authz.Options{Now: func() time.Time { return now }})
+	srv := s3.New(s3.Deps{
+		Coord: coord, Authn: verifier, Authz: verifier, Off: off,
+		Config: s3.Config{
+			Region: "eu-west-1", Addressing: s3.AddressingBoth, ServerVersion: "test",
+			Limits: s3.DefaultLimits(), Compat: s3.DefaultCompat(), ChunkSize: 4 << 20,
+		},
+		Now: func() time.Time { return now },
+	})
+
+	payload := []byte("payload with a flexible checksum trailer")
+	crc := crc32.ChecksumIEEE(payload)
+	var crcBytes [4]byte
+	binary.BigEndian.PutUint32(crcBytes[:], crc)
+	trailerValue := base64.StdEncoding.EncodeToString(crcBytes[:])
+
+	signAndBuild := func(target string, checksumValue string, tamper bool) *http.Request {
+		req := httptest.NewRequest(http.MethodPut, "http://s3.test.local"+target, nil)
+		if err := sigv4.SignRequest(req, "AKIATEST", "secret", now, sigv4.PayloadUnsignedTrailer); err != nil {
+			t.Fatal(err)
+		}
+		auth := req.Header.Get("Authorization")
+		i := strings.LastIndex(auth, "Signature=")
+		seed := auth[i+len("Signature="):]
+		scope := sigv4.NewScope(now, "eu-west-1", "s3")
+		key := sigv4.SigningKey("secret", scope)
+		amzDate := now.Format("20060102T150405Z")
+
+		var body bytes.Buffer
+		// One data chunk, then the terminating zero chunk and the trailer.
+		fmt.Fprintf(&body, "%x\r\n", len(payload))
+		body.Write(payload)
+		body.WriteString("\r\n0\r\n")
+		fmt.Fprintf(&body, "x-amz-checksum-crc32:%s\r\n", checksumValue)
+		canonical := "x-amz-checksum-crc32:" + checksumValue + "\n"
+		trailerSTS := "AWS4-HMAC-SHA256-TRAILER\n" + amzDate + "\n" + scope.String() + "\n" +
+			seed + "\n" + sigv4.HashPayload([]byte(canonical))
+		fmt.Fprintf(&body, "x-amz-trailer-signature:%s\r\n\r\n", sigv4.Sign(key, trailerSTS))
+		if tamper {
+			body.WriteString("")
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body.Bytes()))
+		req.ContentLength = int64(body.Len())
+		req.Header.Set("x-amz-trailer", "x-amz-checksum-crc32")
+		req.Header.Set("x-amz-decoded-content-length", fmt.Sprintf("%d", len(payload)))
+		return req
+	}
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, signAndBuild("/trailerbkt/ok.bin", trailerValue, false))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unsigned-trailer PUT: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Wrong checksum in the trailer: the trailer signature is valid for that
+	// wrong value, but the payload checksum must fail => BadDigest and no commit.
+	wrong := base64.StdEncoding.EncodeToString([]byte{0, 0, 0, 0})
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, signAndBuild("/trailerbkt/bad.bin", wrong, false))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad trailer checksum: %d %s", rec.Code, rec.Body.String())
+	}
+	mustContain(t, rec.Body.String(), "<Code>BadDigest</Code>")
+	if bad := off.coord; bad != nil {
+		if _, err := coord.GetManifest(t.Context(), "trailerbkt", "bad.bin", ""); err == nil {
+			t.Fatal("object with a bad trailer checksum was committed")
+		}
 	}
 }

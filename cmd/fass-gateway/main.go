@@ -74,6 +74,9 @@ type config struct {
 	keySeed     string
 	tenantSeeds multiFlag
 	sdpPolicy   string
+	// dev allows an ephemeral key seed; non-dev gateways refuse to start
+	// without a stable seed so a restart cannot silently orphan every object.
+	dev bool
 
 	logLevel  string
 	logFormat string
@@ -283,14 +286,19 @@ func buildKeyrings(cfg config, logger *slog.Logger) (offloader.KeyringProvider, 
 		}
 	}
 	if len(defaultSeed) == 0 && len(seeds) == 0 {
+		if !cfg.dev {
+			return nil, fmt.Errorf("no tenant key seed configured: refusing to start outside --dev mode. " +
+				"Set --key-seed <hex> (single-key mode) or --tenant-key tenant=<hex> (repeatable). " +
+				"An ephemeral seed would make every object unreadable after a restart.")
+		}
 		// Dev convenience: an ephemeral seed keeps the gateway runnable without a
-		// KMS, but objects are unreadable after a restart. Loud warning, never
-		// silent.
+		// KMS. Print it so a developer can pin it and keep their data.
 		generated, err := offloader.GenerateSeed()
 		if err != nil {
 			return nil, err
 		}
-		logger.Warn("no key seed configured; using an EPHEMERAL dev seed. Objects written now will be unreadable after restart. Set --key-seed or --tenant-key for durable deployments.")
+		logger.Warn("no key seed configured (--dev): using an EPHEMERAL seed. Objects become unreadable after restart. " +
+			"Pin it with --key-seed " + hex.EncodeToString(generated))
 		defaultSeed = generated
 	}
 	return offloader.NewStaticKeyrings(defaultSeed, seeds)
@@ -427,6 +435,7 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.sdpPolicy, "sdp-policy", cfg.sdpPolicy, "path to a Smart Data Placement policy JSON file")
 	fs.StringVar(&cfg.tlsCert, "tls-cert", envOr("FASS_GATEWAY_TLS_CERT", ""), "TLS certificate file")
 	fs.StringVar(&cfg.tlsKey, "tls-key", envOr("FASS_GATEWAY_TLS_KEY", ""), "TLS key file")
+	fs.BoolVar(&cfg.dev, "dev", envBool("FASS_GATEWAY_DEV", false), "dev mode: allow an ephemeral key seed when none is configured")
 	fs.StringVar(&cfg.logLevel, "log-level", cfg.logLevel, "log level: debug|info|warn|error")
 	fs.StringVar(&cfg.logFormat, "log-format", cfg.logFormat, "log format: text|json")
 	fs.StringVar(&cfg.coordinator, "coord", cfg.coordinator, "alias for --coordinator")
@@ -455,6 +464,15 @@ func validateParams(p ec.Params) error {
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func envBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
 	}
 	return def
 }

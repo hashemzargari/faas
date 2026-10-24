@@ -572,16 +572,6 @@ func (c *Client) ListUploads(ctx context.Context, bucketID contract.BucketID) ([
 	return out.Uploads, err
 }
 
-// GetUpload returns the immutable metadata of an in-progress multipart upload.
-// TODO(multipart-version): once the coordinator exposes GET /v1/uploads/{id},
-// UploadPart uses UploadInfo.VersionID here so parts bind the real version id in
-// their chunk AAD (replacing the s3 multipart: mode-prefix bridge).
-func (c *Client) GetUpload(ctx context.Context, up contract.UploadID) (contract.UploadInfo, error) {
-	var out contract.UploadInfo
-	err := c.do(ctx, http.MethodGet, "/v1/uploads/"+url.PathEscape(string(up)), nil, nil, &out)
-	return out, err
-}
-
 func (c *Client) CompleteUpload(ctx context.Context, up contract.UploadID) (contract.CommitResult, error) {
 	var out struct {
 		VersionID contract.VersionID `json:"version_id"`

@@ -328,20 +328,34 @@ func (s *Service) Authorize(ctx context.Context, rc contract.RequestContext) (co
 	// root flag its key does not have.
 	rc.Principal = key.Principal()
 
-	// Normalise resource tenancy from the bucket itself. A CRN names the bucket
-	// owner's tenant/project, not the caller's, which is what makes a bucket
-	// policy or ACL grant from another account addressable at all.
+	// Look the bucket up once. Its tenancy normalises the CRN; its existence
+	// decides whether the ACL stage applies at all.
+	var (
+		bucket       contract.BucketConfig
+		bucketExists bool
+	)
 	if rc.Resource.Bucket != "" {
-		if b, err := s.meta.GetBucket(ctx, rc.Resource.Bucket); err == nil {
+		b, err := s.meta.GetBucket(ctx, rc.Resource.Bucket)
+		switch {
+		case err == nil:
+			bucket, bucketExists = b, true
+			// A CRN names the bucket owner's tenant/project, not the caller's,
+			// which is what makes a bucket policy or ACL grant from another
+			// account addressable at all.
 			rc.Resource.TenantID = b.TenantID
 			rc.Resource.ProjectID = b.ProjectID
 			if rc.Resource.Region == "" {
 				rc.Resource.Region = b.Region
 			}
+		case errors.Is(err, coerr.ErrNoSuchBucket) || coerr.CodeOf(err) == coerr.CodeNoSuchBucket:
+			// A missing bucket is a handler concern, not an authz one.
+		default:
+			return contract.Decision{}, err
 		}
 	}
 
-	// Stage 1: IAM policies (deny wins, then any allow).
+	// Stage 1: IAM policies decide first; an explicit deny wins over everything,
+	// including root access.
 	policies, err := s.policiesFor(ctx, key)
 	if err != nil {
 		return contract.Decision{}, err
@@ -350,22 +364,33 @@ func (s *Service) Authorize(ctx context.Context, rc contract.RequestContext) (co
 		return d, nil
 	}
 
+	// A root principal is implicitly allowed once no explicit deny matched
+	// (AWS root-account semantics; the handler still reports NoSuchBucket for a
+	// missing bucket, which is the correct separation of concerns).
+	if key.IsRoot {
+		return contract.Decision{Allowed: true, Reason: "root access key"}, nil
+	}
+
+	// An ACL only exists on an existing bucket. Creation (and other actions
+	// against a bucket that does not exist) must not be denied by the absence the
+	// caller is about to fix; they are decided by IAM above, and the handler
+	// reports NoSuchBucket when appropriate.
+	if !bucketExists {
+		return contract.Decision{Allowed: false, Reason: "no policy allows this action"}, nil
+	}
+
 	// Stage 2: bucket policy (deny wins, then any allow).
-	if rc.Resource.Bucket != "" {
-		bp, err := s.GetBucketPolicy(ctx, rc.Resource.Bucket)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) && coerr.CodeOf(err) != "NoSuchBucketPolicy" {
-			return contract.Decision{}, err
-		}
-		if bp != nil {
-			if d, matched := evalPolicies([]Policy{*bp}, rc); matched {
-				return d, nil
-			}
+	if bp, err := s.GetBucketPolicy(ctx, rc.Resource.Bucket); err != nil {
+		return contract.Decision{}, err
+	} else if bp != nil {
+		if d, matched := evalPolicies([]Policy{*bp}, rc); matched {
+			return d, nil
 		}
 	}
 
 	// Stage 3: ACL fallback. The owning project's keys are implicitly allowed;
 	// anyone else needs an explicit grant on the bucket (or object) ACL.
-	return s.authorizeByACL(ctx, key, rc)
+	return s.authorizeByACL(ctx, key, bucket, rc)
 }
 
 // policiesFor returns the IAM policies applying to a key: access-key-scoped,
@@ -637,22 +662,12 @@ func (s *Service) DeleteBucketPolicy(ctx context.Context, bucket string) error {
 // ACL fallback
 // ---------------------------------------------------------------------------
 
-// authorizeByACL implements the final chain stage: the owner project is allowed,
-// everyone else needs an explicit grant carrying the required permission. The
-// bucket ACL is checked first, then (for object actions) the object ACL.
-func (s *Service) authorizeByACL(ctx context.Context, key AccessKey, rc contract.RequestContext) (contract.Decision, error) {
-	if rc.Resource.Bucket == "" {
-		// Tenant/project-level actions: only the owning project (or root) may act.
-		if key.IsRoot {
-			return contract.Decision{Allowed: true, Reason: "root access key"}, nil
-		}
-		return contract.Decision{Allowed: false, Reason: "no policy allows this action"}, nil
-	}
-	bucket, err := s.meta.GetBucket(ctx, rc.Resource.Bucket)
-	if err != nil {
-		return contract.Decision{Allowed: false, Reason: "bucket does not exist"}, nil
-	}
-	if key.IsRoot || (key.TenantID == bucket.TenantID && key.ProjectID == bucket.ProjectID) {
+// authorizeByACL implements the final chain stage for an existing bucket: the
+// owning project is allowed, everyone else needs an explicit grant carrying the
+// required permission. The bucket ACL is checked first, then (for object
+// actions) the object ACL.
+func (s *Service) authorizeByACL(ctx context.Context, key AccessKey, bucket contract.BucketConfig, rc contract.RequestContext) (contract.Decision, error) {
+	if key.TenantID == bucket.TenantID && key.ProjectID == bucket.ProjectID {
 		return contract.Decision{Allowed: true, Reason: "bucket owner"}, nil
 	}
 	needed := requiredPermissions(rc.Action)

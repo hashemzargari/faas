@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fass-storage/fass/internal/contract"
@@ -141,6 +142,12 @@ type Server struct {
 	cfg     Config
 	now     func() time.Time
 	limits  Limits
+
+	// uploads caches upload-id -> immutable (key, version) facts. Uploads are
+	// immutable after creation, so a short TTL is safe and avoids a ListUploads
+	// round trip per part.
+	uploadsMu    sync.Mutex
+	uploadsCache map[contract.UploadID]cachedUpload
 }
 
 // New builds a Server. It panics only on programmer error (nil coordinator),
@@ -182,16 +189,17 @@ func New(d Deps) *Server {
 		now = time.Now
 	}
 	return &Server{
-		coord:   d.Coord,
-		authn:   d.Authn,
-		authz:   d.Authz,
-		off:     d.Off,
-		sdp:     d.SDP,
-		log:     d.Logger,
-		metrics: d.Metrics,
-		cfg:     cfg,
-		now:     now,
-		limits:  cfg.Limits,
+		coord:        d.Coord,
+		authn:        d.Authn,
+		authz:        d.Authz,
+		off:          d.Off,
+		sdp:          d.SDP,
+		log:          d.Logger,
+		metrics:      d.Metrics,
+		cfg:          cfg,
+		now:          now,
+		limits:       cfg.Limits,
+		uploadsCache: make(map[contract.UploadID]cachedUpload),
 	}
 }
 

@@ -103,6 +103,57 @@ GET  /metrics                               → Prometheus
 
 ---
 
+### 1.8 Dev bootstrap (`--dev-bootstrap`, dev/eval only)
+
+`fass-coordinator --dev-bootstrap` creates (or reconciles) a deterministic
+three-Nexus cluster before it starts listening, then writes the credentials and
+one-time agent secrets to `<data-dir>/dev-bootstrap.json` and prints them once on
+stdout:
+
+```
+FASS_DEV_BOOTSTRAP {"access_key_id":"dev-access-key","secret":"dev-secret-key",
+ "region":"eu-west-1","rc_id":"dev-rc","ring_id":"dev-ring","bucket":"dev-bucket",
+ "tenant_id":"dev-tenant","project_id":"dev-project",
+ "agents":[{"node_id":"node-a1","nexus_id":"nexus-a","disk_id":"disk-a1-1",
+            "secret":"<one-time announce secret>"}, ... 12 total]}
+```
+
+Topology: swarm `dev-swarm`; Nexuses `nexus-a/b/c`; 6 nodes (`node-a1..c2`) with
+**2 disks each = 12 agents**; tenant `dev-tenant` / project `dev-project`; root
+access key `dev-access-key`/`dev-secret-key`; Redundancy Class `dev-rc` =
+`geo 2+1 / local 3+1`, `aag 2`, chunk 6 MiB (4 shards per Nexus on 2 nodes ⇒ one
+shard loss per node leaves a group unusable, and a whole-Nexus loss leaves
+`geo_n = 2` groups); ring `dev-ring` over the three Nexuses; bucket `dev-bucket`
+(default RC `dev-rc`).
+
+Semantics:
+
+* **Idempotent.** Fixed ids; existing swarm/nexus/node/tenant/project/RC/ring/
+  bucket are reused and verified (an RC with different parameters is an error,
+  not a silent mutation). Re-running never changes an ACTIVE agent's
+  registration: `secret` is empty for such agents (`""`), and a fresh one-time
+  secret is minted only for agents that are not yet ACTIVE.
+* **Disk identity is bound on first announce.** The payload's `disk_id` is the
+  operator-facing slot label (`disk-a1-1`), not the agent's identity: the agent
+  generates its own disk UUID and announce binds it via a node-scoped pending
+  registration matched by the one-time secret. A different disk presenting an
+  already-bound public key is rejected with `409 Agent with the same public key
+  already exists`.
+* **Activation is explicit** (`POST /v1/agents/{id}/activate`) and now refused
+  with `409 AgentNotAnnounced` until the agent has announced: activating an
+  unannounced agent would make it ACTIVE with no endpoint and consume the only
+  legitimate announce path.
+* Dev-only health timings (`--heartbeat-interval`, `--suspect-after`,
+  `--offline-after`) exist so tests can observe SUSPECT/OFFLINE quickly; the
+  production defaults remain 5s/15s/60s.
+
+The 3-Nexus end-to-end test (`go test -tags=e2e ./test/e2e/`) consumes this
+payload: coordinator + 12 agents + gateway as real subprocesses, S3 PUT/HEAD/GET/
+list/range through `pkg/sdk`, then SIGKILL of every nexus-c agent and a GET that
+must still return the original bytes from the two surviving geo groups.
+
+---
+
 ## 2. Agent — `:7100`
 
 ```

@@ -181,6 +181,7 @@ func (s *Service) ListUploads(ctx context.Context, bucketID contract.BucketID) (
 				UploadID:     rec.UploadID,
 				BucketID:     rec.BucketID,
 				Key:          rec.Key,
+				VersionID:    rec.Meta.VersionID,
 				Initiated:    rec.CreatedAt,
 				StorageClass: rec.Meta.StorageClass,
 			})

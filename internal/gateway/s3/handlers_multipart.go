@@ -10,19 +10,54 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/fass-storage/fass/internal/contract"
 	"github.com/fass-storage/fass/internal/gateway/offloader"
 )
 
-// multipartModePrefix re-exports the offloader convention that marks part-level
-// encryption metadata (multipart parts bind an empty AAD version).
-//
-// TODO(multipart-version): delete this bridge once UploadPart can read
-// UploadInfo.VersionID via Coordinator.GetUpload; parts must then bind the real
-// version id in their chunk AAD. The write end is UploadPart/UploadPartCopy and
-// the read end is offloader.Read.
-const multipartModePrefix = offloader.MultipartModePrefix
+// cachedUpload is the immutable identity of an in-progress upload.
+type cachedUpload struct {
+	key       string
+	versionID contract.VersionID
+	expires   time.Time
+}
+
+// uploadCacheTTL bounds how long upload metadata is cached. Uploads never change
+// their key or version id, so this only bounds memory for abandoned uploads.
+const uploadCacheTTL = 5 * time.Minute
+
+// resolveUpload looks up an upload's version id (minted at CreateMultipartUpload)
+// so every part binds it in its chunk AAD. The coordinator's contract exposes the
+// version id through UploadInfo.VersionID.
+func (s *Server) resolveUpload(ctx context.Context, uploadID contract.UploadID, bucketID contract.BucketID) (cachedUpload, *APIError) {
+	now := s.now()
+	s.uploadsMu.Lock()
+	if up, ok := s.uploadsCache[uploadID]; ok && now.Before(up.expires) {
+		s.uploadsMu.Unlock()
+		return up, nil
+	}
+	s.uploadsMu.Unlock()
+
+	uploads, err := s.coord.ListUploads(ctx, bucketID)
+	if err != nil {
+		return cachedUpload{}, mapError(err)
+	}
+	for _, up := range uploads {
+		if up.UploadID != uploadID {
+			continue
+		}
+		entry := cachedUpload{key: up.Key, versionID: up.VersionID, expires: now.Add(uploadCacheTTL)}
+		s.uploadsMu.Lock()
+		if len(s.uploadsCache) > 4096 {
+			s.uploadsCache = make(map[contract.UploadID]cachedUpload)
+		}
+		s.uploadsCache[uploadID] = entry
+		s.uploadsMu.Unlock()
+		return entry, nil
+	}
+	return cachedUpload{}, ErrNoSuchUpload
+}
 
 // handleCreateMultipartUpload implements POST /{bucket}/{key}?uploads.
 func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request, t target) {
@@ -74,8 +109,8 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	uploadMeta := contract.CommitRequest{
-		// The version id is minted here so CompleteUpload can promote it; parts
-		// cannot bind it until Coordinator.GetUpload is available (TODO above).
+		// The version id is minted here so every part can bind it in its chunk
+		// AAD and CompleteUpload can promote it into the manifest.
 		VersionID:    contract.VersionID(s.newUUID()),
 		BucketID:     b.BucketID,
 		Key:          t.Key,
@@ -157,11 +192,16 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, t targ
 		return
 	}
 
-	// TODO(multipart-version): replace the empty version id with the upload's
-	// VersionID from Coordinator.GetUpload and drop the multipart: mode prefix.
-	// Multipart parts use an empty AAD version until then; the mode prefix keeps
-	// reads consistent.
-	spec := s.objectSpec(b, t.Key, "", contentLength(r), r.Header.Get("Content-Type"), meta, nil, "STANDARD", b.DefaultRCID)
+	upload, apiErr := s.resolveUpload(r.Context(), uploadID, b.BucketID)
+	if apiErr != nil {
+		s.fail(w, r, apiErr)
+		return
+	}
+	if upload.key != t.Key {
+		s.fail(w, r, ErrNoSuchUpload)
+		return
+	}
+	spec := s.objectSpec(b, t.Key, upload.versionID, contentLength(r), r.Header.Get("Content-Type"), meta, nil, "STANDARD", b.DefaultRCID)
 	spec.ChunkSize = s.cfg.ChunkSize
 	spec.MaxBytes = s.limits.PartSizeMax
 	spec.Checksums = checksums
@@ -172,11 +212,7 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, t targ
 		s.fail(w, r, err)
 		return
 	}
-	enc := part.Encryption
-	if !strings.HasPrefix(enc.Mode, multipartModePrefix) {
-		enc.Mode = multipartModePrefix + enc.Mode
-	}
-	if err := s.coord.CommitPart(r.Context(), uploadID, partNumber, part.ETag, part.Size, part.Chunks, enc); err != nil {
+	if err := s.coord.CommitPart(r.Context(), uploadID, partNumber, part.ETag, part.Size, part.Chunks, part.Encryption); err != nil {
 		if errors.Is(err, contract.ErrNotFound) {
 			s.fail(w, r, ErrNoSuchUpload)
 			return
@@ -227,6 +263,15 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, t 
 		s.fail(w, r, err)
 		return
 	}
+	upload, apiErr := s.resolveUpload(r.Context(), uploadID, dstBucket.BucketID)
+	if apiErr != nil {
+		s.fail(w, r, apiErr)
+		return
+	}
+	if upload.key != t.Key {
+		s.fail(w, r, ErrNoSuchUpload)
+		return
+	}
 	manifest, err := s.coord.GetManifest(r.Context(), src.Bucket, src.Key, contract.VersionID(src.VersionID))
 	if err != nil {
 		if errors.Is(err, contract.ErrNotFound) {
@@ -266,7 +311,7 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, t 
 		}, pw)
 		_ = pw.CloseWithError(err)
 	}()
-	spec := s.objectSpec(dstBucket, t.Key, "", size, manifest.ContentType, manifest.UserMeta, nil, "STANDARD", dstBucket.DefaultRCID)
+	spec := s.objectSpec(dstBucket, t.Key, upload.versionID, size, manifest.ContentType, manifest.UserMeta, nil, "STANDARD", dstBucket.DefaultRCID)
 	spec.MaxBytes = s.limits.PartSizeMax
 	part, err := s.off.WritePart(ctx, spec, uploadID, partNumber, pr)
 	cancel()
@@ -274,11 +319,7 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, t 
 		s.fail(w, r, err)
 		return
 	}
-	enc := part.Encryption
-	if !strings.HasPrefix(enc.Mode, multipartModePrefix) {
-		enc.Mode = multipartModePrefix + enc.Mode
-	}
-	if err := s.coord.CommitPart(r.Context(), uploadID, partNumber, part.ETag, part.Size, part.Chunks, enc); err != nil {
+	if err := s.coord.CommitPart(r.Context(), uploadID, partNumber, part.ETag, part.Size, part.Chunks, part.Encryption); err != nil {
 		if errors.Is(err, contract.ErrNotFound) {
 			s.fail(w, r, ErrNoSuchUpload)
 			return

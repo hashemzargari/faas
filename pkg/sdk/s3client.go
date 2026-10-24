@@ -72,6 +72,10 @@ func New(endpoint, region, accessKey, secretKey string, opts ...Option) (*Client
 	for _, o := range opts {
 		o(c)
 	}
+	if c.HTTP == nil {
+		// Defensive: an option must not be able to leave the client unusable.
+		c.HTTP = &http.Client{Timeout: 5 * time.Minute}
+	}
 	return c, nil
 }
 

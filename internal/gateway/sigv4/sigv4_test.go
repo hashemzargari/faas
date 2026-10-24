@@ -1,8 +1,10 @@
 package sigv4
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -447,5 +449,46 @@ func TestCanonicalURI(t *testing.T) {
 		if got := CanonicalURI(in); got != want {
 			t.Errorf("CanonicalURI(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestChunkedReaderUnsignedTrailer(t *testing.T) {
+	payload := []byte("payload with a flexible checksum trailer")
+	scope := Scope{Date: "20261024", Region: "eu-west-1", Service: "s3", Terminator: Terminator}
+	key := SigningKey(testSecret, scope)
+	const amzDate = "20261024T113000Z"
+	seed := strings.Repeat("ab", 32)
+	trailerValue := "AAAAAA=="
+	canonical := "x-amz-checksum-crc32:" + trailerValue + "\n"
+	trailerSTS := "AWS4-HMAC-SHA256-TRAILER\n" + amzDate + "\n" + scope.String() + "\n" +
+		seed + "\n" + HashPayload([]byte(canonical))
+	trailerSig := Sign(key, trailerSTS)
+
+	var body bytes.Buffer
+	fmt.Fprintf(&body, "%x\r\n", len(payload))
+	body.Write(payload)
+	body.WriteString("\r\n0\r\n")
+	fmt.Fprintf(&body, "x-amz-checksum-crc32:%s\r\n", trailerValue)
+	fmt.Fprintf(&body, "x-amz-trailer-signature:%s\r\n\r\n", trailerSig)
+
+	r, err := NewChunkedReader(bytes.NewReader(body.Bytes()), ChunkedOptions{
+		Kind:          PayloadUnsignedTrailer,
+		SeedSignature: seed,
+		SigningKey:    key,
+		AmzDate:       amzDate,
+		Scope:         scope,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v (body=%q)", err, body.String())
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("payload = %q", got)
+	}
+	if r.Trailers()["x-amz-checksum-crc32"] != trailerValue {
+		t.Fatalf("trailers = %v", r.Trailers())
 	}
 }

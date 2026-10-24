@@ -270,8 +270,10 @@ func Run(ctx context.Context, m *meta.Service, a *auth.Service, mem *membership.
 	for _, slot := range slots {
 		agentID, secret, _, err := mem.EnsurePending(ctx, membership.PendingRegistration{
 			NodeID: slot.node.ID,
-			// Empty disk: bind the agent's generated disk UUID on first announce.
+			// Empty disk + slot label: bind the agent's generated disk UUID on
+			// first announce; the slot lets several disks share a node.
 			DiskID:        "",
+			Slot:          slot.disk,
 			CapacityBytes: cfg.AgentCapacity,
 		})
 		if err != nil {

@@ -1,9 +1,13 @@
 package s3_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha1"
+	"crypto/sha256"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"sort"
@@ -363,16 +367,6 @@ func (f *fakeCoord) ListUploads(ctx context.Context, bucketID contract.BucketID)
 	return out, nil
 }
 
-func (f *fakeCoord) GetUpload(ctx context.Context, up contract.UploadID) (contract.UploadInfo, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	u, ok := f.uploads[up]
-	if !ok {
-		return contract.UploadInfo{}, contract.ErrNotFound
-	}
-	return contract.UploadInfo{UploadID: up, Key: u.key, VersionID: u.versionID, Initiated: nowUTC(), StorageClass: "STANDARD"}, nil
-}
-
 func (f *fakeCoord) CompleteUpload(ctx context.Context, up contract.UploadID) (contract.CommitResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -498,6 +492,13 @@ func (o *fakeOffloader) Write(ctx context.Context, spec offloader.ObjectSpec, bo
 		return contract.CommitResult{}, err
 	}
 	sum := md5.Sum(data)
+	expected := append([]offloader.ExpectedChecksum(nil), spec.Checksums...)
+	if spec.DeferredChecksums != nil {
+		expected = append(expected, spec.DeferredChecksums()...)
+	}
+	if err := verifyChecksums(data, expected); err != nil {
+		return contract.CommitResult{}, err
+	}
 	if spec.IfMatch != "" || spec.IfNoneMatch != "" {
 		if err := o.checkCondition(ctx, spec); err != nil {
 			return contract.CommitResult{}, err
@@ -633,6 +634,37 @@ func (o *fakeOffloader) checkCondition(ctx context.Context, spec offloader.Objec
 	}
 	if spec.IfNoneMatch == "*" || spec.IfNoneMatch == etag || spec.IfNoneMatch == m.ETag {
 		return contract.ErrPrecondition
+	}
+	return nil
+}
+
+// verifyChecksums mirrors the offloader's pre-commit checksum verification so
+// handler tests exercise the same contract (notably aws-chunked trailers).
+func verifyChecksums(data []byte, expected []offloader.ExpectedChecksum) error {
+	for _, want := range expected {
+		var got []byte
+		switch want.Algorithm {
+		case offloader.ChecksumMD5:
+			sum := md5.Sum(data)
+			got = sum[:]
+		case offloader.ChecksumSHA1:
+			sum := sha1.Sum(data)
+			got = sum[:]
+		case offloader.ChecksumSHA256:
+			sum := sha256.Sum256(data)
+			got = sum[:]
+		case offloader.ChecksumCRC32:
+			sum := crc32.ChecksumIEEE(data)
+			got = []byte{byte(sum >> 24), byte(sum >> 16), byte(sum >> 8), byte(sum)}
+		case offloader.ChecksumCRC32C:
+			sum := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
+			got = []byte{byte(sum >> 24), byte(sum >> 16), byte(sum >> 8), byte(sum)}
+		default:
+			return fmt.Errorf("%w: unsupported algorithm %q", offloader.ErrBadDigest, want.Algorithm)
+		}
+		if !bytes.Equal(got, want.Value) {
+			return fmt.Errorf("%w: %s", offloader.ErrBadDigest, want.Algorithm)
+		}
 	}
 	return nil
 }

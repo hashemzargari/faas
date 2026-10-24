@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -450,12 +451,10 @@ func TestKeyFingerprintMismatch(t *testing.T) {
 func TestWritePartThenReadBack(t *testing.T) {
 	e := newEnv(t)
 	payload := randomPayload(t, 300<<10)
-	// Multipart parts are written before the final version id exists: the AAD
-	// (and therefore the shard-set id) binds an empty version, with the mode
-	// prefix recording that fact for the read path.
-	spec := e.spec
-	spec.VersionID = ""
-	part, err := e.off.WritePart(context.Background(), spec, "upload-1", 1, bytes.NewReader(payload))
+	// Multipart parts bind the upload's gateway-minted version id in the AAD and
+	// in the derived shard-set id, so a part can never be spliced into another
+	// version.
+	part, err := e.off.WritePart(context.Background(), e.spec, "upload-1", 1, bytes.NewReader(payload))
 	if err != nil {
 		t.Fatalf("WritePart: %v", err)
 	}
@@ -466,14 +465,42 @@ func TestWritePartThenReadBack(t *testing.T) {
 	if part.Size != int64(len(payload)) || len(part.Chunks) != 1 {
 		t.Fatalf("part = %+v", part)
 	}
-	enc := part.Encryption
-	enc.Mode = MultipartModePrefix + enc.Mode
 	m := contract.Manifest{
 		TenantID: "t1", ProjectID: "p1", BucketID: "bucket-1", Key: e.spec.Key,
-		VersionID: "part-object", Size: part.Size, ChunkSize: 4 << 20,
-		Chunks: part.Chunks, Encryption: enc,
+		VersionID: e.spec.VersionID, Size: part.Size, ChunkSize: 4 << 20,
+		Chunks: part.Chunks, Encryption: part.Encryption,
 	}
 	if got := e.read(t, m, nil); !bytes.Equal(got, payload) {
 		t.Fatal("part round trip failed")
+	}
+}
+
+// TestDeferredChecksums covers aws-chunked trailers, whose values only exist
+// after the body has been consumed but which must still be verified before the
+// object is committed.
+func TestDeferredChecksums(t *testing.T) {
+	e := newEnv(t)
+	payload := []byte("trailer checksum payload")
+
+	// Correct deferred checksum: commit succeeds.
+	good := sha256.Sum256(payload)
+	e.spec.Checksums = nil
+	e.spec.DeferredChecksums = func() []ExpectedChecksum {
+		return []ExpectedChecksum{{Algorithm: ChecksumSHA256, Value: good[:]}}
+	}
+	if _, err := e.off.Write(context.Background(), e.spec, bytes.NewReader(payload)); err != nil {
+		t.Fatalf("write with correct trailer: %v", err)
+	}
+
+	// Wrong deferred checksum: abort before commit.
+	e2 := newEnv(t)
+	e2.spec.DeferredChecksums = func() []ExpectedChecksum {
+		return []ExpectedChecksum{{Algorithm: ChecksumSHA256, Value: bytes.Repeat([]byte{0}, 32)}}
+	}
+	if _, err := e2.off.Write(context.Background(), e2.spec, bytes.NewReader(payload)); !errors.Is(err, ErrBadDigest) {
+		t.Fatalf("error = %v, want ErrBadDigest", err)
+	}
+	if e2.coord.lastCommit().VersionID != "" {
+		t.Fatal("object was committed despite a bad deferred checksum")
 	}
 }
