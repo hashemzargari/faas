@@ -17,3 +17,6 @@ coverage.out
 # workspace-local toolchain caches (sandbox)
 .gopath/
 .gocache/
+
+# local dev runtime dirs
+.dev/

@@ -1,0 +1,123 @@
+# FASS dev cluster: ONE host, THREE simulated Nexuses.
+#
+# This is the topology the design decisions require for development (docs/06
+# §2.0, decision D-A): the two-tier code path (geo x local) must be exercised
+# from the first end-to-end milestone, so six agents are labelled across
+# nexus-a / nexus-b / nexus-c. Each "agent" is a separate process with its own
+# disk directory and port -- exactly the per-disk agent model (one agent = one
+# disk), just co-located.
+#
+#   docker compose -f deploy/docker/compose.dev.yml up --build
+#   aws --endpoint-url http://localhost:8080 s3 ls
+#
+# Default Redundancy Class in dev: geo 2+1 over 3 Nexuses, local 4+2 within a
+# Nexus => 6 shards per group, 18 shards per chunk, ratio 2.25x. Small numbers
+# so a chunk is 3 shards wide per disk; it exercises every code path without
+# needing 60 agents on a laptop.
+
+name: fass-dev
+
+x-agent: &agent
+  image: fass:dev
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile
+  entrypoint: ["/usr/local/bin/fass-agent"]
+  restart: unless-stopped
+  depends_on:
+    coordinator:
+      condition: service_started
+  environment:
+    FASS_COORDINATOR_URL: http://coordinator:7000
+    FASS_AGENT_SECRET: dev-shared-secret
+    FASS_DISK_RESERVE_PCT: "5"
+
+services:
+  coordinator:
+    image: fass:dev
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    entrypoint: ["/usr/local/bin/fass-coordinator"]
+    restart: unless-stopped
+    command:
+      - --listen=:7000
+      - --data-dir=/var/lib/fass
+      - --dev
+      - --dev-topology=nexus-a:2,nexus-b:2,nexus-c:2
+      - --default-rc=geo2+1-local4+2-aag1
+    ports:
+      - "127.0.0.1:7000:7000"
+      - "127.0.0.1:7001:7001"
+    volumes:
+      - coorddata:/var/lib/fass
+
+  gateway:
+    image: fass:dev
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    entrypoint: ["/usr/local/bin/fass-gateway"]
+    restart: unless-stopped
+    command:
+      - --listen=:8080
+      - --coordinator=http://coordinator:7000
+      - --region=eu-west-1
+      - --chunk-size=4194304
+      - --dev
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      coordinator:
+        condition: service_started
+
+  # nexus-a
+  agent-a1:
+    <<: *agent
+    volumes:
+      - agent-a1-data:/data
+    command: ["--nexus-id=nexus-a", "--node-id=node-a1", "--listen=:7101", "--disk=/data"]
+    ports: ["127.0.0.1:7101:7101"]
+  agent-a2:
+    <<: *agent
+    volumes:
+      - agent-a2-data:/data
+    command: ["--nexus-id=nexus-a", "--node-id=node-a2", "--listen=:7102", "--disk=/data"]
+    ports: ["127.0.0.1:7102:7102"]
+
+  # nexus-b
+  agent-b1:
+    <<: *agent
+    volumes:
+      - agent-b1-data:/data
+    command: ["--nexus-id=nexus-b", "--node-id=node-b1", "--listen=:7103", "--disk=/data"]
+    ports: ["127.0.0.1:7103:7103"]
+  agent-b2:
+    <<: *agent
+    volumes:
+      - agent-b2-data:/data
+    command: ["--nexus-id=nexus-b", "--node-id=node-b2", "--listen=:7104", "--disk=/data"]
+    ports: ["127.0.0.1:7104:7104"]
+
+  # nexus-c
+  agent-c1:
+    <<: *agent
+    volumes:
+      - agent-c1-data:/data
+    command: ["--nexus-id=nexus-c", "--node-id=node-c1", "--listen=:7105", "--disk=/data"]
+    ports: ["127.0.0.1:7105:7105"]
+  agent-c2:
+    <<: *agent
+    volumes:
+      - agent-c2-data:/data
+    command: ["--nexus-id=nexus-c", "--node-id=node-c2", "--listen=:7106", "--disk=/data"]
+    ports: ["127.0.0.1:7106:7106"]
+
+volumes:
+  coorddata:
+  agent-a1-data:
+  agent-a2-data:
+  agent-b1-data:
+  agent-b2-data:
+  agent-c1-data:
+  agent-c2-data:

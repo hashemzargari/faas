@@ -44,53 +44,55 @@ func Wrap(err error, status int, code, message string) *Error {
 
 // Wire error codes. The announce codes are the Cubbit-compatible taxonomy.
 const (
-	CodeNoSuchBucket      = "NoSuchBucket"
-	CodeNoSuchKey         = "NoSuchKey"
-	CodeBucketNotEmpty    = "BucketNotEmpty"
-	CodeBucketAlreadyOwned = "BucketAlreadyOwnedByYou"
-	CodeAccessDenied      = "AccessDenied"
-	CodeInvalidRequest    = "InvalidRequest"
-	CodeInvalidPart       = "InvalidPart"
-	CodeEntityTooLarge    = "EntityTooLarge"
-	CodePreconditionFailed = "PreconditionFailed"
-	CodeObjectLocked      = "AccessDenied"
-	CodeMethodNotAllowed  = "MethodNotAllowed"
-	CodeNotImplemented    = "NotImplemented"
-	CodeSlowDown          = "SlowDown"
-	CodeServiceUnavailable = "ServiceUnavailable"
-	CodeInternal          = "InternalError"
-	CodeConflict          = "Conflict"
+	CodeNoSuchBucket        = "NoSuchBucket"
+	CodeNoSuchKey           = "NoSuchKey"
+	CodeBucketNotEmpty      = "BucketNotEmpty"
+	CodeBucketAlreadyOwned  = "BucketAlreadyOwnedByYou"
+	CodeAccessDenied        = "AccessDenied"
+	CodeInvalidRequest      = "InvalidRequest"
+	CodeInvalidPart         = "InvalidPart"
+	CodeEntityTooLarge      = "EntityTooLarge"
+	CodePreconditionFailed  = "PreconditionFailed"
+	CodeObjectLocked        = "AccessDenied"
+	CodeMethodNotAllowed    = "MethodNotAllowed"
+	CodeNotImplemented      = "NotImplemented"
+	CodeSlowDown            = "SlowDown"
+	CodeServiceUnavailable  = "ServiceUnavailable"
+	CodeInternal            = "InternalError"
+	CodeConflict            = "Conflict"
+	CodeNoSuchUpload        = "NoSuchUpload"
 	CodeInsufficientStorage = "InsufficientStorage"
-	CodeNotFound          = "NotFound"
-	CodeInvalidArgument   = "InvalidArgument"
+	CodeNotFound            = "NotFound"
+	CodeInvalidArgument     = "InvalidArgument"
 
 	// Announce taxonomy — docs/07 §1.7.
-	CodePortMismatch    = "PortMismatch"
-	CodeSecretNotFound  = "SecretNotFound"
+	CodePortMismatch       = "PortMismatch"
+	CodeSecretNotFound     = "SecretNotFound"
 	CodeDuplicatePublicKey = "DuplicatePublicKey"
-	CodeNotPending      = "NotPending"
-	CodeSecretMismatch  = "SecretMismatch"
-	CodeMaintenance     = "Maintenance"
+	CodeNotPending         = "NotPending"
+	CodeSecretMismatch     = "SecretMismatch"
+	CodeMaintenance        = "Maintenance"
 )
 
 var (
-	ErrNoSuchBucket  = &Error{Status: http.StatusNotFound, Code: CodeNoSuchBucket, Message: "The specified bucket does not exist"}
-	ErrNoSuchKey     = &Error{Status: http.StatusNotFound, Code: CodeNoSuchKey, Message: "The specified key does not exist"}
-	ErrBucketNotEmpty = &Error{Status: http.StatusConflict, Code: CodeBucketNotEmpty, Message: "The bucket you tried to delete is not empty"}
-	ErrAccessDenied  = &Error{Status: http.StatusForbidden, Code: CodeAccessDenied, Message: "Access Denied"}
-	ErrInvalidRequest = &Error{Status: http.StatusBadRequest, Code: CodeInvalidRequest, Message: "Invalid request"}
-	ErrInvalidPart   = &Error{Status: http.StatusBadRequest, Code: CodeInvalidPart, Message: "One or more of the specified parts could not be found"}
-	ErrEntityTooLarge = &Error{Status: http.StatusBadRequest, Code: CodeEntityTooLarge, Message: "Your proposed upload exceeds the maximum allowed object size"}
-	ErrPreconditionFailed = &Error{Status: http.StatusPreconditionFailed, Code: CodePreconditionFailed, Message: "At least one of the preconditions you specified did not hold"}
-	ErrObjectLocked  = &Error{Status: http.StatusForbidden, Code: CodeObjectLocked, Message: "Object is protected by retention or legal hold"}
-	ErrMethodNotAllowed = &Error{Status: http.StatusMethodNotAllowed, Code: CodeMethodNotAllowed, Message: "The specified method is not allowed against this resource"}
-	ErrNotImplemented = &Error{Status: http.StatusNotImplemented, Code: CodeNotImplemented, Message: "A header or operation you provided implies functionality that is not implemented"}
-	ErrSlowDown      = &Error{Status: http.StatusServiceUnavailable, Code: CodeSlowDown, Message: "Please reduce your request rate"}
-	ErrServiceUnavailable = &Error{Status: http.StatusServiceUnavailable, Code: CodeServiceUnavailable, Message: "Service is unavailable, please retry"}
-	ErrInternal      = &Error{Status: http.StatusInternalServerError, Code: CodeInternal, Message: "We encountered an internal error. Please try again"}
-	ErrConflict      = &Error{Status: http.StatusConflict, Code: CodeConflict, Message: "Conflicting state"}
+	ErrNoSuchBucket        = &Error{Status: http.StatusNotFound, Code: CodeNoSuchBucket, Message: "The specified bucket does not exist"}
+	ErrNoSuchKey           = &Error{Status: http.StatusNotFound, Code: CodeNoSuchKey, Message: "The specified key does not exist"}
+	ErrBucketNotEmpty      = &Error{Status: http.StatusConflict, Code: CodeBucketNotEmpty, Message: "The bucket you tried to delete is not empty"}
+	ErrAccessDenied        = &Error{Status: http.StatusForbidden, Code: CodeAccessDenied, Message: "Access Denied"}
+	ErrInvalidRequest      = &Error{Status: http.StatusBadRequest, Code: CodeInvalidRequest, Message: "Invalid request"}
+	ErrInvalidPart         = &Error{Status: http.StatusBadRequest, Code: CodeInvalidPart, Message: "One or more of the specified parts could not be found"}
+	ErrEntityTooLarge      = &Error{Status: http.StatusBadRequest, Code: CodeEntityTooLarge, Message: "Your proposed upload exceeds the maximum allowed object size"}
+	ErrPreconditionFailed  = &Error{Status: http.StatusPreconditionFailed, Code: CodePreconditionFailed, Message: "At least one of the preconditions you specified did not hold"}
+	ErrObjectLocked        = &Error{Status: http.StatusForbidden, Code: CodeObjectLocked, Message: "Object is protected by retention or legal hold"}
+	ErrMethodNotAllowed    = &Error{Status: http.StatusMethodNotAllowed, Code: CodeMethodNotAllowed, Message: "The specified method is not allowed against this resource"}
+	ErrNotImplemented      = &Error{Status: http.StatusNotImplemented, Code: CodeNotImplemented, Message: "A header or operation you provided implies functionality that is not implemented"}
+	ErrSlowDown            = &Error{Status: http.StatusServiceUnavailable, Code: CodeSlowDown, Message: "Please reduce your request rate"}
+	ErrServiceUnavailable  = &Error{Status: http.StatusServiceUnavailable, Code: CodeServiceUnavailable, Message: "Service is unavailable, please retry"}
+	ErrInternal            = &Error{Status: http.StatusInternalServerError, Code: CodeInternal, Message: "We encountered an internal error. Please try again"}
+	ErrConflict            = &Error{Status: http.StatusConflict, Code: CodeConflict, Message: "Conflicting state"}
 	ErrInsufficientStorage = &Error{Status: http.StatusInsufficientStorage, Code: CodeInsufficientStorage, Message: "Insufficient storage capacity"}
-	ErrNotFound      = &Error{Status: http.StatusNotFound, Code: CodeNotFound, Message: "Not found"}
+	ErrNotFound            = &Error{Status: http.StatusNotFound, Code: CodeNotFound, Message: "Not found"}
+	ErrNoSuchUpload        = &Error{Status: http.StatusNotFound, Code: CodeNoSuchUpload, Message: "The specified multipart upload does not exist"}
 
 	// Announce errors. Messages are frozen by docs/07 §1.7.
 	ErrPortMismatch       = &Error{Status: http.StatusBadRequest, Code: CodePortMismatch, Message: "Port mismatch"}
@@ -149,7 +151,7 @@ var sentinels = []*Error{
 	ErrNoSuchBucket, ErrNoSuchKey, ErrBucketNotEmpty, ErrAccessDenied,
 	ErrInvalidRequest, ErrInvalidPart, ErrEntityTooLarge, ErrPreconditionFailed,
 	ErrObjectLocked, ErrMethodNotAllowed, ErrNotImplemented, ErrSlowDown,
-	ErrServiceUnavailable, ErrInternal, ErrConflict, ErrInsufficientStorage,
+	ErrServiceUnavailable, ErrInternal, ErrConflict, ErrInsufficientStorage, ErrNoSuchUpload,
 	ErrPortMismatch, ErrSecretNotFound, ErrDuplicatePublicKey, ErrNotPending,
 	ErrSecretMismatch, ErrMaintenance,
 }

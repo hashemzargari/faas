@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-
 )
 
 // SchemaVersion is the logical schema version of the coordinator metadata store.

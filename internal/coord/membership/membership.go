@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"time"
@@ -118,18 +119,18 @@ type Node struct {
 // Agent is one disk's daemon. Score fields are maintained from heartbeats and
 // the repair/scrub feedback loop; they are the placement scorer's inputs.
 type Agent struct {
-	ID       contract.AgentID  `json:"agent_id"`
-	NodeID   contract.NodeID   `json:"node_id"`
-	NexusID  contract.NexusID  `json:"nexus_id"`
-	DiskID   string            `json:"disk_id"`
-	Hostname string            `json:"hostname"`
-	Endpoint string            `json:"endpoint"`
-	Port     int               `json:"port"`
-	Version  string            `json:"version"`
+	ID       contract.AgentID `json:"agent_id"`
+	NodeID   contract.NodeID  `json:"node_id"`
+	NexusID  contract.NexusID `json:"nexus_id"`
+	DiskID   string           `json:"disk_id"`
+	Hostname string           `json:"hostname"`
+	Endpoint string           `json:"endpoint"`
+	Port     int              `json:"port"`
+	Version  string           `json:"version"`
 
-	PublicKey     []byte `json:"public_key,omitempty"`
-	ExpectedPort  int    `json:"expected_port,omitempty"`
-	SecretHash    []byte `json:"secret_hash,omitempty"`
+	PublicKey     []byte    `json:"public_key,omitempty"`
+	ExpectedPort  int       `json:"expected_port,omitempty"`
+	SecretHash    []byte    `json:"secret_hash,omitempty"`
 	SecretExpires time.Time `json:"secret_expires,omitempty"`
 
 	CapacityBytes int64 `json:"capacity_bytes"`
@@ -137,11 +138,11 @@ type Agent struct {
 	UsedBytes     int64 `json:"used_bytes"`
 	ShardCount    int64 `json:"shard_count"`
 
-	State         State     `json:"state"`
-	StateChanged  time.Time `json:"state_changed"`
-	LastSeen      time.Time `json:"last_seen"`
-	RegisteredAt  time.Time `json:"registered_at"`
-	ActivatedAt   time.Time `json:"activated_at"`
+	State        State     `json:"state"`
+	StateChanged time.Time `json:"state_changed"`
+	LastSeen     time.Time `json:"last_seen"`
+	RegisteredAt time.Time `json:"registered_at"`
+	ActivatedAt  time.Time `json:"activated_at"`
 
 	UptimeScore float64 `json:"uptime_score"`
 	Reputation  float64 `json:"reputation"`
@@ -185,15 +186,15 @@ func (rc RedundancyClass) Ratio() float64 { return rc.Params.Ratio() }
 // Ring is a bounded set of agents implementing one RedundancyClass (docs/03
 // §4.6). Agents may belong to several rings.
 type Ring struct {
-	ID         contract.RingID    `json:"ring_id"`
-	Name       string             `json:"name"`
-	RCID       string             `json:"rc_id"`
-	NexusIDs   []contract.NexusID `json:"nexus_ids"`
-	AgentIDs   []contract.AgentID `json:"agent_ids"`
-	Capacity   int64              `json:"capacity_bytes"`
-	UsedBytes  int64              `json:"used_bytes"`
-	Epoch      int                `json:"epoch"`
-	CreatedAt  time.Time          `json:"created_at"`
+	ID        contract.RingID    `json:"ring_id"`
+	Name      string             `json:"name"`
+	RCID      string             `json:"rc_id"`
+	NexusIDs  []contract.NexusID `json:"nexus_ids"`
+	AgentIDs  []contract.AgentID `json:"agent_ids"`
+	Capacity  int64              `json:"capacity_bytes"`
+	UsedBytes int64              `json:"used_bytes"`
+	Epoch     int                `json:"epoch"`
+	CreatedAt time.Time          `json:"created_at"`
 }
 
 // FullPct returns the ring's usage percentage.
@@ -207,14 +208,14 @@ func (r Ring) FullPct() float64 {
 // Snapshot is an immutable view of the topology used by the placement engine and
 // the /v1/topology endpoint.
 type Snapshot struct {
-	ID                string                  `json:"snapshot_id"`
-	At                time.Time               `json:"at"`
-	Swarms            []Swarm                 `json:"swarms"`
-	Nexuses           []Nexus                 `json:"nexuses"`
-	Nodes             []Node                  `json:"nodes"`
-	Agents            []Agent                 `json:"agents"`
-	Rings             []Ring                  `json:"rings"`
-	RedundancyClasses []RedundancyClass       `json:"redundancy_classes"`
+	ID                string                        `json:"snapshot_id"`
+	At                time.Time                     `json:"at"`
+	Swarms            []Swarm                       `json:"swarms"`
+	Nexuses           []Nexus                       `json:"nexuses"`
+	Nodes             []Node                        `json:"nodes"`
+	Agents            []Agent                       `json:"agents"`
+	Rings             []Ring                        `json:"rings"`
+	RedundancyClasses []RedundancyClass             `json:"redundancy_classes"`
 	GeoFence          map[string][]contract.NexusID `json:"geo_fence,omitempty"`
 }
 
@@ -406,6 +407,12 @@ type PendingRegistration struct {
 func (s *Service) RegisterPending(ctx context.Context, reg PendingRegistration) (contract.AgentID, string, error) {
 	if reg.NodeID == "" || reg.DiskID == "" {
 		return "", "", coerr.Invalidf("node_id and disk_id are required")
+	}
+	if reg.ExpectedPort < 0 || reg.ExpectedPort > 65535 {
+		return "", "", coerr.Invalidf("expected_port must be in 0..65535")
+	}
+	if reg.CapacityBytes < 0 {
+		return "", "", coerr.Invalidf("capacity_bytes must be >= 0")
 	}
 	secret, err := id.NewSecret(32)
 	if err != nil {
@@ -649,10 +656,9 @@ func (s *Service) Heartbeat(ctx context.Context, hb contract.Heartbeat) error {
 	if hb.AgentID == "" {
 		return coerr.Invalidf("agent_id is required")
 	}
+	// LastSeen is the coordinator's clock: an agent clock must never be able to
+	// keep itself "fresh" (docs/03 §5.1 detects loss on the coordinator side).
 	now := s.now()
-	if !hb.Time.IsZero() {
-		now = hb.Time.UTC()
-	}
 	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
 		ag, err := storage.GetJSON[Agent](tx, spaceAgents, []byte(hb.AgentID))
 		if errors.Is(err, storage.ErrNotFound) {
@@ -1015,6 +1021,27 @@ func (s *Service) SetRingUsage(ctx context.Context, ringID contract.RingID, used
 	})
 }
 
+// AddRingUsage adjusts a ring's used bytes by delta (raw shard bytes committed or
+// reclaimed). Usage is accounting data: a stale value only affects the
+// ring_full_pct placement gate, never correctness, so callers log rather than
+// fail a commit on error.
+func (s *Service) AddRingUsage(ctx context.Context, ringID contract.RingID, delta int64) error {
+	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+		r, err := storage.GetJSON[Ring](tx, spaceRings, []byte(ringID))
+		if errors.Is(err, storage.ErrNotFound) {
+			return coerr.E(404, "NoSuchRing", "ring %q does not exist", ringID)
+		}
+		if err != nil {
+			return err
+		}
+		r.UsedBytes += delta
+		if r.UsedBytes < 0 {
+			r.UsedBytes = 0
+		}
+		return storage.PutJSON(tx, spaceRings, []byte(ringID), r)
+	})
+}
+
 // DeleteRing removes an empty ring and unbinds it from its agents.
 func (s *Service) DeleteRing(ctx context.Context, ringID contract.RingID) error {
 	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
@@ -1173,7 +1200,7 @@ func removeRing(list []contract.RingID, id contract.RingID) []contract.RingID {
 	return out
 }
 
-func countAgentsInNexus(tx *storage.ReadTx, agentIDs []contract.AgentID, nexus contract.NexusID) int {
+func countAgentsInNexus(tx storage.Reader, agentIDs []contract.AgentID, nexus contract.NexusID) int {
 	n := 0
 	for _, aid := range agentIDs {
 		ag, err := storage.GetJSON[Agent](tx, spaceAgents, []byte(aid))
@@ -1182,4 +1209,63 @@ func countAgentsInNexus(tx *storage.ReadTx, agentIDs []contract.AgentID, nexus c
 		}
 	}
 	return n
+}
+
+// ---------------------------------------------------------------------------
+// Shard status reports (docs/07 §1.6, docs/03 §5.5)
+// ---------------------------------------------------------------------------
+
+var spaceShardStatus = []byte("shard_status")
+
+// shardStatusRecord is the coordinator's view of one shard's health as reported
+// by its owning agent (OK / MISSING / CORRUPT). Repair scheduling consumes these
+// records; v1 only persists them and surfaces CORRUPT agents to the API.
+type shardStatusRecord struct {
+	AgentID    contract.AgentID    `json:"agent_id"`
+	ShardSetID contract.ShardSetID `json:"shard_set_id"`
+	Slot       int                 `json:"slot"`
+	State      string              `json:"state"`
+	UpdatedAt  time.Time           `json:"updated_at"`
+}
+
+// RecordShardStatus persists agent shard-health reports. Invalid states are
+// rejected; unknown agents are ignored (the agent will re-announce).
+func (s *Service) RecordShardStatus(ctx context.Context, items []contract.ShardStatus) error {
+	if len(items) == 0 {
+		return nil
+	}
+	now := s.now()
+	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+		for _, it := range items {
+			switch it.State {
+			case "OK", "MISSING", "CORRUPT":
+			default:
+				return coerr.Invalidf("invalid shard state %q", it.State)
+			}
+			if it.AgentID == "" || it.ShardSetID == "" || it.Slot < 0 {
+				return coerr.Invalidf("shard status needs agent_id, shard_set_id and a non-negative slot")
+			}
+			if !tx.Has(spaceAgents, []byte(it.AgentID)) {
+				continue
+			}
+			rec := shardStatusRecord{
+				AgentID:    it.AgentID,
+				ShardSetID: it.ShardSetID,
+				Slot:       it.Slot,
+				State:      it.State,
+				UpdatedAt:  now,
+			}
+			key := storage.JoinKeyN([]string{string(it.AgentID), string(it.ShardSetID)}, bigEndianSlot(it.Slot))
+			if err := storage.PutJSON(tx, spaceShardStatus, key, rec); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func bigEndianSlot(slot int) []byte {
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], uint32(slot))
+	return buf[:]
 }

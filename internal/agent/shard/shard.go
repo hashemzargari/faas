@@ -45,10 +45,11 @@ func Sum256(data []byte) [32]byte { return sha256.Sum256(data) }
 
 // Sum64 returns the FASS shard checksum of data: the big-endian uint64 formed
 // from the first eight bytes of SHA-256(data).
-func Sum64(data []byte) uint64 {
-	sum := sha256.Sum256(data)
-	return binary.BigEndian.Uint64(sum[:8])
-}
+func Sum64(data []byte) uint64 { return Sum64FromDigest(sha256.Sum256(data)) }
+
+// Sum64FromDigest applies the wire checksum convention to a full SHA-256
+// digest: BigEndian(digest[0:8]).
+func Sum64FromDigest(sum [32]byte) uint64 { return binary.BigEndian.Uint64(sum[:8]) }
 
 // Hasher is an incremental SHA-256 hasher that also exposes the FASS 64-bit
 // shard checksum.
@@ -74,6 +75,12 @@ func (h *Hasher) Sum256() [32]byte {
 	var out [32]byte
 	copy(out[:], h.h.Sum(nil))
 	return out
+}
+
+// Sum implements hash.Hash.
+func (h *Hasher) Sum(b []byte) []byte {
+	sum := h.Sum256()
+	return append(b, sum[:]...)
 }
 
 // Sum64 returns the FASS shard checksum of everything written so far.

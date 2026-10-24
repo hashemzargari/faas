@@ -16,7 +16,8 @@ import (
 //
 // payload := uint8 version | uint32 recordCount | record*
 // record  := uint8 op (1=put, 2=delete)
-//            uint16 spaceLen | uint32 keyLen | uint32 valLen | space | key | val
+//
+//	uint16 spaceLen | uint32 keyLen | uint32 valLen | space | key | val
 //
 // A frame is atomic: either the whole commit lands or (on a torn tail after a
 // crash) it is discarded during replay. All integers are little-endian; keys use

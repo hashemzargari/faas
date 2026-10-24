@@ -19,24 +19,25 @@ package meta
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"encoding/binary"
-
 	"github.com/fass-storage/fass/internal/contract"
 	"github.com/fass-storage/fass/internal/coord/coerr"
+	"github.com/fass-storage/fass/internal/coord/id"
 	"github.com/fass-storage/fass/internal/storage"
 )
 
 // Storage defaults and limits (docs/02 §1.2, docs/03 §1.2).
 const (
-	DefaultChunkSize = 16 << 20      // 16 MiB
-	MaxObjectSize    = 5 << 40       // 5 TiB
-	MaxKeyLength     = 1024          // S3 limit for an object key, in bytes
+	DefaultChunkSize = 16 << 20       // 16 MiB
+	MaxObjectSize    = 5 << 40        // 5 TiB
+	MaxKeyLength     = 1024           // S3 limit for an object key, in bytes
 	DeletionGrace    = 24 * time.Hour // overwrite / version-delete grace (docs/03 §6)
 	UploadExpiry     = 7 * 24 * time.Hour
 )
@@ -44,18 +45,18 @@ const (
 // Key spaces of the embedded engine. The PostgreSQL DDL in docs/schema.sql
 // defines the equivalent tables; every key layout is documented there too.
 var (
-	spaceBuckets      = []byte("buckets")        // name                     -> bucketRecord
-	spaceBucketIDs    = []byte("bucket_ids")     // bucket_id                -> name
-	spaceLatest       = []byte("objects_latest") // bucket_id,key            -> latestRecord
-	spaceVersions     = []byte("objects_versions") // bucket_id,key,seq      -> versionRecord
-	spaceVersionIDs   = []byte("object_version_ids") // bucket_id,key,version_id -> versionRecord
-	spaceManifests    = []byte("manifest_blobs") // manifest_hash            -> compressed manifest
-	spaceUploads      = []byte("uploads")        // upload_id                -> uploadRecord
-	spaceUploadIndex  = []byte("uploads_index")  // bucket_id,upload_id      -> uploadRecord
-	spaceParts        = []byte("upload_parts")   // upload_id,part_number    -> partRecord
-	spaceDeletions    = []byte("deletions")      // seq                      -> deletionItem
-	spaceCounters     = []byte("counters")       // name                     -> uint64 BE
-	spaceTenants      = []byte("tenants")        // tenant_id                -> Tenant
+	spaceBuckets     = []byte("buckets")            // name                     -> bucketRecord
+	spaceBucketIDs   = []byte("bucket_ids")         // bucket_id                -> name
+	spaceLatest      = []byte("objects_latest")     // bucket_id,key            -> latestRecord
+	spaceVersions    = []byte("objects_versions")   // bucket_id,key,seq      -> versionRecord
+	spaceVersionIDs  = []byte("object_version_ids") // bucket_id,key,version_id -> versionRecord
+	spaceManifests   = []byte("manifest_blobs")     // manifest_hash            -> compressed manifest
+	spaceUploads     = []byte("uploads")            // upload_id                -> uploadRecord
+	spaceUploadIndex = []byte("uploads_index")      // bucket_id,upload_id      -> uploadRecord
+	spaceParts       = []byte("upload_parts")       // upload_id,part_number    -> partRecord
+	spaceDeletions   = []byte("deletions")          // seq                      -> deletionItem
+	spaceCounters    = []byte("counters")           // name                     -> uint64 BE
+	spaceTenants     = []byte("tenants")            // tenant_id                -> Tenant
 )
 
 // Service implements the metadata service over a storage.DB.
@@ -88,7 +89,9 @@ func (s *Service) DB() *storage.DB { return s.db }
 // metadata that never leaves the coordinator.
 type Bucket struct {
 	contract.BucketConfig
-	CreatedAt time.Time `json:"created_at"`
+	CreatedAt time.Time    `json:"created_at"`
+	ACL       contract.ACL `json:"acl"`
+	Lifecycle []byte       `json:"lifecycle,omitempty"`
 }
 
 // CreateBucket creates a bucket. Creating an existing bucket owned by the same
@@ -121,9 +124,6 @@ func (s *Service) CreateBucket(ctx context.Context, cfg contract.BucketConfig) e
 
 	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
 		key := []byte(cfg.Name)
-		var existing Bucket
-		err := storage.GetJSON[contract.BucketConfig](tx, spaceBuckets, key).Err
-		_ = err
 		rec, getErr := storage.GetJSON[Bucket](tx, spaceBuckets, key)
 		switch {
 		case getErr == nil:
@@ -135,7 +135,6 @@ func (s *Service) CreateBucket(ctx context.Context, cfg contract.BucketConfig) e
 		case !errors.Is(getErr, storage.ErrNotFound):
 			return getErr
 		}
-		_ = existing
 		rec = Bucket{BucketConfig: cfg, CreatedAt: s.now().UTC()}
 		if err := storage.PutJSON(tx, spaceBuckets, key, rec); err != nil {
 			return err
@@ -277,7 +276,7 @@ func (s *Service) DeleteBucket(ctx context.Context, name string) error {
 	})
 }
 
-func bucketHasObjects(tx *storage.ReadTx, bucketID contract.BucketID) (bool, error) {
+func bucketHasObjects(tx storage.Reader, bucketID contract.BucketID) (bool, error) {
 	found := false
 	prefix := storage.JoinKey(string(bucketID))
 	err := tx.Scan(spaceVersions, prefix, func(_, raw []byte) error {
@@ -313,12 +312,12 @@ func bucketHasObjects(tx *storage.ReadTx, bucketID contract.BucketID) (bool, err
 // Tenant is the coordinator's tenant record. The key seed is opaque bytes: the
 // coordinator never derives object keys from it (docs/03 §3.5).
 type Tenant struct {
-	ID           contract.TenantID `json:"tenant_id"`
-	Name         string            `json:"name"`
-	GeoFence     []contract.NexusID `json:"geo_fence"` // empty = no restriction
-	DefaultRCID  string            `json:"default_rc_id"`
-	KeySeed      []byte            `json:"key_seed,omitempty"`
-	CreatedAt    time.Time         `json:"created_at"`
+	ID          contract.TenantID  `json:"tenant_id"`
+	Name        string             `json:"name"`
+	GeoFence    []contract.NexusID `json:"geo_fence"` // empty = no restriction
+	DefaultRCID string             `json:"default_rc_id"`
+	KeySeed     []byte             `json:"key_seed,omitempty"`
+	CreatedAt   time.Time          `json:"created_at"`
 }
 
 // PutTenant creates or replaces a tenant record.
@@ -418,7 +417,7 @@ func ValidateKey(key string) error {
 // ---------------------------------------------------------------------------
 
 // newID is indirected so tests can make identifiers predictable if ever needed.
-var newID = func() string { return idNew() }
+var newID = func() string { return id.New() }
 
 // nextSeq allocates the next value of a named monotonic counter inside tx.
 func nextSeq(tx *storage.WriteTx, name string) (uint64, error) {
@@ -452,7 +451,7 @@ func seqKey(parts []string, seq uint64) []byte {
 
 // decode is json.Unmarshal with a wrapped error.
 func decode(raw []byte, v any) error {
-	if err := jsonUnmarshal(raw, v); err != nil {
+	if err := json.Unmarshal(raw, v); err != nil {
 		return fmt.Errorf("meta: decode record: %w", err)
 	}
 	return nil

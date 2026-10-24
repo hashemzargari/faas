@@ -186,22 +186,17 @@ func VerifyV2(r *http.Request, secret string, now time.Time, skew time.Duration)
 			return V2Auth{}, fmt.Errorf("%w: expired at %s", ErrV2Expired, a.Expires.Format(time.RFC3339))
 		}
 	} else {
-		// Header auth: bound the Date header to prevent replay.
+		// Header auth: bound the Date header to prevent replay. Legacy clients
+		// send RFC 1123 with a numeric zone ("+0000"), which http.ParseTime
+		// does not accept, so try the RFC 1123 variants explicitly.
 		dateStr := r.Header.Get("Date")
 		if dateStr == "" {
-			// x-amz-date wins when present.
 			dateStr = r.Header.Get("x-amz-date")
 		}
 		if dateStr == "" {
 			return V2Auth{}, fmt.Errorf("%w: missing Date header", ErrV2Malformed)
 		}
-		var signed time.Time
-		var perr error
-		if _, isAmz := r.Header["X-Amz-Date"]; isAmz && r.Header.Get("Date") == "" {
-			signed, perr = time.Parse(amzDateFormat, dateStr)
-		} else {
-			signed, perr = http.ParseTime(dateStr)
-		}
+		signed, perr := parseHTTPDate(dateStr)
 		if perr != nil {
 			return V2Auth{}, fmt.Errorf("%w: bad Date %q", ErrV2Malformed, dateStr)
 		}
@@ -252,4 +247,25 @@ func amzHeaderNames(r *http.Request) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// parseHTTPDate parses the date formats legacy S3 clients use for SigV2.
+func parseHTTPDate(s string) (time.Time, error) {
+	formats := []string{
+		http.TimeFormat, // Mon, 02 Jan 2006 15:04:05 GMT
+		time.RFC1123Z,   // Mon, 02 Jan 2006 15:04:05 -0700
+		time.RFC1123,    // Mon, 02 Jan 2006 15:04:05 MST
+		time.RFC850,     // Monday, 02-Jan-06 15:04:05 MST
+		time.ANSIC,      // Mon Jan _2 15:04:05 2006
+		amzDateFormat,   // 20060102T150405Z
+	}
+	var err error
+	for _, f := range formats {
+		var t time.Time
+		t, err = time.Parse(f, s)
+		if err == nil {
+			return t.UTC(), nil
+		}
+	}
+	return time.Time{}, err
 }

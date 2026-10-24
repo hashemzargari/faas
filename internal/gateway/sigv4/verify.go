@@ -13,16 +13,16 @@ import (
 
 // Sentinel errors. Callers map these to S3 error codes (docs/05 §7).
 var (
-	ErrMissingAuth         = errors.New("sigv4: request is not signed")
-	ErrMalformedAuth       = errors.New("sigv4: malformed authorization")
+	ErrMissingAuth          = errors.New("sigv4: request is not signed")
+	ErrMalformedAuth        = errors.New("sigv4: malformed authorization")
 	ErrUnsupportedAlgorithm = errors.New("sigv4: unsupported signing algorithm")
-	ErrInvalidAccessKeyID  = errors.New("sigv4: invalid access key id")
-	ErrSignatureMismatch   = errors.New("sigv4: signature mismatch")
-	ErrRequestTimeSkewed   = errors.New("sigv4: request time too skewed")
-	ErrExpiredPresign      = errors.New("sigv4: presigned URL expired")
-	ErrMissingSignedHost   = errors.New("sigv4: host header not signed")
-	ErrInvalidPayloadHash  = errors.New("sigv4: invalid x-amz-content-sha256")
-	ErrCorruptChunkedBody  = errors.New("sigv4: corrupt aws-chunked body")
+	ErrInvalidAccessKeyID   = errors.New("sigv4: invalid access key id")
+	ErrSignatureMismatch    = errors.New("sigv4: signature mismatch")
+	ErrRequestTimeSkewed    = errors.New("sigv4: request time too skewed")
+	ErrExpiredPresign       = errors.New("sigv4: presigned URL expired")
+	ErrMissingSignedHost    = errors.New("sigv4: host header not signed")
+	ErrInvalidPayloadHash   = errors.New("sigv4: invalid x-amz-content-sha256")
+	ErrCorruptChunkedBody   = errors.New("sigv4: corrupt aws-chunked body")
 )
 
 const amzDateFormat = "20060102T150405Z"

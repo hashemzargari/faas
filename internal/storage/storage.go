@@ -119,6 +119,10 @@ func (db *DB) Close() error {
 }
 
 // View runs fn against a consistent read-only snapshot of the store.
+//
+// The callback must use the provided transaction for all reads; calling back into
+// View or Update from inside it can deadlock against a waiting writer and is not
+// supported.
 func (db *DB) View(ctx context.Context, fn func(*ReadTx) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -134,6 +138,9 @@ func (db *DB) View(ctx context.Context, fn func(*ReadTx) error) error {
 // Update runs fn against a read/write transaction and commits all its mutations
 // atomically: one WAL frame, one fsync, then applied in memory. If fn returns an
 // error nothing is written.
+//
+// The callback must use the provided transaction for all reads and writes; it
+// must not call View or Update (see View).
 func (db *DB) Update(ctx context.Context, fn func(*WriteTx) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -256,6 +263,51 @@ func (tx *WriteTx) Get(space, key []byte) ([]byte, error) {
 	return tx.ReadTx.Get(space, key)
 }
 
+// Scan iterates keys like ReadTx.Scan but observes the transaction's pending
+// writes: staged puts are included and staged deletes are hidden.
+func (tx *WriteTx) Scan(space, prefix []byte, fn func(key, value []byte) error) error {
+	if err := validAddr(space, nil); err != nil {
+		return err
+	}
+	merged := make(map[string][]byte)
+	if sm := tx.db.data[string(space)]; sm != nil {
+		for k, v := range sm {
+			if strings.HasPrefix(k, string(prefix)) {
+				merged[k] = v
+			}
+		}
+	}
+	for a, m := range tx.batch.overlay {
+		if string(m.space) != string(space) {
+			continue
+		}
+		k := string(m.key)
+		if !strings.HasPrefix(k, string(prefix)) {
+			continue
+		}
+		if m.del {
+			delete(merged, k)
+		} else {
+			merged[k] = m.val
+		}
+		_ = a
+	}
+	keys := make([]string, 0, len(merged))
+	for k := range merged {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if err := fn([]byte(k), append([]byte(nil), merged[k]...)); err != nil {
+			if errors.Is(err, errStop) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 // Has reports whether (space, key) exists, including pending writes.
 func (tx *WriteTx) Has(space, key []byte) bool {
 	_, err := tx.Get(space, key)
@@ -294,8 +346,15 @@ func (tx *WriteTx) Delete(space, key []byte) error {
 // PostgreSQL representations isomorphic.
 // ---------------------------------------------------------------------------
 
+// Reader is the read surface shared by View and Update transactions, so typed
+// helpers work in both.
+type Reader interface {
+	Get(space, key []byte) ([]byte, error)
+	Scan(space, prefix []byte, fn func(key, value []byte) error) error
+}
+
 // GetJSON decodes the JSON record at (space, key) into T.
-func GetJSON[T any](tx *ReadTx, space, key []byte) (T, error) {
+func GetJSON[T any](tx Reader, space, key []byte) (T, error) {
 	var out T
 	raw, err := tx.Get(space, key)
 	if err != nil {
@@ -318,7 +377,7 @@ func PutJSON[T any](tx *WriteTx, space, key []byte, v T) error {
 
 // ScanJSON decodes every record of space with prefix, calling fn in key order
 // with the decoded value.
-func ScanJSON[T any](tx *ReadTx, space, prefix []byte, fn func(key []byte, v T) error) error {
+func ScanJSON[T any](tx Reader, space, prefix []byte, fn func(key []byte, v T) error) error {
 	return tx.Scan(space, prefix, func(k, raw []byte) error {
 		var v T
 		if err := json.Unmarshal(raw, &v); err != nil {
