@@ -345,11 +345,14 @@ func runRepair(ctx context.Context, g *globalOpts, args []string, stdout, stderr
 	// coordinator answers 404 and we fall back to the topology-derived view, so
 	// the command never breaks against a mixed-version deployment.
 	if raw, gerr := client.getRaw(ctx, "/v1/repair/status"); gerr == nil {
-		status, derr := parseRepairStatus(raw)
-		if derr != nil {
-			return servicef(derr, "decode coordinator /v1/repair/status")
+		if strings.TrimSpace(raw) != "" {
+			status, derr := parseRepairStatus(raw)
+			if derr != nil {
+				return servicef(derr, "decode coordinator /v1/repair/status")
+			}
+			return printRepairStatus(stdout, g, status)
 		}
-		return printRepairStatus(stdout, g, status)
+		// 204/empty: treat like "not implemented" and derive from topology.
 	} else if !isNotFound(gerr) {
 		return gerr
 	}

@@ -205,7 +205,7 @@ fass health                       # coordinator (and gateway, if --endpoint conf
 fass cluster status               # agents by state, per-nexus matrix, rings, RCs, ratio
 fass node ls                      # nodes with agent counts
 fass rc ls                        # RC parameters and storage overhead
-fass repair status                # risk summary derived from topology
+fass repair status                # repair queue from /v1/repair/status (topology fallback)
 fass gc status                    # deletion-GC counters from /metrics
 ```
 
@@ -227,7 +227,7 @@ What each reads:
 | `cluster status` | `GET /v1/topology`, `GET /healthz` |
 | `node ls` | `GET /v1/topology` |
 | `rc ls` | `GET /v1/redundancy-classes` |
-| `repair status` | `GET /v1/repair/status` if a future coordinator provides it, else derived from `/v1/topology` |
+| `repair status` | `GET /v1/repair/status` (`pending`, `running`, `failed`, `oldest_pending_age`, `bytes_repaired_last_24h`, `throttled`); falls back to a `/v1/topology`-derived risk summary on `404` or an empty response |
 | `gc status` | `GET /metrics` (lines prefixed `fass_coordinator_gc_`) |
 
 ### 3.5 Output and exit codes
@@ -390,17 +390,20 @@ These are deliberate for the MVP; each is a candidate follow-up task.
 
 **CLI**
 
-* Listings use one S3 page (1,000 keys) because `pkg/sdk` does not yet expose
-  continuation tokens; `ls`, recursive `cp` and `rm -r` warn on stderr when the
-  page is truncated. Narrow the prefix or use `aws s3`/`rclone` for bulk work.
-* Uploads are single PUTs with the payload buffered for signing (fine for the
-  20 MiB acceptance case; the documented single-PUT limit is 5 GiB, but memory
-  use grows with object size). Multipart upload from the CLI is not implemented.
+* Uploads are single PUTs. The payload is buffered to compute the SigV4
+  payload hash, so peak memory is roughly the file size: comfortable for tens of
+  MiB (the acceptance run used 20 MiB), but use `aws-cli`/`rclone` for
+  multi-gigabyte objects — the documented single-PUT limit is 5 GiB and there is
+  no CLI multipart upload yet.
+* `ls`, recursive `cp` and `rm -r` page through **all** listings (S3 caps a page
+  at 1,000 keys; the CLI follows continuation tokens to completion). A recursive
+  copy or delete never stops at a page boundary.
 * S3→S3 copies stream through the CLI (GET+PUT); the gateway's `CopyObject` is
   not exposed by the SDK yet.
-* `repair status` has no repair-queue endpoint to read: it derives risk from
-  topology (offline/suspect agents, write-degraded nexuses, rings ≥ 80% full)
-  and says so in its output. `gc status` reports only counters exported on
+* `repair status` consumes `GET /v1/repair/status` when the coordinator
+  provides it; against an older coordinator it falls back to a topology-derived
+  risk summary (offline/suspect agents, write-degraded nexuses, rings ≥ 80%
+  full) and labels the source. `gc status` reports only counters exported on
   `/metrics`.
 
 ---
@@ -417,7 +420,7 @@ These are deliberate for the MVP; each is a candidate follow-up task.
 | Console POST returns `403 CSRF check failed` | stale page or lost cookie | reload and retry; cookies must be enabled |
 | Console POST returns `403 Read-only mode` | started with the default `--read-only` | restart with `--read-only=false` |
 | Agent stuck `pending`, activate fails `409 AgentNotAnnounced` | agent never announced with its one-time secret | check the agent log; re-mint a secret via dev bootstrap only for non-ACTIVE agents |
-| `fass cp` warns about truncation | more than 1,000 keys under the prefix | narrow the prefix (see limitations) |
+| `fass ls`/`fass cp -r` is slow on huge prefixes | sequential listing is bounded by round trips | narrow the prefix or use `aws s3`/`rclone` for bulk migrations |
 
 Logs: coordinator/agents/gateway/console log to stderr (`--log-format=json`
 for structured output); the dev smoke script keeps them under `.dev/smoke-*`

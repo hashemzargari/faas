@@ -270,6 +270,34 @@ func TestRepairStatusFromCoordinator(t *testing.T) {
 	}
 }
 
+func TestRepairStatusEmptyResponseFallsBack(t *testing.T) {
+	snap := devTopology()
+	coord := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/topology":
+			writeJSONForTest(w, snap)
+		case "/v1/repair/status":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer coord.Close()
+	adminEnv(t, coord.URL)
+
+	out, stderr, code := runCLI(t, "repair", "status", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	var got repairRiskJSON
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("expected the derived fallback, got %q: %v", out, err)
+	}
+	if got.Source != "derived from /v1/topology" || got.AgentsTotal != 12 {
+		t.Fatalf("fallback = %+v", got)
+	}
+}
+
 func TestRepairStatusDerived(t *testing.T) {
 	snap := devTopology()
 	snap.Agents[0].State = "offline"
