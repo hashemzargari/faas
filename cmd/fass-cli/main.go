@@ -243,6 +243,8 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			return nil
 		}
 		return runPKI(cmdArgs, stdout)
+	case "bridge":
+		return runBridge(ctx, g, cmdArgs, stdout)
 	default:
 		return usagef("unknown command %q (try `fass help`)", cmd)
 	}
@@ -456,6 +458,12 @@ Coordinator admin commands (HTTP+JSON):
   repair status                        repair/risk summary (derived from topology)
   gc status                            deletion-GC counters from /metrics
 
+S3→FASS migration (DS3 Bridge control API):
+  bridge create                        create destination buckets + bridge (no copy yet)
+  bridge start <id>                    begin/resume migration (idempotent)
+  bridge status <id>                   per-bucket progress
+  bridge rm <id>                       stop tracking (never deletes data)
+
 Certificates (offline; neutral CLI):
   pki init                            create the cluster CA (keep ca.key offline)
   pki issue-server                    issue a listener certificate (repeatable --dns/--ip)
@@ -505,6 +513,8 @@ func printCommandUsage(w io.Writer, cmd string) {
 		fmt.Fprintln(w, "usage: fass gc status [--json]")
 	case "pki":
 		printPKIUsage(w)
+	case "bridge":
+		printBridgeUsage(w)
 	default:
 		fmt.Fprintf(w, "usage: fass %s ...\n", cmd)
 	}

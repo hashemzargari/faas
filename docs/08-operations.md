@@ -879,3 +879,62 @@ data hop: it is plaintext by design so probes need no certificate. Bind it to
 loopback or front it with TLS; the S3 edge (`:8080`) is the client-facing TLS
 hop. Everything carrying object data or control metadata — shard transport,
 repair fetches, coordinator API, S3 edge — is TLS and reports it above.
+
+---
+
+## 5. DS3 Bridge: migrate an S3 bucket into FASS
+
+`fass-bridge` copies objects from an existing S3 endpoint into a FASS gateway,
+verifies each copy by read-back, and only then deletes the source copy. It is a
+**write-through migrator**, not an S3 proxy: point applications at the target
+gateway; writes after the bridge starts always land on the target and a stale
+source copy never overwrites them.
+
+```console
+# 1. Start the control plane (JSON, not S3; bind it privately — create carries
+#    source/target credentials).
+fass-bridge --listen 127.0.0.1:8082 --data-dir /var/lib/fass/bridge \
+  --concurrency 4 --max-bytes-per-second 0 --max-requests-per-second 0
+
+# 2. Create the bridge (creates destination buckets; no copy yet).
+fass bridge create --bridge http://127.0.0.1:8082 \
+  --source-endpoint https://s3.customer.example --source-region us-east-1 \
+  --source-access-key AKIA... --source-secret-key ... \
+  --target-endpoint https://s3.fass.internal --target-region eu-west-1 \
+  --target-access-key ... --target-secret-key ... \
+  --bucket customer-data
+# -> created bridge br-… (status ready)
+
+# 3. Start and monitor (start is idempotent and resumes after a restart).
+fass bridge start br-…
+fass bridge status br-…      # TOTAL MIGRATED FAILED SKIPPED BYTES COMPLETED per bucket
+
+# 4. Verify before cutting over:
+aws --endpoint-url https://s3.customer.example s3api list-objects-v2 --bucket customer-data
+#    (empty: every verified copy was deleted from the source)
+aws --endpoint-url https://s3.fass.internal s3 ls s3://customer-data/ --recursive | wc -l
+```
+
+Behaviour and limits:
+
+* **Delete after verify.** Each copy is re-read from the target and compared by
+  size + SHA-256 before the source DELETE. A mismatch counts the object
+  `failed`, leaves the source intact, and does not retry within the run.
+* **Failures don't block completion.** A bucket reaches `completed` with a
+  non-zero `failed` count; operators re-run after fixing the cause (`start` is
+  idempotent; already-classified objects are skipped).
+* **Concurrent-write safety.** If the target already has a version at least as
+  new as the source (by `Last-Modified`), the object is `skipped` and the source
+  copy is left in place rather than deleted.
+* **Resumability.** Progress (per-object outcomes + listing continuation token)
+  is journaled under `--data-dir` (mode 0700, one JSON file per bridge, contains
+  credentials). A restart leaves the bridge `ready`; `start` resumes without
+  re-copying or re-listing already-processed pages.
+* **Preconditions.** Source buckets with Object Lock enabled are refused (the
+  verified-delete contract cannot be honoured under retention); STS/session
+  credentials are rejected — the bridge needs permanent credentials.
+* **Bounded load.** `--concurrency` caps simultaneous transfers;
+  `--max-bytes-per-second` and `--max-requests-per-second` throttle the source.
+  `--multipart-threshold`/`--part-size` control multipart uploads.
+* `DELETE /v1/bridges/{id}` stops tracking and removes the journal; it never
+  deletes data on either side.

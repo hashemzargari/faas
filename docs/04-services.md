@@ -363,6 +363,8 @@ DELETE /v1/bridges/{id}            → 204           (stops tracking; no data ac
 ```
 Semantics: reads proxy to the source until an object is copied; writes always go to FASS; each object is deleted from the source only after a verified copy; failures do not auto-retry and are counted in `failed`; buckets end `completed` even with failures. Preconditions: no Object Lock on source; permanent credentials (no STS).
 
+**Status: implemented** in `cmd/fass-bridge` + `internal/bridge` (control API as above; the service is a write-through migrator and does not itself serve S3 reads — clients point at the target gateway, and target writes always win over stale source copies). Migration is resumable via a per-bridge JSON journal, bounded by `--concurrency` and optional byte/request rate limits, and verification is size + SHA-256 read-back before the source copy is deleted. See docs/08 §5 for the operator flow.
+
 ---
 
 ## 11. Operator (`fass-operator`) & Installer
