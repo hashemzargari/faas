@@ -524,6 +524,9 @@ func baseEnv(t *testing.T, coordURL string) map[string]string {
 		"FASS_AGENT_SCRUB":              "false",
 		"FASS_AGENT_REPAIR":             "false",
 		"FASS_AGENT_LOG_LEVEL":          "debug",
+		// Transport TLS is required by default since task-16; these dev tests
+		// exercise the rest of the wiring, so opt into plaintext explicitly.
+		"FASS_AGENT_INSECURE": "true",
 	}
 }
 
@@ -634,7 +637,7 @@ func TestBuildHeartbeatReportsBoundDiskID(t *testing.T) {
 	stats := store.Stats{FreeBytes: 100, UsedBytes: 200, ShardCount: 3, SetCount: 1}
 	now := time.Unix(1_726_000_000, 0).UTC()
 
-	hb, err := buildHeartbeat("agent-1", "disk-bound", "", stats, 0.25, "cursor-1", now)
+	hb, err := buildHeartbeat("agent-1", "disk-bound", "", stats, 0.25, "cursor-1", heartbeatSecurity{}, now)
 	if err != nil {
 		t.Fatalf("buildHeartbeat: %v", err)
 	}
@@ -650,7 +653,7 @@ func TestBuildHeartbeatReportsBoundDiskID(t *testing.T) {
 		t.Fatal("empty inventory digest")
 	}
 
-	hb, err = buildHeartbeat("agent-1", "disk-bound", "disk-bound", stats, 0, "", now)
+	hb, err = buildHeartbeat("agent-1", "disk-bound", "disk-bound", stats, 0, "", heartbeatSecurity{}, now)
 	if err != nil {
 		t.Fatalf("matching flag: %v", err)
 	}
@@ -663,7 +666,7 @@ func TestBuildHeartbeatFailsLoudlyOnDivergence(t *testing.T) {
 	stats := store.Stats{}
 	now := time.Now().UTC()
 
-	_, err := buildHeartbeat(contract.AgentID("agent-1"), "disk-bound", "disk-flag", stats, 0, "", now)
+	_, err := buildHeartbeat(contract.AgentID("agent-1"), "disk-bound", "disk-flag", stats, 0, "", heartbeatSecurity{}, now)
 	if err == nil {
 		t.Fatal("divergent disk identity did not fail")
 	}
@@ -671,7 +674,7 @@ func TestBuildHeartbeatFailsLoudlyOnDivergence(t *testing.T) {
 		t.Fatalf("error does not name both identities: %v", err)
 	}
 
-	if _, err := buildHeartbeat("agent-1", "", "", stats, 0, "", now); err == nil {
+	if _, err := buildHeartbeat("agent-1", "", "", stats, 0, "", heartbeatSecurity{}, now); err == nil {
 		t.Fatal("heartbeat with empty bound disk id succeeded")
 	}
 }

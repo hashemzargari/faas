@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -64,13 +65,13 @@ func (k *KV) View(ctx context.Context, fn func(storage.Reader) error) error {
 	}
 	tx, err := k.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
-		return fmt.Errorf("postgres: begin read tx: %w", err)
+		return unavailable("begin read tx", err)
 	}
 	defer tx.Rollback()
 	if err := fn(&txRead{ctx: ctx, tx: tx}); err != nil {
-		return err
+		return unavailable("read", err)
 	}
-	return tx.Rollback()
+	return unavailable("end read tx", tx.Rollback())
 }
 
 // Update runs fn in one transaction and commits it atomically. Serialization
@@ -96,7 +97,7 @@ func (k *KV) Update(ctx context.Context, fn func(storage.Writer) error) error {
 		}
 		lastErr = err
 		if !retryable(err) {
-			return err
+			return unavailable("update", err)
 		}
 		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 	}
@@ -519,4 +520,39 @@ func scanBlobs(ctx context.Context, tx *sql.Tx, prefix []byte, overlay map[strin
 		}
 	}
 	return nil
+}
+
+// unavailable classifies backend-connectivity failures as storage.ErrUnavailable
+// so the control plane can answer 503 (retryable) instead of a permanent-looking
+// 500 during a failover or pool exhaustion. nil passes through.
+func unavailable(op string, err error) error {
+	if err == nil || errors.Is(err, storage.ErrUnavailable) {
+		return err
+	}
+	if isUnavailable(err) {
+		return fmt.Errorf("%w: postgres %s: %v", storage.ErrUnavailable, op, err)
+	}
+	return err
+}
+
+func isUnavailable(err error) bool {
+	var pg *pgconn.PgError
+	if errors.As(err, &pg) {
+		// Class 08: connection exception; 57P01-57P03: server shutdown/recovery.
+		if strings.HasPrefix(pg.Code, "08") || pg.Code == "57P01" || pg.Code == "57P02" || pg.Code == "57P03" {
+			return true
+		}
+	}
+	var conn *pgconn.ConnectError
+	if errors.As(err, &conn) {
+		return true
+	}
+	if errors.Is(err, sql.ErrConnDone) || errors.Is(err, driver.ErrBadConn) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// The stdlib returns plain errors for some connection teardown paths.
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "failed to connect") || strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "conn closed") || strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "no connection to the server")
 }

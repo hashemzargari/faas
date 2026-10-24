@@ -9,11 +9,13 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -26,6 +28,7 @@ import (
 	"github.com/fass-storage/fass/internal/agent/client"
 	"github.com/fass-storage/fass/internal/contract"
 	"github.com/fass-storage/fass/internal/ec"
+	"github.com/fass-storage/fass/internal/gateway/agenttls"
 	"github.com/fass-storage/fass/internal/gateway/authz"
 	"github.com/fass-storage/fass/internal/gateway/coordclient"
 	"github.com/fass-storage/fass/internal/gateway/metrics"
@@ -38,6 +41,17 @@ import (
 var version = "dev"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "pki" {
+		if err := runPKI(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "fass-gateway pki: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		fmt.Println(version)
+		return
+	}
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "fass-gateway: %v\n", err)
 		os.Exit(1)
@@ -50,6 +64,20 @@ type config struct {
 	coordinator string
 	tlsCert     string
 	tlsKey      string
+
+	// Data/control plane security. insecure is the explicit, loud plaintext
+	// escape hatch; agentTLS is off|auto|require; requireMTLS rejects plaintext
+	// peers. Non-dev without TLS material refuses to start.
+	insecure      bool
+	agentTLS      string
+	requireMTLS   bool
+	caCert        string
+	clientCert    string
+	clientKey     string
+	coordinatorCA string
+	// coordinatorInsecure explicitly allows plaintext control-plane traffic
+	// (dev/transitional), independent of data-plane TLS.
+	coordinatorInsecure bool
 
 	region            string
 	virtualHostDomain string
@@ -105,17 +133,71 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Security posture: fail closed, never silently downgrade.
+	agentMode, err := agenttls.ParseMode(cfg.agentTLS)
+	if err != nil {
+		return err
+	}
+	insecure := cfg.insecure
+	if cfg.dev && cfg.caCert == "" && !cfg.insecure {
+		// Dev default may stay plaintext, but it is loud and visible.
+		insecure = true
+		agentMode = agenttls.ModeOff
+		logger.Warn("DEV MODE: data/control planes are PLAINTEXT. Configure --ca-cert/--tls-cert/--tls-key for TLS; /healthz reports security.insecure=true.")
+	}
+	if insecure {
+		agentMode = agenttls.ModeOff
+		logger.Warn("INSECURE MODE (enabled by --insecure or --dev): shard and coordinator traffic is plaintext; /healthz reports security.insecure=true. Never use in production.")
+	}
+	if err := validateSecurityConfig(cfg, insecure, agentMode); err != nil {
+		return err
+	}
+	agentHTTP, agentSecurity, err := agenttls.NewClient(agenttls.Options{
+		Mode:        agentMode,
+		CAFile:      cfg.caCert,
+		CertFile:    cfg.clientCert,
+		KeyFile:     cfg.clientKey,
+		RequireMTLS: cfg.requireMTLS,
+		Logger:      logger,
+	})
+	if err != nil {
+		return fmt.Errorf("data-plane TLS: %w", err)
+	}
+
 	// Data plane.
 	keyrings, err := buildKeyrings(cfg, logger)
 	if err != nil {
 		return err
 	}
-	shardClient := client.New(client.Options{UserAgent: "fass-gateway/" + version})
+	shardClient := client.New(client.Options{UserAgent: "fass-gateway/" + version, HTTPClient: agentHTTP, Scheme: agentSecurity.Scheme()})
 
-	// Coordination.
+	// Coordination. The control-plane TLS client uses the same CA and identity;
+	// its ServerName is the coordinator's URL host.
+	coordHTTP := &http.Client{Timeout: 10 * time.Second}
+	coordinatorTLS := !insecure && !cfg.coordinatorInsecure
+	if coordinatorTLS {
+		caFile := cfg.coordinatorCA
+		if caFile == "" {
+			caFile = cfg.caCert
+		}
+		coordHTTP, _, err = agenttls.NewClient(agenttls.Options{
+			Mode:        agenttls.ModeRequire,
+			CAFile:      caFile,
+			CertFile:    cfg.clientCert,
+			KeyFile:     cfg.clientKey,
+			RequireMTLS: cfg.requireMTLS,
+			Logger:      logger,
+		})
+		if err != nil {
+			return fmt.Errorf("coordinator TLS: %w", err)
+		}
+	} else if cfg.coordinatorInsecure && !insecure {
+		logger.Warn("CONTROL PLANE IS PLAINTEXT (--coordinator-insecure) while the data plane uses TLS; /healthz reports security.coordinator_insecure=true")
+	}
 	coord, err := coordclient.New(coordclient.Options{
-		BaseURL:   cfg.coordinator,
-		UserAgent: "fass-gateway/" + version,
+		BaseURL:    cfg.coordinator,
+		UserAgent:  "fass-gateway/" + version,
+		HTTPClient: coordHTTP,
 	})
 	if err != nil {
 		return err
@@ -185,11 +267,20 @@ func run(args []string) error {
 		Config:  s3cfg,
 	})
 
-	readiness := &readinessChecker{url: strings.TrimRight(cfg.coordinator, "/") + "/v1/healthz", client: &http.Client{Timeout: 3 * time.Second}}
+	readiness := &readinessChecker{url: strings.TrimRight(cfg.coordinator, "/") + "/v1/healthz", client: coordHTTP}
 	readiness.start(ctx, logger)
 
+	secStatus := securityStatus{
+		Insecure:        insecure,
+		AgentMode:       string(agentMode),
+		RequireMTLS:     cfg.requireMTLS,
+		S3TLS:           cfg.tlsCert != "" && cfg.tlsKey != "",
+		CoordinatorTLS:  coordinatorTLS,
+		CertNotAfter:    formatNotAfter(agentSecurity.NotAfter),
+		CertFingerprint: agentSecurity.Fingerprint,
+	}
 	adminMux := http.NewServeMux()
-	adminMux.HandleFunc("GET /healthz", healthHandler("ok"))
+	adminMux.HandleFunc("GET /healthz", healthHandler("ok", secStatus))
 	adminMux.HandleFunc("GET /readyz", readiness.handler)
 	adminMux.Handle("GET /metrics", registry.Handler())
 
@@ -198,7 +289,7 @@ func run(args []string) error {
 	mainHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/healthz":
-			healthHandler("ok")(w, r)
+			healthHandler("ok", secStatus)(w, r)
 		case "/readyz":
 			readiness.handler(w, r)
 		case "/metrics":
@@ -368,11 +459,69 @@ func (r *readinessChecker) handler(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ready"}`))
 }
 
-func healthHandler(status string) http.HandlerFunc {
+// securityStatus is the machine-readable security posture served by /healthz.
+// It is intentionally impossible to hide plaintext: insecure=true and
+// agent_mode="off" are always present.
+type securityStatus struct {
+	Insecure        bool   `json:"insecure"`
+	AgentMode       string `json:"agent_mode"`
+	RequireMTLS     bool   `json:"require_mtls"`
+	S3TLS           bool   `json:"s3_tls"`
+	CoordinatorTLS  bool   `json:"coordinator_tls"`
+	CertNotAfter    string `json:"cert_not_after,omitempty"`
+	CertFingerprint string `json:"cert_fingerprint,omitempty"`
+}
+
+func healthHandler(status string, sec securityStatus) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"` + status + `"}`))
+		body, err := json.Marshal(struct {
+			Status   string         `json:"status"`
+			Security securityStatus `json:"security"`
+		}{Status: status, Security: sec})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write(body)
 	}
+}
+
+// formatNotAfter renders a certificate expiry for /healthz, empty when absent so
+// the field is omitted rather than showing Go's zero time.
+func formatNotAfter(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// validateSecurityConfig enforces fail-closed defaults: outside dev/--insecure
+// the data plane must have TLS material and the coordinator must be https.
+func validateSecurityConfig(cfg config, insecure bool, agentMode agenttls.Mode) error {
+	if insecure {
+		return nil
+	}
+	if cfg.caCert == "" {
+		return fmt.Errorf("refusing to start: data-plane TLS requires --ca-cert (or run --insecure/--dev for plaintext)")
+	}
+	if agentMode == agenttls.ModeOff {
+		return fmt.Errorf("refusing to start: --agent-tls=off requires --insecure in a non-dev deployment")
+	}
+	if cfg.requireMTLS && (cfg.clientCert == "" || cfg.clientKey == "") {
+		return fmt.Errorf("refusing to start: --require-mtls needs --tls-cert and --tls-key")
+	}
+	u, err := url.Parse(cfg.coordinator)
+	if err != nil {
+		return fmt.Errorf("invalid --coordinator URL: %w", err)
+	}
+	if u.Scheme != "https" && !cfg.coordinatorInsecure {
+		return fmt.Errorf("refusing to start: coordinator control plane must use https when TLS is enforced (got %q); pass --coordinator-insecure only for explicit dev/transitional mode", cfg.coordinator)
+	}
+	if u.Scheme == "https" && cfg.coordinatorInsecure {
+		return fmt.Errorf("--coordinator-insecure conflicts with an https --coordinator URL")
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +543,8 @@ func parseConfig(args []string) (config, error) {
 		logLevel:          envOr("FASS_LOG_LEVEL", "info"),
 		logFormat:         envOr("FASS_LOG_FORMAT", "text"),
 	}
+	cfg.clientCert = envOr("FASS_GATEWAY_CLIENT_CERT", "")
+	cfg.clientKey = envOr("FASS_GATEWAY_CLIENT_KEY", "")
 	allowAnon, _ := strconv.ParseBool(envOr("FASS_GATEWAY_ALLOW_ANONYMOUS", "true"))
 	cfg.allowAnonymous = allowAnon
 	cfg.chunkSize = envInt("FASS_GATEWAY_CHUNK_SIZE", 16<<20)
@@ -434,8 +585,16 @@ func parseConfig(args []string) (config, error) {
 	fs.Var(&cfg.tenantSeeds, "tenant-key", "per-tenant key seed as tenant=hexseed (repeatable)")
 	fs.StringVar(&cfg.sdpPolicy, "sdp-policy", cfg.sdpPolicy, "path to a Smart Data Placement policy JSON file")
 	fs.StringVar(&cfg.tlsCert, "tls-cert", envOr("FASS_GATEWAY_TLS_CERT", ""), "TLS certificate file")
-	fs.StringVar(&cfg.tlsKey, "tls-key", envOr("FASS_GATEWAY_TLS_KEY", ""), "TLS key file")
+	fs.StringVar(&cfg.tlsKey, "tls-key", envOr("FASS_GATEWAY_TLS_KEY", ""), "TLS key file for the S3 listener")
+	fs.StringVar(&cfg.clientKey, "client-key", envOr("FASS_GATEWAY_CLIENT_KEY", ""), "gateway client key for mTLS")
+	fs.StringVar(&cfg.coordinatorCA, "coordinator-ca", envOr("FASS_GATEWAY_COORDINATOR_CA", ""), "CA bundle for the coordinator (defaults to --ca-cert)")
+	fs.BoolVar(&cfg.coordinatorInsecure, "coordinator-insecure", envBool("FASS_GATEWAY_COORDINATOR_INSECURE", false), "explicitly allow plaintext control-plane traffic (dev/transitional; logged and visible in /healthz)")
 	fs.BoolVar(&cfg.dev, "dev", envBool("FASS_GATEWAY_DEV", false), "dev mode: allow an ephemeral key seed when none is configured")
+	fs.StringVar(&cfg.agentTLS, "agent-tls", envOr("FASS_GATEWAY_AGENT_TLS", "require"), "data-plane TLS mode: off|auto|require (auto = mixed-mode rollout)")
+	fs.BoolVar(&cfg.requireMTLS, "require-mtls", envBool("FASS_GATEWAY_REQUIRE_MTLS", false), "reject plaintext peers and require client certificates (strict mode)")
+	fs.BoolVar(&cfg.insecure, "insecure", envBool("FASS_GATEWAY_INSECURE", false), "explicitly allow plaintext data/control traffic (logged on every start, visible in /healthz)")
+	fs.StringVar(&cfg.caCert, "ca-cert", envOr("FASS_GATEWAY_CA_CERT", ""), "cluster CA certificate used to verify agents and the coordinator")
+	fs.StringVar(&cfg.clientCert, "client-cert", envOr("FASS_GATEWAY_CLIENT_CERT", ""), "gateway client certificate for mTLS (agent and coordinator)")
 	fs.StringVar(&cfg.logLevel, "log-level", cfg.logLevel, "log level: debug|info|warn|error")
 	fs.StringVar(&cfg.logFormat, "log-format", cfg.logFormat, "log format: text|json")
 	fs.StringVar(&cfg.coordinator, "coord", cfg.coordinator, "alias for --coordinator")

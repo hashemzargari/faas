@@ -112,6 +112,10 @@ services:
     environment:
       FASS_COORDINATOR_LISTEN: ":7000"
       FASS_COORDINATOR_DATA_DIR: /var/lib/fass
+      # Dev-only plaintext listener. --dev-bootstrap implies dev, but setting
+      # both makes the intent explicit: outside dev the coordinator is
+      # fail-closed without TLS material.
+      FASS_COORDINATOR_DEV: "true"
       FASS_COORDINATOR_DEV_BOOTSTRAP: "true"
       FASS_COORDINATOR_LOG_LEVEL: info
       FASS_COORDINATOR_LOG_FORMAT: text
@@ -165,6 +169,9 @@ services:
       FASS_GATEWAY_OFFLOADER_WORKERS: "4"
       FASS_GATEWAY_SHARD_PARALLEL: "8"
       FASS_GATEWAY_KEY_SEED: "${FASS_DEV_KEY_SEED:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
+      # Dev-only plaintext data/control planes (new gateways fail closed without
+      # TLS material outside --dev). /healthz exposes security.insecure=true.
+      FASS_GATEWAY_DEV: "true"
       FASS_LOG_LEVEL: info
       FASS_LOG_FORMAT: text
     ports:

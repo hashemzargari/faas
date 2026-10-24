@@ -137,6 +137,9 @@ func TestThreeNexusEndToEnd(t *testing.T) {
 			"--coordinator-url", c.coordURL,
 			"--secret", slot.Secret,
 			"--hostname", "127.0.0.1",
+			// Data-plane TLS is fail-closed outside an explicit opt-out; this
+			// harness runs a plaintext loopback cluster, so it must say so.
+			"--insecure",
 			"--heartbeat-interval", "1s",
 			"--repair=false",
 			"--scrub=false",
@@ -191,6 +194,10 @@ func TestThreeNexusEndToEnd(t *testing.T) {
 		// Deterministic dev-only tenant key seed: the gateway requires one outside
 		// its own --dev mode, and a fixed seed keeps reads reproducible.
 		"--key-seed", devKeySeed,
+		// Data-plane TLS is fail-closed outside --dev, so an e2e cluster running
+		// plaintext on loopback must say so explicitly. --insecure (rather than
+		// --dev) keeps the gateway's other production-shaped checks enabled.
+		"--insecure",
 		"--log-level", "info",
 		"--log-format", "text",
 	)

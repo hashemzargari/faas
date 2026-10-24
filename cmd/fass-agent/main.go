@@ -38,28 +38,35 @@ import (
 const version = "0.1.0-dev"
 
 type config struct {
-	disk         string
-	diskID       string
-	port         int
-	nexusID      string
-	nodeID       string
-	coordURL     string
-	secret       string
-	secretFile   string
-	secretSource string // "flag" | "env" | "file" | "" (dev mode)
-	hostname     string
-	reservePct   float64
-	maxShard     int64
-	scrub        bool
-	scrubPeriod  time.Duration
-	scrubRate    int64
-	repair       bool
-	repairWork   int
-	repairFetch  int
-	heartbeat    time.Duration
-	shutdown     time.Duration
-	logLevel     string
-	showVersion  bool
+	disk          string
+	diskID        string
+	port          int
+	nexusID       string
+	nodeID        string
+	coordURL      string
+	secret        string
+	secretFile    string
+	secretSource  string // "flag" | "env" | "file" | "" (dev mode)
+	tlsCert       string
+	tlsKey        string
+	tlsCA         string
+	tlsClientCert string
+	tlsClientKey  string
+	requireMTLS   bool
+	insecure      bool
+	hostname      string
+	reservePct    float64
+	maxShard      int64
+	scrub         bool
+	scrubPeriod   time.Duration
+	scrubRate     int64
+	repair        bool
+	repairWork    int
+	repairFetch   int
+	heartbeat     time.Duration
+	shutdown      time.Duration
+	logLevel      string
+	showVersion   bool
 }
 
 func main() {
@@ -178,6 +185,13 @@ func registerFlags(fs *flag.FlagSet, cfg *config) {
 	fs.StringVar(&cfg.coordURL, "coordinator-url", "http://127.0.0.1:7000", "coordinator control-plane URL")
 	fs.StringVar(&cfg.secret, "secret", "", "one-time announce secret issued by the coordinator (visible in the process list; prefer --secret-file or FASS_AGENT_SECRET)")
 	fs.StringVar(&cfg.secretFile, "secret-file", "", "file holding the one-time announce secret (one trailing newline is trimmed; mutually exclusive with --secret)")
+	fs.StringVar(&cfg.tlsCert, "tls-cert", "", "PEM certificate for the shard TLS listener (required unless --insecure)")
+	fs.StringVar(&cfg.tlsKey, "tls-key", "", "PEM private key for the shard TLS listener (required unless --insecure)")
+	fs.StringVar(&cfg.tlsCA, "tls-ca", "", "PEM CA bundle used to verify peer certificates (required with --require-mtls and for agent-to-agent repair)")
+	fs.StringVar(&cfg.tlsClientCert, "tls-client-cert", "", "optional client-auth certificate for agent-to-agent repair (defaults to --tls-cert; must carry the client-auth EKU)")
+	fs.StringVar(&cfg.tlsClientKey, "tls-client-key", "", "optional client-auth key for agent-to-agent repair (defaults to --tls-key)")
+	fs.BoolVar(&cfg.requireMTLS, "require-mtls", false, "require and verify client certificates on the shard listener")
+	fs.BoolVar(&cfg.insecure, "insecure", false, "serve plaintext and skip TLS entirely (dev only; warns every start and is visible in /v1/healthz)")
 	fs.StringVar(&cfg.hostname, "hostname", hostname(), "hostname reported in the announce request")
 	fs.Float64Var(&cfg.reservePct, "reserve-pct", 5, "percentage of the filesystem kept free (never filled)")
 	fs.Int64Var(&cfg.maxShard, "max-shard-bytes", 32<<20, "maximum single shard payload size")
@@ -207,6 +221,11 @@ func usageFunc(fs *flag.FlagSet) func() {
 		fmt.Fprintln(out, "Secrets: prefer --secret-file/FASS_AGENT_SECRET_FILE or FASS_AGENT_SECRET over --secret,")
 		fmt.Fprintln(out, "because command-line arguments are visible to local users via ps. Setting both")
 		fmt.Fprintln(out, "--secret and --secret-file is rejected. An empty secret file is an error.")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "TLS: the shard listener and repair traffic are encrypted by default. Provide")
+		fmt.Fprintln(out, "--tls-cert/--tls-key (and --tls-ca for mTLS or repair); missing material is fatal.")
+		fmt.Fprintln(out, "--insecure is the only way to serve plaintext: it warns on every start and")
+		fmt.Fprintln(out, "/v1/healthz reports {\"tls\":false,\"insecure\":true}.")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "Flags:")
 		fs.PrintDefaults()
@@ -292,6 +311,11 @@ func run(parent context.Context, cfg config, logger *slog.Logger) error {
 			"prefer --secret-file or FASS_AGENT_SECRET")
 	}
 
+	security, err := buildAgentSecurity(cfg, logger)
+	if err != nil {
+		return fmt.Errorf("transport security: %w", err)
+	}
+
 	st, err := store.Open(ctx, store.Options{
 		Root:          cfg.disk,
 		DiskID:        cfg.diskID,
@@ -338,6 +362,7 @@ func run(parent context.Context, cfg config, logger *slog.Logger) error {
 	srv, err := transport.New(transport.Options{
 		Store:           st,
 		Scrubber:        scrubber,
+		TLS:             security.serverTLS,
 		NodeID:          cfg.nodeID,
 		Version:         version,
 		Logger:          logger,
@@ -365,6 +390,9 @@ func run(parent context.Context, cfg config, logger *slog.Logger) error {
 		"public_key", ident.PublicKeyBase64(),
 		"coordinator", cfg.coordURL,
 		"secret_source", cfg.secretSource,
+		"tls_enabled", !security.insecure,
+		"insecure", security.insecure,
+		"require_mtls", cfg.requireMTLS,
 	)
 
 	gctx, gcancel := context.WithCancel(ctx)
@@ -417,7 +445,7 @@ func run(parent context.Context, cfg config, logger *slog.Logger) error {
 				return
 			case agentID := <-agentIDCh:
 				exec, err := repair.New(repair.Options{
-					Client:           client.New(client.Options{}),
+					Client:           client.New(client.Options{Scheme: security.scheme, HTTPClient: security.httpClient}),
 					Coordinator:      coord,
 					Worker:           string(agentID),
 					Workers:          cfg.repairWork,
@@ -535,7 +563,7 @@ func runMembership(
 		case <-ticker.C:
 		}
 		hb, err := buildHeartbeat(res.AgentID, st.DiskID(), cfg.diskID, st.Stats(),
-			srv.LoadEWMA(), cursorFn(), time.Now().UTC())
+			srv.LoadEWMA(), cursorFn(), heartbeatSecurityFrom(srv.Security()), time.Now().UTC())
 		if err != nil {
 			// Identity divergence would make the agent lie about which disk it
 			// serves. Fail the membership loop loudly instead.
@@ -562,6 +590,7 @@ func buildHeartbeat(
 	stats store.Stats,
 	loadEWMA float64,
 	scrubCursor string,
+	security heartbeatSecurity,
 	now time.Time,
 ) (contract.Heartbeat, error) {
 	if boundDiskID == "" {
@@ -582,7 +611,29 @@ func buildHeartbeat(
 		ScrubCursor:     scrubCursor,
 		InventoryDigest: inventoryDigest(stats),
 		Time:            now,
+		TLSEnabled:      security.TLSEnabled,
+		Insecure:        security.Insecure,
+		CertNotAfter:    security.CertNotAfter,
 	}, nil
+}
+
+// heartbeatSecurity is the security posture reported on every heartbeat.
+type heartbeatSecurity struct {
+	TLSEnabled   bool
+	Insecure     bool
+	CertNotAfter *time.Time
+}
+
+// heartbeatSecurityFrom projects the transport's live security info onto the
+// heartbeat fields. CertNotAfter is a pointer so "no TLS" is JSON null rather
+// than the zero time.
+func heartbeatSecurityFrom(info transport.SecurityInfo) heartbeatSecurity {
+	out := heartbeatSecurity{TLSEnabled: info.Enabled, Insecure: info.Insecure}
+	if info.Enabled && !info.NotAfter.IsZero() {
+		notAfter := info.NotAfter.UTC()
+		out.CertNotAfter = &notAfter
+	}
+	return out
 }
 
 // inventoryDigest is a cheap summary the coordinator compares between reports;

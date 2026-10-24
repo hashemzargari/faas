@@ -40,6 +40,11 @@ import (
 var (
 	// ErrNotFound is returned by Get/Scan lookups for a missing key.
 	ErrNotFound = errors.New("storage: key not found")
+	// ErrUnavailable reports that the persistence backend cannot currently be
+	// reached (connection refused, failover in progress, pool closed). It is a
+	// retryable condition: the control plane maps it to 503, never to a 500 that
+	// looks permanent. Backends wrap it into the underlying error.
+	ErrUnavailable = errors.New("storage: backend unavailable")
 	// ErrClosed is returned once Close has been called.
 	ErrClosed = errors.New("storage: closed")
 )

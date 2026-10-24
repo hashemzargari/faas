@@ -56,51 +56,35 @@ func runSmoke(ctx context.Context, coordinator, endpoint, ak, sk, region, bucket
 		return fmt.Errorf("coordinator not healthy: %w", err)
 	}
 
-	// 1. Wait for every agent to announce (state "pending"), then activate.
-	deadline := time.Now().Add(90 * time.Second)
+	// 1. Activate every announced agent. Pending registrations exist in the
+	//    topology before an agent process has announced, and activating one of
+	//    those is a 409 AgentNotAnnounced by design: retry it on the next pass
+	//    instead of failing the smoke check on a startup race.
+	deadline := time.Now().Add(120 * time.Second)
+	active := 0
 	for {
 		agents, err := fetchAgents(ctx, coord)
 		if err != nil {
 			return err
 		}
-		if len(agents) >= wantAgents {
-			break
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("only %d/%d agents announced; is an agent container crashing? check `docker compose logs agent-*`", len(agents), wantAgents)
-		}
-		time.Sleep(time.Second)
-	}
-	agents, err := fetchAgents(ctx, coord)
-	if err != nil {
-		return err
-	}
-	for _, a := range agents {
-		if a.State == "active" {
-			continue
-		}
-		if err := postJSON(ctx, coord+"/v1/agents/"+a.AgentID+"/activate", nil); err != nil {
-			return fmt.Errorf("activate %s: %w", a.AgentID, err)
-		}
-	}
-	// 2. Wait for all agents ACTIVE.
-	for {
-		agents, err = fetchAgents(ctx, coord)
-		if err != nil {
-			return err
-		}
-		active := 0
+		active = 0
 		for _, a := range agents {
 			if a.State == "active" {
 				active++
+				continue
+			}
+			retryable, aerr := activateAgent(ctx, coord, a.AgentID)
+			if aerr != nil && !retryable {
+				return fmt.Errorf("activate %s: %w", a.AgentID, aerr)
 			}
 		}
 		if active >= wantAgents {
 			fmt.Printf("smoke: %d/%d agents ACTIVE\n", active, wantAgents)
 			break
 		}
-		if time.Now().After(deadline.Add(30 * time.Second)) {
-			return fmt.Errorf("%d/%d agents ACTIVE after timeout", active, wantAgents)
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%d/%d agents ACTIVE after timeout (declared=%d); is an agent container crashing? check `docker compose logs agent-*`",
+				active, wantAgents, len(agents))
 		}
 		time.Sleep(time.Second)
 	}
@@ -173,6 +157,29 @@ func fetchAgents(ctx context.Context, coord string) ([]agentInfo, error) {
 		return nil, fmt.Errorf("decode agents: %w", err)
 	}
 	return out.Agents, nil
+}
+
+// activateAgent activates one agent. A 409 AgentNotAnnounced is retryable: the
+// pending registration exists but the agent process has not announced yet.
+func activateAgent(ctx context.Context, coord, id string) (retryable bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, coord+"/v1/agents/"+id+"/activate", nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return false, nil
+	}
+	body := strings.TrimSpace(string(raw))
+	if resp.StatusCode == http.StatusConflict && strings.Contains(body, "AgentNotAnnounced") {
+		return true, nil
+	}
+	return false, fmt.Errorf("%d %s", resp.StatusCode, body)
 }
 
 func postJSON(ctx context.Context, url string, body any) error {

@@ -604,17 +604,30 @@ the entity relations directly, and what that costs.
 | Coordinator on PostgreSQL serving the full S3 surface | `go test -tags=compat ./test/compat/` 21/21 and `scripts/compat.sh` PASS (aws-cli, rclone incl. tree sync, s3cmd) with `FASS_COMPAT_POSTGRES_DSN` set |
 | Lifecycle expiry + object lock on PostgreSQL | included in the compat suite above, including the dev-gated clock restart |
 | Crash-restart of the coordinator | the metadata transaction is the durability boundary; a restart reconnects to PostgreSQL and re-runs no migrations by default |
+| **Ungraceful primary crash + promotion** (`docker kill`, `pg_ctl promote`) | HA drill below: detection 150 ms, RTO 461 ms, RPO 0/20 acknowledged objects, plus the outage behaviour (health 503, retryable writes) |
+| **pg_dump / pg_restore metadata round trip** | HA drill below: restored database served the same 20 objects byte-identically |
 
 ### Not tested (do not assume these work)
 
-* **No PostgreSQL failover was exercised.** No streaming replication, no
-  promotion, no split-brain scenario. Treat any HA story here as a plan, not a
-  verified property.
+The failover/restore drill below closes the previous "no failover, no restore
+drill" gap **for the control-plane metadata path**. It does not close these:
+
 * **No load/latency test of the adapter.** Statement timeouts are set (default
   5 s, `--db-statement-timeout`) and the pool is bounded (defaults 40 open /
   10 idle, `--db-max-open-conns/--db-max-idle-conns`); capacity is not measured.
+* **No gateway-level failover test.** The drill drives the coordinator HTTP API
+  directly (metadata commits/reads); it does not start gateways/agents, so the
+  gateway's retry/error mapping during a database outage is still unverified.
+* **No floating-endpoint (proxy) failover.** The drill restarts the coordinator
+  against the promoted standby; the no-restart VIP/DNS variant is documented but
+  not exercised.
+* **No asynchronous-replication RPO measurement.** RPO 0 was observed with a
+  synchronous standby; an async standby's loss window under the same crash is not
+  measured, and neither is split-brain prevention (that is database topology
+  configuration, out of FASS's control).
 * **No cross-version migration run** (only the initial migration exists).
-* **No backup/PITR restore drill.**
+* **No long-running PITR drill.** The restore drill uses `pg_dump`/`pg_restore`
+  (physical/logical backup round trip), not WAL-archive PITR to a past timestamp.
 
 ### Starting the PostgreSQL-backed coordinator
 
@@ -653,21 +666,70 @@ is on the standby too, at the cost of commit latency. With the default
 lose the last asynchronous standbyship transactions, so use a synchronous standby
 if losing the last commits is unacceptable.
 
-### Failover behaviour (plan, untested)
+### Failover behaviour (observed in the drill)
 
-* **Gateways are stateless.** They reconnect to the configured coordinator
-  endpoint on the next request; in-flight requests fail with 503 and S3 clients
-  retry. Keep a floating endpoint (VIP, DNS name, or a load balancer) in front of
-  the coordinator so the gateway configuration does not change.
-* **Coordinators do not elect a new primary themselves.** They are simple clients
-  of one primary; after a failover, restart/repoint the coordinator(s) at the new
-  primary (or move the floating endpoint). Two coordinators writing to different
-  primaries is a split-brain and must be prevented by the database topology.
+* **The coordinator detects the loss on the next request, not by a background
+  probe.** In the drill, `/healthz` returned `503` with
+  `{"status":"unhealthy","database":"unreachable"}` within **150 ms** of the
+  ungraceful kill (the very first health poll after the crash).
+* **Writes fail fast and are retryable.** A metadata commit while the primary was
+  down returned **503 `ServiceUnavailable` in ~252 µs**, not a 500 and not a
+  hang. The coordinator maps backend connectivity failures ("connection reset",
+  connection-refused, PostgreSQL class 08/57P0x, pool closed) to `storage.ErrUnavailable`
+  → 503, so a client/SDK retry is the correct response. Reads fail the same way.
+* **A coordinator restart is required to follow the promoted primary** (or a
+  floating endpoint). Coordinators do not elect a new primary themselves; they
+  are clients of one primary. Two coordinators writing to different primaries is
+  split-brain and must be prevented by the database topology.
+* **Gateways are stateless** (they hold no database connection; they call the
+  coordinator HTTP API), so a coordinator restart is transparent to their
+  configuration, but the gateway-level retry/error mapping during a DB outage was
+  **not exercised** by this drill — see "Not tested".
+* **Agents** hold no metadata and are unaffected apart from the pause in
+  control-plane responses.
 * **Agents** retry heartbeats and re-announce if needed; they hold no metadata
   and are unaffected by a database failover apart from the pause in control-plane
   responses.
 * **Repair state** (`/v1/repair/status`) is in coordinator memory and resets on
   restart; the queue itself is database-backed once the orchestrator lands.
+
+### Measured failover and restore drill (2026-10-24)
+
+Reference run, reproducible with `go test -tags=ha -count=1 ./test/ha/ -v`
+(docker required; the test skips cleanly when it is unavailable):
+
+* Two `postgres:16` containers on one docker network: primary with
+  `wal_level=replica`, a synchronous streaming standby
+  (`synchronous_commit=on`, `synchronous_standby_names='*'`), and the coordinator
+  (`fass-coordinator --db-driver=postgres`) in front of the primary. The drill
+  drives the coordinator HTTP API directly (20 committed metadata objects + a
+  versioned bucket; no gateways/agents are started).
+* Kill: `docker kill <primary>` — an ungraceful crash, no checkpoints/shutdown.
+* Promotion: `docker exec --user postgres <standby> pg_ctl promote -D /pgdata`,
+  then the coordinator is restarted against the standby DSN (same listen port).
+
+| Measurement | Result |
+|---|---|
+| Health detection (`/healthz` first non-200 after `docker kill`) | **150–170 ms** |
+| Promotion detected (first writable probe on the standby) | **134–155 ms** |
+| Write-unavailability window (last 200 before kill → first 200 after repoint) | **456–482 ms** |
+| RTO (kill → first successful write) | **456–482 ms** |
+| RPO | **0 of 20 acknowledged objects lost**; all byte-identical after promotion |
+| Outage write behaviour | **503 ServiceUnavailable in 252–354 µs** (retryable, bounded) |
+| Object that errored during the outage | cleanly absent (404) after recovery — no partial manifest |
+| Restore drill (`pg_dump -Fc` → `pg_restore` into a fresh DB → coordinator → reads) | dump ~10.5 KB, **416–471 ms** end-to-end; all 20 objects byte-identical |
+
+Ranges are across three consecutive reference runs, not a statistical sample.
+
+These are single-run numbers from a dev-mode coordinator (embedded bootstrap,
+plaintext listener) on one machine, with tiny objects; they measure failover
+*mechanics*, not a production SLO. Reproduce:
+
+```bash
+# Requires docker (starts and cleans up its own containers/network/volume).
+go test -tags=ha -count=1 ./test/ha/ -v
+# look for the MEASURED lines in the output
+```
 
 ### Backups and PITR
 

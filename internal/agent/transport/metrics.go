@@ -45,7 +45,7 @@ func (m *metrics) add(name string, delta int64) { m.ctr(name).Add(delta) }
 
 // render writes the Prometheus text format. It never fails on a request path:
 // metric rendering errors are ignored because the HTTP status is already 200.
-func (m *metrics) render(w io.Writer, st store.Stats, load float64) {
+func (m *metrics) render(w io.Writer, st store.Stats, load float64, sec SecurityInfo) {
 	m.mu.RLock()
 	names := make([]string, 0, len(m.counters))
 	for name := range m.counters {
@@ -63,6 +63,15 @@ func (m *metrics) render(w io.Writer, st store.Stats, load float64) {
 		fmt.Fprintf(w, "fass_agent_%s %d\n", name, values[name])
 	}
 
+	tlsEnabled := 0.0
+	if sec.Enabled {
+		tlsEnabled = 1
+	}
+	insecure := 0.0
+	if sec.Insecure {
+		insecure = 1
+	}
+
 	gauges := []struct {
 		name  string
 		help  string
@@ -77,6 +86,16 @@ func (m *metrics) render(w io.Writer, st store.Stats, load float64) {
 		{"fass_agent_free_bytes", "Free bytes net of the configured reservation", float64(st.FreeBytes)},
 		{"fass_agent_reserved_bytes", "Bytes reserved so the disk cannot fill", float64(st.ReservedBytes)},
 		{"fass_agent_total_bytes", "Filesystem size in bytes", float64(st.TotalBytes)},
+		{"fass_agent_tls_enabled", "1 when the shard listener serves TLS", tlsEnabled},
+		{"fass_agent_tls_insecure", "1 when the shard listener is plaintext (dev-only)", insecure},
+	}
+	if sec.Enabled && !sec.NotAfter.IsZero() {
+		gauges = append(gauges,
+			struct {
+				name  string
+				help  string
+				value float64
+			}{"fass_agent_tls_cert_expiry_timestamp_seconds", "Unix timestamp when the served TLS certificate expires", float64(sec.NotAfter.Unix())})
 	}
 	for _, g := range gauges {
 		fmt.Fprintf(w, "# HELP %s %s\n", g.name, g.help)

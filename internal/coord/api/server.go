@@ -24,6 +24,7 @@ import (
 	"github.com/fass-storage/fass/internal/coord/coerr"
 	"github.com/fass-storage/fass/internal/coord/id"
 	"github.com/fass-storage/fass/internal/coord/recovery"
+	"github.com/fass-storage/fass/internal/storage"
 )
 
 // MaxJSONBody bounds non-streaming control-plane request bodies. A full-object
@@ -216,6 +217,11 @@ func writeJSON(w http.ResponseWriter, r *http.Request, status int, v any) {
 }
 
 func writeError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, storage.ErrUnavailable) {
+		// The metadata backend is unreachable (failover, pool exhausted). This is
+		// retryable: answer 503 ServiceUnavailable, never a permanent-looking 500.
+		err = coerr.E(503, coerr.CodeServiceUnavailable, "The metadata store is temporarily unavailable; retry the request")
+	}
 	e := coerr.From(err)
 	// Log 5xx with the underlying cause; never leak it to the client.
 	if e.Status >= 500 {
@@ -342,7 +348,16 @@ func boolQuery(r *http.Request, name string) bool {
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	body, err := s.svc.Health(r.Context())
 	if err != nil {
-		writeError(w, r, err)
+		// Honesty over optimism: health must never claim ok while the system of
+		// record is unreachable. 503 is what load balancers and operators expect.
+		writeJSON(w, r, http.StatusServiceUnavailable, map[string]any{
+			"status":   "unhealthy",
+			"database": "unreachable",
+			"tls":      s.transport.tls,
+			"mtls":     s.transport.mtls,
+			"insecure": s.transport.insecure,
+			"error":    "metadata store unreachable; see coordinator logs",
+		})
 		return
 	}
 	if body == nil {

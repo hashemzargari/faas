@@ -9,10 +9,12 @@ package transport
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -42,6 +44,11 @@ type Options struct {
 	NodeID   string
 	Version  string
 	Logger   *slog.Logger
+	// TLS enables the shard listener's TLS/mTLS configuration. Nil means the
+	// listener is plaintext, which transport reports honestly as
+	// {"tls":false,"insecure":true} in /v1/healthz. cmd/fass-agent refuses to
+	// run plaintext unless the operator passed --insecure.
+	TLS *ServerTLS
 	// ReadHeaderTimeout defaults to 10s.
 	ReadHeaderTimeout time.Duration
 	// ShutdownTimeout defaults to 15s.
@@ -52,6 +59,7 @@ type Options struct {
 type Server struct {
 	store    *store.Store
 	scrubber Scrubber
+	tls      *ServerTLS
 	nodeID   string
 	version  string
 	log      *slog.Logger
@@ -89,6 +97,7 @@ func New(opts Options) (*Server, error) {
 	s := &Server{
 		store:             opts.Store,
 		scrubber:          opts.Scrubber,
+		tls:               opts.TLS,
 		nodeID:            opts.NodeID,
 		version:           opts.Version,
 		log:               opts.Logger.With("component", "transport"),
@@ -122,6 +131,11 @@ func (s *Server) ServeListener(ctx context.Context, ln net.Listener) error {
 		MaxHeaderBytes:    1 << 20,
 	}
 
+	if s.tls != nil {
+		srv.ErrorLog = log.New(tlsErrorLogWriter{logger: s.log}, "", 0)
+		ln = tls.NewListener(ln, s.tls.Config())
+	}
+
 	errCh := make(chan error, 1)
 	go func() {
 		err := srv.Serve(ln)
@@ -146,8 +160,16 @@ func (s *Server) ServeListener(ctx context.Context, ln net.Listener) error {
 	}
 }
 
-// LocalAddr reports the listener address when ServeListener is in use. It is
-// exposed via the listener for cmd; kept here as documentation of intent.
+// Security reports the listener's security posture. A transport built without
+// TLS is plaintext and reports Insecure=true; cmd/fass-agent prevents that from
+// happening accidentally by refusing to start without --insecure.
+func (s *Server) Security() SecurityInfo {
+	if s.tls == nil {
+		return SecurityInfo{Enabled: false, Insecure: true}
+	}
+	return s.tls.Info()
+}
+
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
@@ -336,7 +358,9 @@ func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	st := s.store.Stats()
+	sec := s.Security()
 	resp := statsResponse{
+		TLS:           tlsStatsFrom(sec),
 		FreeBytes:     st.FreeBytes,
 		UsedBytes:     st.UsedBytes,
 		TotalBytes:    st.TotalBytes,
@@ -353,11 +377,19 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	s.writeJSON(w, r, http.StatusOK, healthResponse{
-		State:  stateReady,
-		DiskID: s.store.DiskID(),
-		NodeID: s.nodeID,
-	})
+	sec := s.Security()
+	resp := healthResponse{
+		State:    stateReady,
+		DiskID:   s.store.DiskID(),
+		NodeID:   s.nodeID,
+		TLS:      sec.Enabled,
+		Insecure: sec.Insecure,
+	}
+	if sec.Enabled && !sec.NotAfter.IsZero() {
+		notAfter := sec.NotAfter.UTC()
+		resp.TLSNotAfter = &notAfter
+	}
+	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
 func (s *Server) handleScrub(w http.ResponseWriter, r *http.Request) {
@@ -372,7 +404,7 @@ func (s *Server) handleScrub(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	s.metrics.render(w, s.store.Stats(), s.load())
+	s.metrics.render(w, s.store.Stats(), s.load(), s.Security())
 }
 
 func (s *Server) handleMethodNotAllowed(w http.ResponseWriter, r *http.Request) {

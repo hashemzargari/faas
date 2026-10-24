@@ -64,7 +64,7 @@ for i, a in enumerate(d["agents"]):
         f'./bin/fass-agent --nexus-id={a["nexus_id"]} --node-id={a["node_id"]} '
         f'--disk={tmp}/disks/a{i} --port={base+i} --coordinator-url=http://127.0.0.1:{coord} '
         f'--secret={a["secret"]} --disk-id={a["disk_id"]} --repair=false --scrub=false '
-        f'--log-level=warn >>{tmp}/agent{i}.log 2>&1 & echo $! >>{tmp}/pids'
+        f'--log-level=warn --insecure >>{tmp}/agent{i}.log 2>&1 & echo $! >>{tmp}/pids'
     )
 print("\n".join(lines))
 PY

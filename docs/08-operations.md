@@ -124,7 +124,10 @@ make build
 # 1. Coordinator with the deterministic dev topology. It prints one line:
 #    FASS_DEV_BOOTSTRAP {"access_key_id":"dev-access-key",...,"agents":[12]...}
 #    and writes the same JSON to <data-dir>/dev-bootstrap.json.
-./bin/fass-coordinator --listen=127.0.0.1:7000 \
+#    --dev is the explicit plaintext switch (`--dev-bootstrap` implies it). A
+#    coordinator outside dev fails closed without --tls-cert/--tls-key, so any
+#    copy of this recipe that drops --dev must also add TLS material.
+./bin/fass-coordinator --listen=127.0.0.1:7000 --dev \
   --data-dir=.dev/coord --dev-bootstrap >.dev/coord.log 2>&1 &
 grep -o 'FASS_DEV_BOOTSTRAP .*' .dev/coord.log | cut -d' ' -f2- >.dev/boot.json
 
@@ -531,7 +534,108 @@ These are deliberate for the MVP; each is a candidate follow-up task.
 | Console POST returns `403 Read-only mode` | started with the default `--read-only` | restart with `--read-only=false` |
 | Agent stuck `pending`, activate fails `409 AgentNotAnnounced` | agent never announced with its one-time secret | check the agent log; re-mint a secret via dev bootstrap only for non-ACTIVE agents |
 | `fass ls`/`fass cp -r` is slow on huge prefixes | sequential listing is bounded by round trips | narrow the prefix or use `aws s3`/`rclone` for bulk migrations |
+| `make dev`: buildx complains it cannot write its state (`read-only file system`, sandboxed/CI HOME) | Docker CLI keeps buildx state under `$HOME/.docker` | point it at a writable dir: `DOCKER_CONFIG=$PWD/.dev/docker-config make dev` |
 
 Logs: coordinator/agents/gateway/console log to stderr (`--log-format=json`
 for structured output); the dev smoke script keeps them under `.dev/smoke-*`
 (or your own redirects).
+
+---
+
+## 4. TLS / mTLS (data plane, control plane, rotation)
+
+Every hop ships with TLS available and **fails closed outside dev**: the gateway and
+agents refuse to start without TLS material unless you pass `--insecure` (or run
+`--dev`). Plaintext is always loud: a warning is printed on **every** start and
+`/healthz` carries a machine-readable `security` block, so a "temporarily
+plaintext" deployment cannot hide.
+
+```console
+$ curl -s localhost:9000/healthz | jq .security
+{
+  "insecure": true,
+  "agent_mode": "off",
+  "require_mtls": false,
+  "s3_tls": false
+}
+```
+
+`agent_mode` is `require` (TLS only), `auto` (TLS with a logged per-endpoint
+plaintext fallback during a mixed-mode rollout) or `off` (plaintext, only with
+`--insecure`/`--dev`).
+
+### 4.1 Three-step runbook: init CA → issue certs → enable strict
+
+TLS 1.3 only (`crypto/tls`, `crypto/x509`; no external dependencies). The CA key
+is written `0600` and is **never required at runtime** by agents or gateways.
+
+```console
+# 1. Create the cluster CA (keep ca.key offline; only ca.crt is distributed).
+fass-gateway pki init --dir /etc/fass/pki/ca --cn fass-cluster-ca
+
+# 2. Issue certificates (one per listener identity; SANs must match how peers dial it).
+#    Gateway S3/control client + agent shard listeners:
+fass-gateway pki issue-server --ca-dir /etc/fass/pki/ca --dir /etc/fass/pki/agent \
+  --dns agent-a1.internal --ip 10.0.0.11 --ttl 2160h
+fass-gateway pki issue-client --ca-dir /etc/fass/pki/ca --dir /etc/fass/pki/gateway \
+  --identity gateway-1 --ttl 2160h
+#    Inspect any certificate (expiry, SANs, fingerprint):
+fass-gateway pki inspect --cert /etc/fass/pki/agent/tls.crt
+
+# 3. Enable TLS, then strict mTLS once every peer presents a certificate.
+#    The coordinator is fail-closed outside --dev: it needs its own certificate.
+#    --require-mtls additionally verifies client certificates against --tls-client-ca.
+fass-coordinator --tls-cert /etc/fass/pki/coordinator/tls.crt \
+                 --tls-key /etc/fass/pki/coordinator/tls.key \
+                 --tls-client-ca /etc/fass/pki/ca/ca.crt --require-mtls
+fass-agent --tls-cert /etc/fass/pki/agent/tls.crt --tls-key /etc/fass/pki/agent/tls.key \
+           --tls-ca /etc/fass/pki/ca/ca.crt --require-mtls
+fass-gateway --ca-cert /etc/fass/pki/ca/ca.crt \
+             --client-cert /etc/fass/pki/gateway/tls.crt --client-key /etc/fass/pki/gateway/tls.key \
+             --agent-tls require --require-mtls \
+             --coordinator https://coordinator.internal:7001 --coordinator-ca /etc/fass/pki/ca/ca.crt
+```
+
+| Gateway flag | Env | Meaning |
+|---|---|---|
+| `--ca-cert` | `FASS_GATEWAY_CA_CERT` | CA bundle used to verify agents and the coordinator |
+| `--client-cert` / `--client-key` | `FASS_GATEWAY_CLIENT_CERT` / `FASS_GATEWAY_CLIENT_KEY` | gateway identity for mTLS |
+| `--agent-tls off\|auto\|require` | `FASS_GATEWAY_AGENT_TLS` | data-plane mode (default `require`) |
+| `--require-mtls` | `FASS_GATEWAY_REQUIRE_MTLS` | strict: no plaintext peers, client certs mandatory |
+| `--coordinator-ca` | `FASS_GATEWAY_COORDINATOR_CA` | CA bundle for the coordinator (defaults to `--ca-cert`) |
+| `--insecure` | `FASS_GATEWAY_INSECURE` | explicit plaintext; warning on every start, visible in `/healthz` |
+| `--tls-cert` / `--tls-key` | `FASS_GATEWAY_TLS_CERT` / `FASS_GATEWAY_TLS_KEY` | serve the S3 edge over HTTPS |
+
+Non-dev gateways refuse to start with `--ca-cert` missing, `--agent-tls=off`
+(without `--insecure`), `--require-mtls` without a client certificate, or a
+plaintext `--coordinator` URL.
+
+### 4.2 Rotation without a flag day
+
+Certificates renew inside a window of **one third of their lifetime, capped at
+24 h** (`pki.RenewalWindow`; a 90-day cert renews 30 days early). Agents reload
+cert/key from disk on the next handshake once inside the window, keeping existing
+connections alive — no coordinated restart of twelve agents.
+
+```console
+# Issue the replacement to the same paths the component reads (atomic replace),
+fass-gateway pki issue-server --ca-dir /etc/fass/pki/ca --dir /etc/fass/pki/agent.new ...
+# then move tls.crt/tls.key into place for the component; in-flight connections finish
+# on the old certificate, the next handshake picks up the new one.
+```
+
+`fass cluster status` warns when a component is inside its renewal window
+(`/v1/stats` exposes `tls.not_after`).
+
+### 4.3 Mixed-mode rollout (upgrading live agents)
+
+1. Roll out TLS listeners with `--insecure` still present on the not-yet-updated agents.
+2. Run gateways with `--agent-tls auto --ca-cert ...`: TLS peers are verified,
+   plaintext peers are used with a warning per endpoint. `/healthz` stays
+   `insecure=false` but the warnings make the remaining plaintext list visible.
+3. When every agent has TLS, flip gateways to `--agent-tls require --require-mtls`.
+   From then on a plaintext agent is a hard failure, not a quiet downgrade.
+
+The transition is a state, not an option: compat/tests assert that strict mode
+rejects a plaintext peer, and an expired certificate fails with an actionable
+`renew/re-enroll` message rather than an opaque handshake error.

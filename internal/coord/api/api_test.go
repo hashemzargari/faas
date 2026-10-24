@@ -22,6 +22,7 @@ import (
 	"github.com/fass-storage/fass/internal/coord/membership"
 	"github.com/fass-storage/fass/internal/coord/recovery"
 	"github.com/fass-storage/fass/internal/ec"
+	"github.com/fass-storage/fass/internal/storage"
 )
 
 // harness boots a real coordinator on a random port (httptest) over an embedded
@@ -842,5 +843,61 @@ func TestHealthReportsTransportSecurity(t *testing.T) {
 	body := read("/healthz")
 	if body["tls"] != true || body["mtls"] != true || body["insecure"] != false {
 		t.Fatalf("TLS transport = tls %v mtls %v insecure %v, want true/true/false", body["tls"], body["mtls"], body["insecure"])
+	}
+}
+
+// failingStore simulates an unreachable metadata backend (failover/pool loss).
+type failingStore struct{}
+
+func (failingStore) View(context.Context, func(storage.Reader) error) error {
+	return fmt.Errorf("%w: connection refused", storage.ErrUnavailable)
+}
+func (failingStore) Update(context.Context, func(storage.Writer) error) error {
+	return fmt.Errorf("%w: connection refused", storage.ErrUnavailable)
+}
+func (failingStore) Close() error { return nil }
+
+// TestBackendUnavailableIsRetryableAndHonest: a dead system of record must
+// surface as 503 (retryable) and /healthz must say unhealthy, never ok.
+func TestBackendUnavailableIsRetryableAndHonest(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := coord.NewWithStore(failingStore{}, false, coord.Config{Logger: logger})
+	srv := httptest.NewServer(api.New(svc, logger).Handler())
+	defer srv.Close()
+
+	resp, err := srv.Client().Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("/healthz status = %d, want 503 (body %s)", resp.StatusCode, body)
+	}
+	var health map[string]any
+	if err := json.Unmarshal(body, &health); err != nil {
+		t.Fatalf("decode health: %v", err)
+	}
+	if health["status"] != "unhealthy" || health["database"] != "unreachable" {
+		t.Fatalf("health body = %v, want status unhealthy/database unreachable", health)
+	}
+
+	resp, err = srv.Client().Get(srv.URL + "/v1/buckets")
+	if err != nil {
+		t.Fatalf("GET /v1/buckets: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("/v1/buckets status = %d, want 503 (body %s)", resp.StatusCode, body)
+	}
+	var env struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &env)
+	if env.Error.Code != "ServiceUnavailable" {
+		t.Fatalf("error code = %q, want ServiceUnavailable", env.Error.Code)
 	}
 }
