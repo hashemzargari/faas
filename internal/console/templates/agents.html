@@ -1,0 +1,10 @@
+{{define "content"}}
+<section class="page-head">
+  <h1>Agents</h1>
+  <div class="head-meta">
+    <span class="muted">Updated automatically every 10 s via HTMX · {{len .Agents}} shown</span>
+    {{if .Common.ReadOnly}}<span class="pill warn">read-only: actions disabled</span>{{else}}<span class="pill ok">actions enabled</span>{{end}}
+  </div>
+</section>
+{{template "agents_body" .}}
+{{end}}

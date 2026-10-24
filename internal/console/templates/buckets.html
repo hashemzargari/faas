@@ -1,0 +1,32 @@
+{{define "content"}}
+<section class="page-head">
+  <h1>Buckets</h1>
+  <div class="head-meta"><span class="muted">{{len .Buckets}} bucket(s) · object counts cover the first 1,000 keys per bucket</span></div>
+</section>
+
+{{if .Error}}<div class="banner bad">{{.Error}}</div>{{end}}
+
+<section class="panel">
+  <table>
+    <thead>
+      <tr><th>Bucket</th><th>Region</th><th>Versioning</th><th>Ownership</th><th>Default RC</th><th>Objects</th><th>Size (first page)</th><th>Created</th></tr>
+    </thead>
+    <tbody>
+    {{range .Buckets}}
+      <tr>
+        <td><a href="/buckets/{{.Config.Name}}">{{.Config.Name}}</a></td>
+        <td>{{dash .Config.Region}}</td>
+        <td>{{if .Config.Versioning}}{{.Config.Versioning}}{{else}}<span class="muted">unversioned</span>{{end}}</td>
+        <td>{{dash .Config.Ownership}}</td>
+        <td>{{dash .Config.DefaultRCID}}</td>
+        <td>{{.Objects}}{{if .Truncated}}<span class="muted">+</span>{{end}}</td>
+        <td>{{humanBytes .Size}}{{if .Truncated}}<span class="muted">+</span>{{end}}</td>
+        <td>{{humanTime .Config.CreatedAt}}</td>
+      </tr>
+    {{else}}
+      <tr><td colspan="8" class="muted">No buckets. Create one with <code>fass mb &lt;bucket&gt;</code>.</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</section>
+{{end}}

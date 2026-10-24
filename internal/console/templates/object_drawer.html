@@ -1,0 +1,64 @@
+{{define "object_drawer"}}
+<div class="drawer-inner">
+  {{if .Error}}
+    <h2>Object error</h2>
+    <div class="banner bad">{{.Error}}</div>
+    <p class="muted">The coordinator could not return a manifest for this key.</p>
+  {{else}}
+    <h2 class="break">{{.Key}}</h2>
+    <dl class="props">
+      <dt>Bucket</dt><dd>{{.Bucket}}</dd>
+      <dt>Version</dt><dd class="mono break">{{.Manifest.VersionID}}</dd>
+      <dt>Size</dt><dd>{{humanBytes .Manifest.Size}} <span class="muted">({{.Manifest.Size}} bytes)</span></dd>
+      <dt>ETag</dt><dd class="mono break">{{dash .Manifest.ETag}}</dd>
+      <dt>Content-Type</dt><dd>{{dash .Manifest.ContentType}}</dd>
+      <dt>Created</dt><dd>{{humanTime .Manifest.CreatedAt}}</dd>
+      <dt>Chunk size</dt><dd>{{humanBytes .Manifest.ChunkSize}}</dd>
+      <dt>RC / ring</dt><dd>{{dash .Manifest.RCID}} / {{dash .Manifest.RingID}}</dd>
+      <dt>Encryption</dt><dd>{{dash .Manifest.Encryption.Mode}} <span class="muted">(frame {{humanBytes .Manifest.Encryption.FrameSize}})</span></dd>
+    </dl>
+
+    {{if .Manifest.Retention}}
+    <h3>Retention</h3>
+    <dl class="props">
+      <dt>Mode</dt><dd>{{.Manifest.Retention.Mode}}</dd>
+      <dt>Retain until</dt><dd>{{humanTime .Manifest.Retention.RetainUntil}}</dd>
+      <dt>Legal hold</dt><dd>{{if .Manifest.Retention.LegalHold}}yes{{else}}no{{end}}</dd>
+    </dl>
+    {{end}}
+
+    <h3>Chunk table ({{len .Manifest.Chunks}})</h3>
+    <table class="compact">
+      <thead><tr><th>#</th><th>Coding</th><th>Shard set</th><th>Ciphertext</th><th>Shard</th><th>Gen</th><th>Slots</th></tr></thead>
+      <tbody>
+      {{range .Manifest.Chunks}}
+        <tr>
+          <td>{{.Index}}</td>
+          <td>{{.Params.GeoN}}+{{.Params.GeoK}} × {{.Params.LocalN}}+{{.Params.LocalK}}</td>
+          <td class="mono break">{{dash .ShardSetID}}</td>
+          <td>{{humanBytes .CiphertextLen}}</td>
+          <td>{{humanBytes .ShardSize}}</td>
+          <td>{{.Generation}}</td>
+          <td>{{len .Slots}}</td>
+        </tr>
+      {{else}}
+        <tr><td colspan="7" class="muted">No chunks (zero-byte object or metadata-only manifest).</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+
+    {{if .Manifest.UserMeta}}
+    <h3>User metadata</h3>
+    <dl class="props">
+      {{range $k, $v := .Manifest.UserMeta}}<dt class="mono break">{{$k}}</dt><dd class="break">{{$v}}</dd>{{end}}
+    </dl>
+    {{end}}
+    {{if .Manifest.Tags}}
+    <h3>Tags</h3>
+    <dl class="props">
+      {{range $k, $v := .Manifest.Tags}}<dt class="mono break">{{$k}}</dt><dd class="break">{{$v}}</dd>{{end}}
+    </dl>
+    {{end}}
+  {{end}}
+</div>
+{{end}}

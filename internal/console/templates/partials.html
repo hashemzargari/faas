@@ -1,0 +1,183 @@
+{{define "overview_body"}}
+<div id="overview-body" hx-get="/partials/overview" hx-trigger="every 15s" hx-swap="outerHTML">
+  <section class="page-head">
+    <h1>Cluster overview</h1>
+    <div class="head-meta">
+      <span class="pill {{if eq .Status "ok"}}ok{{else if eq .Status "unreachable"}}bad{{else}}warn{{end}}">{{.Status}}</span>
+      <span class="muted">snapshot {{.SnapshotAt}}</span>
+    </div>
+  </section>
+
+  <section class="cards">
+    <div class="card">
+      <div class="card-label">Agents</div>
+      <div class="card-value">{{.Active}} / {{.AgentsTotal}} active</div>
+      <div class="card-detail">
+        {{.Suspect}} suspect · {{.Offline}} offline · {{.Pending}} pending · {{.Decommissioning}} decommissioning
+      </div>
+      <a href="/agents" class="card-link">agents →</a>
+    </div>
+    <div class="card">
+      <div class="card-label">Capacity</div>
+      <div class="card-value">{{pct .UsedBytes .CapacityBytes}}</div>
+      <div class="card-detail">{{humanBytes .UsedBytes}} used of {{humanBytes .CapacityBytes}} (agent-reported)</div>
+      <div class="bar"><span style="width: {{percentOf .UsedBytes .CapacityBytes}}%"></span></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Rings</div>
+      <div class="card-value">{{len .Rings}}</div>
+      <div class="card-detail">{{len .RCs}} redundancy class(es) · {{len .Nexuses}} nexuses</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Coordinator</div>
+      {{if .Health}}
+      <div class="card-value">reachable</div>
+      <div class="card-detail">status {{index .Health "status"}}{{if index .Health "schema_version"}} · schema {{index .Health "schema_version"}}{{end}}</div>
+      {{else}}
+      <div class="card-value bad">unreachable</div>
+      <div class="card-detail">{{.CoordinatorError}}</div>
+      {{end}}
+      <div class="card-detail muted">HTTP 5xx since coordinator start: {{.Coordinator5xx}}{{if .MetricsError}} (metrics: {{.MetricsError}}){{end}}</div>
+    </div>
+  </section>
+
+  <section class="grid-2">
+    <div class="panel">
+      <h2>Needs attention</h2>
+      {{if .Attention}}
+      <ul class="attention">
+        {{range .Attention}}
+        <li class="attn {{.Severity}}"><span class="dot"></span><a href="{{.Link}}">{{.Text}}</a></li>
+        {{end}}
+      </ul>
+      {{else}}
+      <p class="muted">Nothing to report: every agent is ACTIVE, every nexus is writable, no ring is above 85%.</p>
+      {{end}}
+    </div>
+
+    <div class="panel">
+      <h2>Nexuses</h2>
+      <table>
+        <thead><tr><th>Nexus</th><th>Agents</th><th>Active</th><th>Writes</th></tr></thead>
+        <tbody>
+        {{range .Nexuses}}
+          <tr>
+            <td>{{.ID}}</td>
+            <td>{{.Agents}}</td>
+            <td>{{.Active}}</td>
+            <td>{{if .WriteDegraded}}<span class="pill warn">degraded</span>{{else}}<span class="pill ok">normal</span>{{end}}</td>
+          </tr>
+        {{else}}
+          <tr><td colspan="4" class="muted">No nexuses registered.</td></tr>
+        {{end}}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Rings</h2>
+    <table>
+      <thead><tr><th>Ring</th><th>RC</th><th>Nexuses</th><th>Agents</th><th>Capacity</th><th>Used</th><th>Full</th></tr></thead>
+      <tbody>
+      {{range .Rings}}
+        <tr>
+          <td>{{.ID}}</td>
+          <td>{{.RCID}}</td>
+          <td>{{len .NexusIDs}}</td>
+          <td>{{.AgentCount}}</td>
+          <td>{{humanBytes .Capacity}}</td>
+          <td>{{humanBytes .UsedBytes}}</td>
+          <td>
+            <span class="{{if ge .FullPct 85.0}}bad{{else if ge .FullPct 70.0}}warn{{else}}ok{{end}}">{{printf "%.1f%%" .FullPct}}</span>
+            <span class="bar small"><span style="width: {{.FullPct}}%"></span></span>
+          </td>
+        </tr>
+      {{else}}
+        <tr><td colspan="7" class="muted">No rings.</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <h2>Redundancy classes</h2>
+    <table>
+      <thead><tr><th>RC</th><th>Name</th><th>Geo</th><th>Local</th><th>AAG</th><th>Chunk</th><th>Ratio</th></tr></thead>
+      <tbody>
+      {{range .RCs}}
+        <tr>
+          <td>{{.RC.ID}}</td>
+          <td>{{.RC.Name}}</td>
+          <td>{{.RC.Params.GeoN}}+{{.RC.Params.GeoK}}</td>
+          <td>{{.RC.Params.LocalN}}+{{.RC.Params.LocalK}}</td>
+          <td>{{.RC.AAG}}</td>
+          <td>{{humanBytes .RC.ChunkSize}}</td>
+          <td>{{ratio .Ratio}}</td>
+        </tr>
+      {{else}}
+        <tr><td colspan="7" class="muted">No redundancy classes.</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+  </section>
+</div>
+{{end}}
+
+{{define "agents_body"}}
+<div id="agents-body" hx-get="/partials/agents{{if .StateFilter}}?state={{.StateFilter}}{{end}}{{if .NexusFilter}}{{if .StateFilter}}&{{else}}?{{end}}nexus={{.NexusFilter}}{{end}}" hx-trigger="every 10s" hx-swap="outerHTML">
+  <div class="filters">
+    <a href="/agents" class="chip {{if not .StateFilter}}active{{end}}">all ({{len .Agents}})</a>
+    <a href="/agents?state=active" class="chip {{if eq .StateFilter "active"}}active{{end}}">active ({{index .Counts "active"}})</a>
+    <a href="/agents?state=pending" class="chip {{if eq .StateFilter "pending"}}active{{end}}">pending ({{index .Counts "pending"}})</a>
+    <a href="/agents?state=suspect" class="chip {{if eq .StateFilter "suspect"}}active{{end}}">suspect ({{index .Counts "suspect"}})</a>
+    <a href="/agents?state=offline" class="chip {{if eq .StateFilter "offline"}}active{{end}}">offline ({{index .Counts "offline"}})</a>
+    <a href="/agents?state=decommissioning" class="chip {{if eq .StateFilter "decommissioning"}}active{{end}}">decommissioning ({{index .Counts "decommissioning"}})</a>
+  </div>
+  <table class="agents">
+    <thead>
+      <tr><th>Agent</th><th>Nexus</th><th>Node</th><th>Disk</th><th>State</th><th>Uptime</th><th>Last heartbeat</th><th>Capacity</th><th>Shards</th><th>Actions</th></tr>
+    </thead>
+    <tbody>
+    {{range .Agents}}
+      <tr>
+        <td><a href="/agents/{{.ID}}">{{.ID}}</a></td>
+        <td>{{.NexusID}}</td>
+        <td>{{.NodeID}}</td>
+        <td>{{dash .DiskID}}</td>
+        <td><span class="pill {{stateClass .State}}">{{.State}}</span></td>
+        <td>{{if .ActivatedAt}}{{humanAgo .ActivatedAt}}{{else}}-{{end}}</td>
+        <td>{{humanTime .LastSeen}}<span class="muted"> · {{humanAgo .LastSeen}}</span></td>
+        <td>{{humanBytes .UsedBytes}} / {{humanBytes .CapacityBytes}}</td>
+        <td>{{.ShardCount}}</td>
+        <td class="actions">
+          {{if not $.Common.ReadOnly}}
+            {{if eq .State "pending"}}
+            <form method="post" action="/agents/{{.ID}}/activate">
+              <input type="hidden" name="csrf" value="{{$.Common.CSRF}}">
+              <button class="btn ok" type="submit">Activate</button>
+            </form>
+            {{else if eq .State "decommissioning"}}
+            <form method="post" action="/agents/{{.ID}}/decommission">
+              <input type="hidden" name="csrf" value="{{$.Common.CSRF}}">
+              <input type="hidden" name="on" value="false">
+              <button class="btn" type="submit">Cancel decommission</button>
+            </form>
+            {{else}}
+            <form method="post" action="/agents/{{.ID}}/decommission" data-confirm="Decommission {{.ID}}? The agent will drain and stop accepting new shards.">
+              <input type="hidden" name="csrf" value="{{$.Common.CSRF}}">
+              <button class="btn danger" type="submit">Decommission</button>
+            </form>
+            {{end}}
+          {{else}}
+          <span class="muted" title="Start the console with --read-only=false to enable actions">read-only</span>
+          {{end}}
+        </td>
+      </tr>
+    {{else}}
+      <tr><td colspan="10" class="muted">No agents match this filter.</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}

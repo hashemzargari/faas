@@ -1,0 +1,51 @@
+{{define "content"}}
+<section class="page-head">
+  <h1>Bucket <code>{{.BucketName}}</code></h1>
+  <div class="head-meta">
+    <span class="pill {{if eq .Bucket.Versioning "Enabled"}}ok{{else}}idle{{end}}">versioning {{if .Bucket.Versioning}}{{.Bucket.Versioning}}{{else}}off{{end}}</span>
+    {{if .Bucket.ObjectLock}}<span class="pill warn">object lock</span>{{end}}
+    <span class="muted">region {{dash .Bucket.Region}} · ownership {{dash .Bucket.Ownership}} · default RC {{dash .Bucket.DefaultRCID}}</span>
+  </div>
+</section>
+
+<form class="filter-form" method="get" action="/buckets/{{.BucketName}}">
+  <label for="prefix">Prefix</label>
+  <input id="prefix" type="text" name="prefix" value="{{.Prefix}}" placeholder="e.g. e2e/">
+  <button class="btn" type="submit">Filter</button>
+  {{if .Prefix}}<a class="btn ghost" href="/buckets/{{.BucketName}}">Clear</a>{{end}}
+</form>
+
+<div class="split">
+  <section class="panel">
+    <h2>Objects</h2>
+    <table>
+      <thead><tr><th>Key</th><th>Size</th><th>ETag</th><th>Modified</th></tr></thead>
+      <tbody>
+      {{range .Result.Entries}}
+        <tr>
+          <td>
+            <a href="#" hx-get="/buckets/{{$.BucketName}}/object?key={{.Key | urlquery}}{{if .VersionID}}&version={{.VersionID}}{{end}}"
+               hx-target="#drawer" hx-swap="innerHTML" class="key">{{.Key}}</a>
+          </td>
+          <td>{{humanBytes .Size}}</td>
+          <td class="mono">{{dash .ETag}}</td>
+          <td>{{humanTime .LastModified}}</td>
+        </tr>
+      {{else}}
+        <tr><td colspan="4" class="muted">No objects under this prefix.</td></tr>
+      {{end}}
+      </tbody>
+    </table>
+    <div class="pager">
+      <span class="muted">{{.Result.KeyCount}} key(s) on this page{{if .Result.IsTruncated}} · more available{{end}}</span>
+      {{if .NextToken}}
+      <a class="btn" href="/buckets/{{.BucketName}}?prefix={{.Prefix | urlquery}}&token={{.NextToken | urlquery}}">Next page →</a>
+      {{end}}
+    </div>
+  </section>
+
+  <aside class="panel drawer" id="drawer">
+    <p class="muted">Select an object to inspect its manifest: chunk table, coding parameters, generation and placement.</p>
+  </aside>
+</div>
+{{end}}

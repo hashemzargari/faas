@@ -1,0 +1,79 @@
+{{define "content"}}
+<section class="page-head">
+  <h1>Agent <code>{{.AgentID}}</code></h1>
+  <div class="head-meta">
+    {{if .Agent.State}}
+      <span class="pill {{stateClass .Agent.State}}">{{.Agent.State}}</span>
+    {{end}}
+    <a class="btn ghost" href="/agents">← all agents</a>
+  </div>
+</section>
+
+{{if .Error}}<div class="banner bad">{{.Error}}</div>{{end}}
+
+{{if .Agent.State}}
+<section class="grid-2">
+  <div class="panel">
+    <h2>Identity &amp; placement</h2>
+    <dl class="props">
+      <dt>Agent</dt><dd class="mono">{{.Agent.ID}}</dd>
+      <dt>Nexus</dt><dd>{{.Agent.NexusID}}{{if .NexusName}} <span class="muted">({{.NexusName}})</span>{{end}}</dd>
+      <dt>Node</dt><dd>{{.Agent.NodeID}}{{if .NodeName}} <span class="muted">({{.NodeName}})</span>{{end}}</dd>
+      <dt>Disk</dt><dd class="mono">{{dash .Agent.DiskID}}</dd>
+      <dt>Endpoint</dt><dd class="mono">{{dash .Agent.Endpoint}}{{if .Agent.Port}}:{{.Agent.Port}}{{end}}</dd>
+      <dt>Version</dt><dd>{{dash .Agent.Version}}</dd>
+      <dt>Rings</dt><dd>{{if .Agent.RingIDs}}{{join .Agent.RingIDs ", "}}{{else}}-{{end}}</dd>
+      <dt>Registered</dt><dd>{{humanTime .Agent.RegisteredAt}}</dd>
+      <dt>Activated</dt><dd>{{humanTime .Agent.ActivatedAt}}</dd>
+      <dt>State changed</dt><dd>{{humanTime .Agent.StateChanged}}</dd>
+    </dl>
+  </div>
+
+  <div class="panel">
+    <h2>Health &amp; capacity</h2>
+    <dl class="props">
+      <dt>Last heartbeat</dt><dd>{{humanTime .Agent.LastSeen}} <span class="muted">({{humanAgo .Agent.LastSeen}})</span></dd>
+      <dt>Capacity</dt><dd>{{humanBytes .Agent.UsedBytes}} used / {{humanBytes .Agent.CapacityBytes}} total</dd>
+      <dt>Free</dt><dd>{{humanBytes .Agent.FreeBytes}}</dd>
+      <dt>Shards</dt><dd>{{.Agent.ShardCount}}</dd>
+      <dt>Inventory digest</dt><dd class="mono break">{{dash .Agent.InventoryDigest}}</dd>
+      <dt>Scrub cursor</dt><dd class="mono">{{dash .Agent.ScrubCursor}}</dd>
+      <dt>Load EWMA</dt><dd>{{printf "%.3f" .Agent.LoadEWMA}}</dd>
+      <dt>Uptime score</dt><dd>{{printf "%.3f" .Agent.UptimeScore}}</dd>
+      <dt>Reputation</dt><dd>{{printf "%.3f" .Agent.Reputation}}</dd>
+      <dt>Bandwidth</dt><dd>{{.Agent.BandwidthBps}} B/s</dd>
+    </dl>
+  </div>
+</section>
+
+{{if not .Common.ReadOnly}}
+<section class="panel">
+  <h2>Actions</h2>
+  <div class="action-row">
+    {{if eq .Agent.State "pending"}}
+    <form method="post" action="/agents/{{.AgentID}}/activate">
+      <input type="hidden" name="csrf" value="{{.Common.CSRF}}">
+      <button class="btn ok" type="submit">Activate agent</button>
+      <span class="muted">Makes the agent eligible for placement.</span>
+    </form>
+    {{else if eq .Agent.State "decommissioning"}}
+    <form method="post" action="/agents/{{.AgentID}}/decommission">
+      <input type="hidden" name="csrf" value="{{.Common.CSRF}}">
+      <input type="hidden" name="on" value="false">
+      <button class="btn" type="submit">Cancel decommission</button>
+      <span class="muted">Agent returns to its health-derived state.</span>
+    </form>
+    {{else}}
+    <form method="post" action="/agents/{{.AgentID}}/decommission" data-confirm="Decommission {{.AgentID}}? The agent will drain and stop accepting new shards.">
+      <input type="hidden" name="csrf" value="{{.Common.CSRF}}">
+      <button class="btn danger" type="submit">Decommission agent</button>
+      <span class="muted">Drains the disk; shards are repaired onto the remaining agents.</span>
+    </form>
+    {{end}}
+  </div>
+</section>
+{{end}}
+{{else}}
+<p class="muted">No data for this agent; the coordinator may be unreachable or the agent id is unknown.</p>
+{{end}}
+{{end}}

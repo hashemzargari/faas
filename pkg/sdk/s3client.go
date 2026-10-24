@@ -260,26 +260,41 @@ func (c *Client) DeleteObject(ctx context.Context, bucket, key string) error {
 }
 
 // ListObjectsV2 returns up to maxKeys entries under prefix (one page).
+//
+// Deprecated for pagination: use ListObjectsV2Page, which exposes the
+// continuation token. A caller that loops on this method cannot make progress
+// past the first page.
 func (c *Client) ListObjectsV2(ctx context.Context, bucket, prefix string, maxKeys int) ([]Object, bool, error) {
+	objs, _, truncated, err := c.ListObjectsV2Page(ctx, bucket, prefix, "", maxKeys)
+	return objs, truncated, err
+}
+
+// ListObjectsV2Page returns one page of objects plus the continuation token for
+// the next page (empty when the listing is complete).
+func (c *Client) ListObjectsV2Page(ctx context.Context, bucket, prefix, continuationToken string, maxKeys int) ([]Object, string, bool, error) {
 	q := url.Values{}
 	q.Set("list-type", "2")
 	if prefix != "" {
 		q.Set("prefix", prefix)
+	}
+	if continuationToken != "" {
+		q.Set("continuation-token", continuationToken)
 	}
 	if maxKeys > 0 {
 		q.Set("max-keys", fmt.Sprint(maxKeys))
 	}
 	resp, err := c.do(ctx, http.MethodGet, "/"+bucket, q, nil, 0, nil)
 	if err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 	defer resp.Body.Close()
 	if err := check(resp); err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 	var out struct {
-		IsTruncated bool `xml:"IsTruncated"`
-		Contents    []struct {
+		IsTruncated           bool   `xml:"IsTruncated"`
+		NextContinuationToken string `xml:"NextContinuationToken"`
+		Contents              []struct {
 			Key          string `xml:"Key"`
 			Size         int64  `xml:"Size"`
 			ETag         string `xml:"ETag"`
@@ -287,7 +302,7 @@ func (c *Client) ListObjectsV2(ctx context.Context, bucket, prefix string, maxKe
 		} `xml:"Contents"`
 	}
 	if err := xml.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, false, fmt.Errorf("sdk: decode ListObjectsV2: %w", err)
+		return nil, "", false, fmt.Errorf("sdk: decode ListObjectsV2: %w", err)
 	}
 	objs := make([]Object, 0, len(out.Contents))
 	for _, o := range out.Contents {
@@ -297,7 +312,7 @@ func (c *Client) ListObjectsV2(ctx context.Context, bucket, prefix string, maxKe
 			ETag: strings.Trim(o.ETag, `"`), LastModified: t,
 		})
 	}
-	return objs, out.IsTruncated, nil
+	return objs, out.NextContinuationToken, out.IsTruncated, nil
 }
 
 // DefaultPresignTTL is used when a caller passes a non-positive TTL.

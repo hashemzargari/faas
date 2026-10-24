@@ -1,4 +1,4 @@
-.PHONY: all build test race vet lint fmt e2e compat chaos bench dev image clean
+.PHONY: all build test race vet lint fmt e2e compat chaos bench dev image clean cli console
 
 SHELL := /bin/bash
 GOENV := source scripts/env.sh &&
@@ -9,7 +9,7 @@ build:
 	$(GOENV) go build -trimpath -o bin/ ./cmd/...
 
 test:
-	$(GOENV) go test -count=1 ./internal/... ./pkg/...
+	$(GOENV) go test -count=1 ./cmd/... ./internal/... ./pkg/...
 
 race:
 	$(GOENV) go test -race -count=1 ./internal/... ./pkg/...
@@ -34,6 +34,15 @@ bench:
 
 dev: build
 	$(GOENV) go run ./cmd/fass-all --dev
+
+# Operator surface. `make build` also produces bin/fass-cli and bin/fass-console
+# (named after their directories); these targets install the operator-facing
+# names: bin/fass and bin/fass-console.
+cli:
+	$(GOENV) go build -trimpath -o bin/fass ./cmd/fass-cli
+
+console:
+	$(GOENV) go build -trimpath -o bin/fass-console ./cmd/fass-console
 
 image:
 	docker build -f deploy/docker/Dockerfile -t fass:dev .

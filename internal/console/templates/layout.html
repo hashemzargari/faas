@@ -1,0 +1,46 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Common.Title}} · FASS console</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">FASS</span><span class="sub">console</span></div>
+    <nav>
+      <a href="/" class="{{if eq .Common.CurrentPath "/"}}active{{end}}">Overview</a>
+      <a href="/buckets" class="{{if hasPrefix .Common.CurrentPath "/buckets"}}active{{end}}">Buckets</a>
+      <a href="/agents" class="{{if hasPrefix .Common.CurrentPath "/agents"}}active{{end}}">Agents</a>
+    </nav>
+    <div class="who">
+      <span>{{.Common.User}}</span>
+      <span class="sep">·</span>
+      <span>v{{.Common.Version}}</span>
+      <span class="sep">·</span>
+      {{if .Common.ReadOnly}}<span class="pill warn" title="Started with --read-only">read-only</span>
+      {{else}}<span class="pill ok" title="Write actions enabled">writes enabled</span>{{end}}
+    </div>
+  </header>
+
+  {{if .Common.CoordinatorError}}
+  <div class="banner bad" role="alert">
+    <strong>Coordinator unreachable or degraded.</strong>
+    {{.Common.CoordinatorError}}
+    <span class="muted">Showing empty/last-known data; the page keeps working while the control plane recovers.</span>
+  </div>
+  {{end}}
+  {{if .Common.Flash}}<div class="banner ok" role="status">{{.Common.Flash}}</div>{{end}}
+
+  <main>
+    {{template "content" .}}
+  </main>
+
+  <footer>
+    FASS console · server-rendered Go templates + HTMX · assets embedded · no Node toolchain
+  </footer>
+</body>
+</html>{{end}}
