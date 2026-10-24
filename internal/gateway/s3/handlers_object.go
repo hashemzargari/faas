@@ -81,7 +81,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, t targe
 		return
 	}
 
-	versionID := contract.VersionID(s.newUUID())
+	versionID, _ := s.mintVersionID(b)
 	spec := s.objectSpec(b, t.Key, versionID, contentLength(r),
 		r.Header.Get("Content-Type"), meta, tags, storageClass, rcID)
 	spec.Checksums = checksums
@@ -98,9 +98,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, t targe
 		return
 	}
 	w.Header().Set("ETag", quoteETag(res.ETag))
-	if b.Versioning == "Enabled" {
-		w.Header().Set("x-amz-version-id", string(res.VersionID))
-	}
+	versionHeader(w.Header(), b, res.VersionID)
 	writeEmpty(w, http.StatusOK)
 }
 
@@ -374,9 +372,7 @@ func (s *Server) handleDeleteObject(w http.ResponseWriter, r *http.Request, t ta
 		s.fail(w, r, err)
 		return
 	}
-	if b.Versioning == "Enabled" && versionID != "" {
-		w.Header().Set("x-amz-version-id", string(versionID))
-	}
+	versionHeader(w.Header(), b, versionID)
 	if isMarker {
 		w.Header().Set("x-amz-delete-marker", "true")
 	}
@@ -526,7 +522,7 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, t targ
 		return
 	}
 
-	versionID := contract.VersionID(s.newUUID())
+	versionID, _ := s.mintVersionID(dstBucket)
 	spec := s.objectSpec(dstBucket, t.Key, versionID, size, contentType, meta, tags, storageClass, rcID)
 	if s.cfg.Compat.ConditionalWrites {
 		spec.IfMatch = r.Header.Get("If-Match")
@@ -554,9 +550,7 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, t targ
 		return
 	}
 	w.Header().Set("ETag", quoteETag(res.ETag))
-	if dstBucket.Versioning == "Enabled" {
-		w.Header().Set("x-amz-version-id", string(res.VersionID))
-	}
+	versionHeader(w.Header(), dstBucket, res.VersionID)
 	writeXML(w, http.StatusOK, copyObjectResultXML{
 		LastModified: xmlTime(s.now()),
 		ETag:         quoteETag(res.ETag),

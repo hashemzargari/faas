@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -160,23 +161,25 @@ type commonPrefixXML struct {
 }
 
 type listVersionsResult struct {
-	XMLName             xml.Name          `xml:"http://s3.amazonaws.com/doc/2006-03-01/ ListVersionsResult"`
-	Name                string            `xml:"Name"`
-	Prefix              string            `xml:"Prefix"`
-	KeyMarker           string            `xml:"KeyMarker"`
-	VersionIDMarker     string            `xml:"VersionIdMarker"`
-	NextKeyMarker       string            `xml:"NextKeyMarker,omitempty"`
-	NextVersionIDMarker string            `xml:"NextVersionIdMarker,omitempty"`
-	MaxKeys             int               `xml:"MaxKeys"`
-	Delimiter           string            `xml:"Delimiter,omitempty"`
-	IsTruncated         bool              `xml:"IsTruncated"`
-	EncodingType        string            `xml:"EncodingType,omitempty"`
-	Versions            []versionXML      `xml:"Version"`
-	DeleteMarkers       []deleteMarkerXML `xml:"DeleteMarker"`
-	CommonPrefixes      []commonPrefixXML `xml:"CommonPrefixes"`
+	XMLName             xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ ListVersionsResult"`
+	Name                string   `xml:"Name"`
+	Prefix              string   `xml:"Prefix"`
+	KeyMarker           string   `xml:"KeyMarker"`
+	VersionIDMarker     string   `xml:"VersionIdMarker"`
+	NextKeyMarker       string   `xml:"NextKeyMarker,omitempty"`
+	NextVersionIDMarker string   `xml:"NextVersionIdMarker,omitempty"`
+	MaxKeys             int      `xml:"MaxKeys"`
+	Delimiter           string   `xml:"Delimiter,omitempty"`
+	IsTruncated         bool     `xml:"IsTruncated"`
+	EncodingType        string   `xml:"EncodingType,omitempty"`
+	// Entries holds <Version> and <DeleteMarker> elements in the coordinator's
+	// key/version order. They must be interleaved, exactly as S3 emits them.
+	Entries        []any             `xml:"-"`
+	CommonPrefixes []commonPrefixXML `xml:"CommonPrefixes"`
 }
 
 type versionXML struct {
+	XMLName      xml.Name  `xml:"Version"`
 	Key          string    `xml:"Key"`
 	VersionID    string    `xml:"VersionId"`
 	IsLatest     bool      `xml:"IsLatest"`
@@ -188,6 +191,7 @@ type versionXML struct {
 }
 
 type deleteMarkerXML struct {
+	XMLName      xml.Name  `xml:"DeleteMarker"`
 	Key          string    `xml:"Key"`
 	VersionID    string    `xml:"VersionId"`
 	IsLatest     bool      `xml:"IsLatest"`
@@ -551,4 +555,68 @@ type accessControlPolicyRequest struct {
 	ACL struct {
 		Grants []grantXML `xml:"Grant"`
 	} `xml:"AccessControlList"`
+}
+
+// MarshalXML renders ListObjectVersionsResult with Version and DeleteMarker
+// entries interleaved. encoding/xml cannot emit two element kinds from one
+// struct slice, and splitting them into separate fields (the old code) reordered
+// the response, which S3 clients use to reconstruct version history.
+func (l listVersionsResult) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	start.Name = xml.Name{Local: "ListVersionsResult", Space: xmlNS}
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+	writeStr := func(name, value string) error {
+		if value == "" {
+			return nil
+		}
+		return e.EncodeElement(value, xml.StartElement{Name: xml.Name{Local: name}})
+	}
+	writeRequired := func(name, value string) error {
+		return e.EncodeElement(value, xml.StartElement{Name: xml.Name{Local: name}})
+	}
+	if err := writeRequired("Name", l.Name); err != nil {
+		return err
+	}
+	for _, f := range []struct{ name, value string }{
+		{"Prefix", l.Prefix},
+		{"KeyMarker", l.KeyMarker},
+		{"VersionIdMarker", l.VersionIDMarker},
+		{"NextKeyMarker", l.NextKeyMarker},
+		{"NextVersionIdMarker", l.NextVersionIDMarker},
+	} {
+		if err := writeStr(f.name, f.value); err != nil {
+			return err
+		}
+	}
+	if err := writeRequired("MaxKeys", strconv.Itoa(l.MaxKeys)); err != nil {
+		return err
+	}
+	if err := writeStr("Delimiter", l.Delimiter); err != nil {
+		return err
+	}
+	if err := writeRequired("IsTruncated", strconv.FormatBool(l.IsTruncated)); err != nil {
+		return err
+	}
+	if err := writeStr("EncodingType", l.EncodingType); err != nil {
+		return err
+	}
+	for _, entry := range l.Entries {
+		if err := e.Encode(entry); err != nil {
+			return err
+		}
+	}
+	for _, cp := range l.CommonPrefixes {
+		cpStart := xml.StartElement{Name: xml.Name{Local: "CommonPrefixes"}}
+		if err := e.EncodeToken(cpStart); err != nil {
+			return err
+		}
+		if err := e.EncodeElement(cp.Prefix, xml.StartElement{Name: xml.Name{Local: "Prefix"}}); err != nil {
+			return err
+		}
+		if err := e.EncodeToken(cpStart.End()); err != nil {
+			return err
+		}
+	}
+	return e.EncodeToken(start.End())
 }

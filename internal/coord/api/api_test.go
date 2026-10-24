@@ -329,6 +329,27 @@ func TestCoordinatorEndToEnd(t *testing.T) {
 		t.Fatalf("all listing = %d entries", len(all.Entries))
 	}
 
+	// max-keys=0 is an explicit "empty page" request (S3), not "unset".
+	var emptyPage contract.ListResult
+	resp = h.doJSON("GET", "/v1/objects?bucket=e2e-bucket&max_keys=0", nil, &emptyPage)
+	h.mustStatus(resp, http.StatusOK)
+	if len(emptyPage.Entries) != 0 || emptyPage.KeyCount != 0 || emptyPage.IsTruncated {
+		t.Fatalf("max_keys=0 = %+v, want empty non-truncated page", emptyPage)
+	}
+
+	// A malformed continuation token is a client error (InvalidArgument), never
+	// a 500 or a silent default page.
+	var badToken struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	resp = h.doJSON("GET", "/v1/objects?bucket=e2e-bucket&token=Zm9vYmFy", nil, &badToken)
+	h.mustStatus(resp, http.StatusBadRequest)
+	if badToken.Error.Code != "InvalidArgument" {
+		t.Fatalf("malformed token code = %q, want InvalidArgument", badToken.Error.Code)
+	}
+
 	// ---- Delete -----------------------------------------------------------
 	var del struct {
 		VersionID    contract.VersionID `json:"version_id"`

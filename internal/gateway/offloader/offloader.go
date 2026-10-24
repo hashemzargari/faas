@@ -203,6 +203,15 @@ type writeResult struct {
 // It returns only after every shard is acknowledged and the manifest is
 // committed (docs/04 §2.3 invariant 1).
 func (o *Offloader) Write(ctx context.Context, spec ObjectSpec, body io.Reader) (contract.CommitResult, error) {
+	// Shard-set identity must be unique per write. Deriving it from
+	// (bucket, key, version, chunkIndex) collides whenever those coordinates
+	// repeat — multipart parts restart chunk indices, suspended writes repeat the
+	// version id "null", and any retry/replication flow can reuse coordinates.
+	// A random scope makes the collision class structurally impossible; the id is
+	// carried in ChunkRef.ShardSetID for the coordinator, GC and the read path.
+	if spec.PartScope == "" {
+		spec.PartScope = contract.NewUUID()
+	}
 	res, err := o.writeChunks(ctx, spec, body)
 	if err != nil {
 		return contract.CommitResult{}, err
@@ -249,9 +258,10 @@ func (o *Offloader) WritePart(ctx context.Context, spec ObjectSpec, uploadID con
 	if partNumber < 1 {
 		return PartRef{}, fmt.Errorf("offloader: invalid part number %d", partNumber)
 	}
-	// Every part restarts chunk indices at 0, so the scope is what keeps part 2's
-	// shard-set ids disjoint from part 1's (see contract.ShardSetIDForScoped).
-	spec.PartScope = fmt.Sprintf("part/%d", partNumber)
+	// A fresh random scope per part: the part number alone is not enough (two
+	// uploads of the same suspended object share version "null"), and coordinates
+	// in general must never determine shard identity.
+	spec.PartScope = contract.NewUUID()
 	res, err := o.writeChunks(ctx, spec, body)
 	if err != nil {
 		return PartRef{}, err

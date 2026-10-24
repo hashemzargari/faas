@@ -110,24 +110,12 @@ func mapError(err error) *APIError {
 
 	// Preserve HTTP status semantics from lower layers (e.g. the coordinator
 	// returns 405 for a GET of an explicit delete-marker version).
-	var statuser interface{ HTTPStatus() int }
-	if errors.As(err, &statuser) {
-		switch statuser.HTTPStatus() {
-		case http.StatusMethodNotAllowed:
-			return ErrMethodNotAllowed
-		case http.StatusPreconditionFailed:
-			return ErrPreconditionFailed
-		case http.StatusForbidden:
-			return ErrAccessDenied
-		case http.StatusNotFound:
-			return ErrNoSuchKey
-		case http.StatusConflict:
-			return ErrInvalidBucketState
-		case http.StatusNotImplemented:
-			return ErrNotImplemented
-		case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout:
-			return ErrServiceUnavailable
-		}
+	// Control-plane errors carry an HTTP status and often a typed code/message.
+	// They must be mapped here, first: falling through used to turn every
+	// coordinator 400 (invalid continuation token, retention period, markers, …)
+	// into a 500 and hide the whole validation surface.
+	if api := mapStatusError(err); api != nil {
+		return api
 	}
 
 	// Contract layer.
@@ -194,4 +182,85 @@ func mapError(err error) *APIError {
 
 	// Never leak internal details to the client, but keep the message for logs.
 	return ErrInternalError
+}
+
+// statusError is the shape of an error crossing the coordinator boundary. The
+// coordinator's client implements it; tests can implement it too.
+type statusError interface {
+	HTTPStatus() int
+	ErrorCode() string
+	ErrorMessage() string
+}
+
+// mapStatusError converts a transport-level status error into the matching S3
+// error, preserving the coordinator's typed code and message for client errors.
+// It returns nil when err carries no status.
+func mapStatusError(err error) *APIError {
+	var se statusError
+	if !errors.As(err, &se) {
+		return nil
+	}
+	status := se.HTTPStatus()
+	code, message := se.ErrorCode(), se.ErrorMessage()
+
+	var base *APIError
+	switch status {
+	case http.StatusBadRequest:
+		base = ErrInvalidArgument
+	case http.StatusForbidden:
+		base = ErrAccessDenied
+	case http.StatusNotFound:
+		base = ErrNoSuchKey
+	case http.StatusMethodNotAllowed:
+		base = ErrMethodNotAllowed
+	case http.StatusConflict:
+		base = ErrInvalidBucketState
+	case http.StatusPreconditionFailed:
+		base = ErrPreconditionFailed
+	case http.StatusNotImplemented:
+		base = ErrNotImplemented
+	case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout:
+		base = ErrServiceUnavailable
+	case http.StatusInsufficientStorage:
+		// Storage exhaustion is transient from the client's point of view; S3
+		// has no 507 class, so expose the retryable 503.
+		base = ErrServiceUnavailable
+	case http.StatusInternalServerError:
+		// Never leak an internal error message; the gateway log has the detail.
+		return ErrInternalError
+	default:
+		return nil
+	}
+
+	// The coordinator uses "InvalidRequest" as a generic bad-request code; S3
+	// clients expect the documented "InvalidArgument" class for malformed
+	// parameters (AWS itself answers a bad continuation token that way), so
+	// normalise it while keeping the coordinator's precise message. Specific S3
+	// 400 codes (InvalidPart, EntityTooLarge, …) are preserved.
+	if status == http.StatusBadRequest && code == "InvalidRequest" {
+		code = ErrInvalidArgument.Code
+	}
+
+	// "SlowDown" is the documented 503 code and carries Retry-After semantics.
+	if code == "SlowDown" {
+		out := *ErrSlowDown
+		if message != "" {
+			out.Message = message
+		}
+		return &out
+	}
+	if code != "" {
+		out := *base
+		out.Code = code
+		if message != "" {
+			out.Message = message
+		}
+		return &out
+	}
+	if message != "" {
+		out := *base
+		out.Message = message
+		return &out
+	}
+	return base
 }

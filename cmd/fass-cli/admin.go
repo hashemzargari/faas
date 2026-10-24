@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -196,6 +197,13 @@ func (c *adminClient) get(ctx context.Context, path string) (int, []byte, error)
 		return 0, nil, servicef(err, "read coordinator response")
 	}
 	return resp.StatusCode, body, nil
+}
+
+// isNotFound reports a coordinator 404/405/501, used to fall back to derived
+// views when an older coordinator does not implement an additive endpoint.
+func isNotFound(err error) bool {
+	var ae *apiError
+	return errors.As(err, &ae) && (ae.Status == http.StatusNotFound || ae.Status == http.StatusMethodNotAllowed || ae.Status == http.StatusNotImplemented)
 }
 
 func decodeAPIError(status int, body []byte) error {

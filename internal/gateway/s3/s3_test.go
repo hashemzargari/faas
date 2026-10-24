@@ -959,3 +959,256 @@ func TestMultipartTwoPartRoundTrip(t *testing.T) {
 		t.Fatalf("range across part boundary mismatch")
 	}
 }
+
+// TestSuspendedVersioningUsesNull is G-2: writes while versioning is Suspended
+// must use the literal version id "null", replace only the previous null version,
+// retain UUID versions, and expose x-amz-version-id: null on PUT (and DELETE,
+// which creates a null delete marker).
+func TestSuspendedVersioningUsesNull(t *testing.T) {
+	h := newHarness(t)
+	h.mustCreateBucket(t, "sbkt")
+	// Enable versioning and write a UUID-versioned object.
+	if rec := h.do(t, http.MethodPut, "/sbkt?versioning",
+		strings.NewReader(`<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>`), nil); rec.Code != http.StatusOK {
+		t.Fatalf("enable versioning: %d %s", rec.Code, rec.Body.String())
+	}
+	rec := h.do(t, http.MethodPut, "/sbkt/k", strings.NewReader("one"), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put enabled: %d", rec.Code)
+	}
+	uuidVersion := rec.Header().Get("x-amz-version-id")
+	if uuidVersion == "" || uuidVersion == "null" {
+		t.Fatalf("enabled PUT version id = %q", uuidVersion)
+	}
+
+	// Suspend: subsequent writes use the literal null version id.
+	if rec := h.do(t, http.MethodPut, "/sbkt?versioning",
+		strings.NewReader(`<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>`), nil); rec.Code != http.StatusOK {
+		t.Fatalf("suspend versioning: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = h.do(t, http.MethodPut, "/sbkt/k", strings.NewReader("two"), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put suspended: %d", rec.Code)
+	}
+	if got := rec.Header().Get("x-amz-version-id"); got != "null" {
+		t.Fatalf("suspended PUT version header = %q, want null", got)
+	}
+	h.coord.mu.Lock()
+	commit := h.coord.committedVersion
+	h.coord.mu.Unlock()
+	if commit != "null" {
+		t.Fatalf("CommitRequest.VersionID = %q, want null (must be minted before encryption)", commit)
+	}
+
+	// A second suspended write replaces the null version, not the UUID one.
+	rec = h.do(t, http.MethodPut, "/sbkt/k", strings.NewReader("three"), nil)
+	if got := rec.Header().Get("x-amz-version-id"); got != "null" {
+		t.Fatalf("second suspended PUT version header = %q", got)
+	}
+	rec = h.do(t, http.MethodGet, "/sbkt/k?versionId=null", nil, nil)
+	if rec.Code != http.StatusOK || rec.Body.String() != "three" {
+		t.Fatalf("null version read: %d %q", rec.Code, rec.Body.String())
+	}
+	// The earlier UUID version is retained.
+	rec = h.do(t, http.MethodGet, "/sbkt/k?versionId="+uuidVersion, nil, nil)
+	if rec.Code != http.StatusOK || rec.Body.String() != "one" {
+		t.Fatalf("uuid version retained? %d %q", rec.Code, rec.Body.String())
+	}
+
+	// DELETE without versionId creates a null delete marker.
+	rec = h.do(t, http.MethodDelete, "/sbkt/k", nil, nil)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete: %d", rec.Code)
+	}
+	if got := rec.Header().Get("x-amz-version-id"); got != "null" {
+		t.Fatalf("suspended DELETE version header = %q, want null", got)
+	}
+	if got := rec.Header().Get("x-amz-delete-marker"); got != "true" {
+		t.Fatalf("suspended DELETE delete-marker header = %q", got)
+	}
+}
+
+// TestUnversionedBucketHasNoVersionHeader keeps the never-versioned behaviour.
+func TestUnversionedBucketHasNoVersionHeader(t *testing.T) {
+	h := newHarness(t)
+	h.mustCreateBucket(t, "ubkt")
+	rec := h.do(t, http.MethodPut, "/ubkt/k", strings.NewReader("x"), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put: %d", rec.Code)
+	}
+	if got := rec.Header().Get("x-amz-version-id"); got != "" {
+		t.Fatalf("unversioned PUT leaked x-amz-version-id = %q", got)
+	}
+	rec = h.do(t, http.MethodDelete, "/ubkt/k", nil, nil)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete: %d", rec.Code)
+	}
+	if got := rec.Header().Get("x-amz-version-id"); got != "" {
+		t.Fatalf("unversioned DELETE leaked x-amz-version-id = %q", got)
+	}
+}
+
+// TestSuspendedMultipartVersionIsNull covers the multipart path for suspended
+// buckets: the upload is created with version "null" and completion reports it.
+func TestSuspendedMultipartVersionIsNull(t *testing.T) {
+	h := newHarness(t)
+	h.mustCreateBucket(t, "smpbkt")
+	if rec := h.do(t, http.MethodPut, "/smpbkt?versioning",
+		strings.NewReader(`<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>`), nil); rec.Code != http.StatusOK {
+		t.Fatalf("suspend versioning: %d", rec.Code)
+	}
+	rec := h.do(t, http.MethodPost, "/smpbkt/mp.bin?uploads", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("initiate: %d %s", rec.Code, rec.Body.String())
+	}
+	var initDoc struct {
+		UploadID string `xml:"UploadId"`
+	}
+	if err := xml.Unmarshal(rec.Body.Bytes(), &initDoc); err != nil || initDoc.UploadID == "" {
+		t.Fatalf("initiate xml: %v", err)
+	}
+	h.coord.mu.Lock()
+	up := h.coord.uploads[contract.UploadID(initDoc.UploadID)]
+	uploadVersion := up.versionID
+	h.coord.mu.Unlock()
+	if uploadVersion != "null" {
+		t.Fatalf("upload version = %q, want null", uploadVersion)
+	}
+	part := bytes.Repeat([]byte("z"), 5<<20)
+	rec = h.do(t, http.MethodPut, "/smpbkt/mp.bin?partNumber=1&uploadId="+initDoc.UploadID, bytes.NewReader(part), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("part: %d %s", rec.Code, rec.Body.String())
+	}
+	etag := rec.Header().Get("ETag")
+	complete := `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>` + etag + `</ETag></Part></CompleteMultipartUpload>`
+	rec = h.do(t, http.MethodPost, "/smpbkt/mp.bin?uploadId="+initDoc.UploadID, strings.NewReader(complete), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("complete: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("x-amz-version-id"); got != "null" {
+		t.Fatalf("suspended multipart version header = %q, want null", got)
+	}
+}
+
+// TestListObjectVersionsInterleaved is G-3: S3 emits <Version> and
+// <DeleteMarker> elements interleaved in key/version order. The old writer
+// emitted every Version first, then every DeleteMarker.
+func TestListObjectVersionsInterleaved(t *testing.T) {
+	h := newHarness(t)
+	h.mustCreateBucket(t, "vbkt")
+	h.coord.mu.Lock()
+	h.coord.versionsResult = &contract.ListResult{
+		Entries: []contract.ObjectEntry{
+			{Key: "k", VersionID: "v-new", IsLatest: true, Size: 1, ETag: "e1"},
+			{Key: "k", VersionID: "null", IsDeleteMarker: true, IsLatest: false},
+			{Key: "k", VersionID: "v-old", IsLatest: false, Size: 1, ETag: "e2"},
+		},
+		KeyCount: 3,
+	}
+	h.coord.mu.Unlock()
+
+	rec := h.do(t, http.MethodGet, "/vbkt?versions", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list versions: %d %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	idxNew := strings.Index(body, "<VersionId>v-new</VersionId>")
+	idxMarker := strings.Index(body, "<DeleteMarker>")
+	idxOld := strings.Index(body, "<VersionId>v-old</VersionId>")
+	if idxNew < 0 || idxMarker < 0 || idxOld < 0 {
+		t.Fatalf("missing entries:\n%s", body)
+	}
+	if !(idxNew < idxMarker && idxMarker < idxOld) {
+		t.Fatalf("Version/DeleteMarker elements are not interleaved (new=%d marker=%d old=%d):\n%s",
+			idxNew, idxMarker, idxOld, body)
+	}
+	// The DeleteMarker entry carries the null version id.
+	if !strings.Contains(body, "<DeleteMarker><Key>k</Key><VersionId>null</VersionId>") {
+		t.Fatalf("delete marker body:\n%s", body)
+	}
+}
+
+// coordStatusError mimics the coordinator client's typed status error.
+type coordStatusError struct {
+	status  int
+	code    string
+	message string
+}
+
+func (e coordStatusError) Error() string        { return e.code + ": " + e.message }
+func (e coordStatusError) HTTPStatus() int      { return e.status }
+func (e coordStatusError) ErrorCode() string    { return e.code }
+func (e coordStatusError) ErrorMessage() string { return e.message }
+
+// TestCoordinatorBadRequestIsNotA500 is the G-1 end-to-end case: a coordinator
+// 400 (invalid continuation token) used to surface as 500 InternalError.
+func TestCoordinatorBadRequestIsNotA500(t *testing.T) {
+	h := newHarness(t)
+	h.mustCreateBucket(t, "bkt")
+	h.coord.mu.Lock()
+	h.coord.listErr = coordStatusError{
+		status: 400, code: "InvalidRequest", message: "malformed continuation token",
+	}
+	h.coord.mu.Unlock()
+
+	rec := h.do(t, http.MethodGet, "/bkt?list-type=2&continuation-token=not-a-valid-token", nil, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body %s)", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// The coordinator says InvalidRequest; S3 clients expect InvalidArgument for
+	// a malformed parameter. The coordinator's message is preserved.
+	mustContain(t, body, "<Code>InvalidArgument</Code>")
+	mustContain(t, body, "<Message>malformed continuation token</Message>")
+	if strings.Contains(body, "InternalError") {
+		t.Fatalf("leaked InternalError: %s", body)
+	}
+}
+
+// TestListObjectsMaxKeysZero is G-4: max-keys=0 is an explicit empty page, not
+// "use the coordinator default". The client must forward 0 verbatim.
+func TestListObjectsMaxKeysZero(t *testing.T) {
+	h := newHarness(t)
+	h.mustCreateBucket(t, "mkbkt")
+	for _, k := range []string{"a", "b", "c"} {
+		if rec := h.do(t, http.MethodPut, "/mkbkt/"+k, strings.NewReader("x"), nil); rec.Code != http.StatusOK {
+			t.Fatalf("put %s: %d", k, rec.Code)
+		}
+	}
+	rec := h.do(t, http.MethodGet, "/mkbkt?list-type=2&max-keys=0", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("v2 max-keys=0: %d %s", rec.Code, rec.Body.String())
+	}
+	var v2 struct {
+		KeyCount    int `xml:"KeyCount"`
+		MaxKeys     int `xml:"MaxKeys"`
+		IsTruncated bool
+		Contents    []struct {
+			Key string
+		} `xml:"Contents"`
+	}
+	if err := xml.Unmarshal(rec.Body.Bytes(), &v2); err != nil {
+		t.Fatal(err)
+	}
+	if v2.KeyCount != 0 || len(v2.Contents) != 0 || v2.IsTruncated || v2.MaxKeys != 0 {
+		t.Fatalf("v2 max-keys=0 = %+v", v2)
+	}
+
+	rec = h.do(t, http.MethodGet, "/mkbkt?max-keys=0", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("v1 max-keys=0: %d", rec.Code)
+	}
+	var v1 struct {
+		MaxKeys     int  `xml:"MaxKeys"`
+		IsTruncated bool `xml:"IsTruncated"`
+		Contents    []struct {
+			Key string
+		} `xml:"Contents"`
+	}
+	if err := xml.Unmarshal(rec.Body.Bytes(), &v1); err != nil {
+		t.Fatal(err)
+	}
+	if len(v1.Contents) != 0 || v1.IsTruncated || v1.MaxKeys != 0 {
+		t.Fatalf("v1 max-keys=0 = %+v", v1)
+	}
+}

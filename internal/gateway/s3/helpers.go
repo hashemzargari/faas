@@ -77,6 +77,41 @@ func versionFromQuery(r *http.Request) contract.VersionID {
 // generator keeps the format consistent.
 func (s *Server) newUUID() string { return contract.NewUUID() }
 
+// nullVersionID is the literal version id S3 uses for writes made while bucket
+// versioning is Suspended (docs/05 §5.1). It must be lowercase.
+const nullVersionID = contract.VersionID("null")
+
+// mintVersionID returns the version id to store for a write, and whether it is
+// client-visible (x-amz-version-id). Enabled → UUIDv4; Suspended → the literal
+// "null"; never-versioned → a UUID that is not exposed (still needed because the
+// chunk AAD binds a version id).
+func (s *Server) mintVersionID(b contract.BucketConfig) (contract.VersionID, bool) {
+	switch b.Versioning {
+	case "Enabled":
+		return contract.VersionID(s.newUUID()), true
+	case "Suspended":
+		return nullVersionID, true
+	default:
+		return contract.VersionID(s.newUUID()), false
+	}
+}
+
+// versionHeader sets x-amz-version-id when the bucket's versioning state makes
+// the version id visible. For a suspended bucket that is the literal "null".
+func versionHeader(h http.Header, b contract.BucketConfig, versionID contract.VersionID) {
+	if b.Versioning != "Enabled" && b.Versioning != "Suspended" {
+		return
+	}
+	if versionID == "" {
+		if b.Versioning == "Suspended" {
+			versionID = nullVersionID
+		} else {
+			return
+		}
+	}
+	h.Set("x-amz-version-id", string(versionID))
+}
+
 // regionFor returns the region to report for a bucket.
 func (s *Server) regionFor(b contract.BucketConfig) string {
 	if b.Region != "" {

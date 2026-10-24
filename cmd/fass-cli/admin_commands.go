@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -340,15 +341,17 @@ func runRepair(ctx context.Context, g *globalOpts, args []string, stdout, stderr
 		return err
 	}
 
-	// Forward compatibility: if the coordinator ever exposes a repair queue
-	// endpoint, use it verbatim. Today it does not (docs/08-operations.md).
-	if raw, gerr := client.getRaw(ctx, "/v1/repair/status"); gerr == nil && raw != "" {
-		if g.jsonOut {
-			fmt.Fprintln(stdout, strings.TrimSpace(raw))
-			return nil
+	// Prefer the coordinator's repair-queue endpoint when it exists. An older
+	// coordinator answers 404 and we fall back to the topology-derived view, so
+	// the command never breaks against a mixed-version deployment.
+	if raw, gerr := client.getRaw(ctx, "/v1/repair/status"); gerr == nil {
+		status, derr := parseRepairStatus(raw)
+		if derr != nil {
+			return servicef(derr, "decode coordinator /v1/repair/status")
 		}
-		fmt.Fprintln(stdout, strings.TrimSpace(raw))
-		return nil
+		return printRepairStatus(stdout, g, status)
+	} else if !isNotFound(gerr) {
+		return gerr
 	}
 
 	snap, err := client.topology(ctx)
@@ -425,6 +428,109 @@ func runRepair(ctx context.Context, g *globalOpts, args []string, stdout, stderr
 // ---------------------------------------------------------------------------
 // gc status
 // ---------------------------------------------------------------------------
+
+// repairStatusKeys is the documented shape of GET /v1/repair/status, in display
+// order. Unknown keys from a newer coordinator are appended after these.
+var repairStatusKeys = []string{
+	"pending", "running", "failed", "oldest_pending_age",
+	"bytes_repaired_last_24h", "throttled",
+}
+
+// parseRepairStatus decodes the coordinator response into a generic map so an
+// additive field from a newer coordinator is still shown, not dropped.
+func parseRepairStatus(raw string) (map[string]any, error) {
+	var status map[string]any
+	if err := json.Unmarshal([]byte(raw), &status); err != nil {
+		return nil, err
+	}
+	if status == nil {
+		return nil, fmt.Errorf("empty body")
+	}
+	return status, nil
+}
+
+func printRepairStatus(w io.Writer, g *globalOpts, status map[string]any) error {
+	if g.jsonOut {
+		return writeJSON(w, status)
+	}
+	t := newTable("METRIC", "VALUE")
+	shown := map[string]bool{}
+	for _, key := range repairStatusKeys {
+		v, ok := status[key]
+		if !ok {
+			continue
+		}
+		t.add(key, formatRepairValue(key, v))
+		shown[key] = true
+	}
+	var extra []string
+	for key := range status {
+		if !shown[key] {
+			extra = append(extra, key)
+		}
+	}
+	sortStrings(extra)
+	for _, key := range extra {
+		t.add(key, formatRepairValue(key, status[key]))
+	}
+	fmt.Fprintln(w, "source: coordinator /v1/repair/status")
+	t.render(w)
+	return nil
+}
+
+// formatRepairValue renders the documented fields humanly: bytes as MiB/GiB,
+// age as a duration, throttled as yes/no.
+func formatRepairValue(key string, v any) string {
+	switch key {
+	case "bytes_repaired_last_24h":
+		switch n := v.(type) {
+		case float64:
+			return humanBytes(int64(n))
+		case json.Number:
+			if i, err := n.Int64(); err == nil {
+				return humanBytes(i)
+			}
+		}
+	case "oldest_pending_age":
+		switch age := v.(type) {
+		case string:
+			if d, err := time.ParseDuration(age); err == nil {
+				return d.String()
+			}
+			return age
+		case float64:
+			// Go marshals time.Duration as integer nanoseconds; small integers
+			// are treated as seconds for hand-written fixtures.
+			if age >= float64(time.Millisecond) {
+				return time.Duration(int64(age)).Round(time.Second).String()
+			}
+			return fmt.Sprintf("%.0fs", age)
+		case json.Number:
+			if i, err := age.Int64(); err == nil {
+				if i >= int64(time.Millisecond) {
+					return time.Duration(i).Round(time.Second).String()
+				}
+				return fmt.Sprintf("%ds", i)
+			}
+		}
+	case "throttled":
+		if b, ok := v.(bool); ok {
+			if b {
+				return "yes"
+			}
+			return "no"
+		}
+	}
+	return fmt.Sprint(v)
+}
+
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
+}
 
 func runGC(ctx context.Context, g *globalOpts, args []string, stdout, stderr io.Writer) error {
 	pos, err := parseCommandFlags(g, "gc", args, stderr, func(fs *flag.FlagSet) {})

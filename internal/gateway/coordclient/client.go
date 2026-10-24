@@ -69,6 +69,13 @@ func (e *APIError) Error() string {
 // HTTPStatus exposes the status so the S3 edge can preserve 405/409 semantics.
 func (e *APIError) HTTPStatus() int { return e.Status }
 
+// ErrorCode exposes the coordinator's own error code so the S3 edge can surface
+// typed validation errors (e.g. InvalidRequest) instead of a generic 500.
+func (e *APIError) ErrorCode() string { return e.Code }
+
+// ErrorMessage exposes the coordinator's message for the same reason.
+func (e *APIError) ErrorMessage() string { return e.Message }
+
 // Is maps coordinator error codes onto the shared sentinels.
 func (e *APIError) Is(target error) bool {
 	switch target {
@@ -432,9 +439,10 @@ func (c *Client) ListObjects(ctx context.Context, req contract.ListRequest) (con
 	if req.Delimiter != "" {
 		q.Set("delimiter", req.Delimiter)
 	}
-	if req.MaxKeys > 0 {
-		q.Set("max_keys", strconv.Itoa(req.MaxKeys))
-	}
+	// Always send the value verbatim: the S3 handler applies the default when the
+	// client omits max-keys, so 0 here means an explicit empty page. The
+	// coordinator treats negative as unset.
+	q.Set("max_keys", strconv.Itoa(req.MaxKeys))
 	if req.StartAfter != "" {
 		q.Set("start_after", req.StartAfter)
 	}

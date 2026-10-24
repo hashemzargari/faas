@@ -154,7 +154,7 @@ func TestCommitGetListDelete(t *testing.T) {
 	}
 
 	// Flat listing is key-ordered.
-	res, err := m.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID})
+	res, err := m.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID, MaxKeys: meta.DefaultMaxKeys})
 	if err != nil {
 		t.Fatalf("ListObjects: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestCommitGetListDelete(t *testing.T) {
 	}
 
 	// Prefix listing.
-	res, err = m.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID, Prefix: "docs/"})
+	res, err = m.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID, Prefix: "docs/", MaxKeys: meta.DefaultMaxKeys})
 	if err != nil {
 		t.Fatalf("ListObjects prefix: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestCommitGetListDelete(t *testing.T) {
 	}
 
 	// Delimiter grouping: two common prefixes, no objects.
-	res, err = m.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID, Delimiter: "/"})
+	res, err = m.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID, Delimiter: "/", MaxKeys: meta.DefaultMaxKeys})
 	if err != nil {
 		t.Fatalf("ListObjects delimiter: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestCommitGetListDelete(t *testing.T) {
 	if _, _, err := m.DeleteObject(ctx, bucket.Name, "docs/a.txt", "", false); err != nil {
 		t.Fatalf("idempotent delete: %v", err)
 	}
-	res, err = m.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID})
+	res, err = m.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID, MaxKeys: meta.DefaultMaxKeys})
 	if err != nil {
 		t.Fatalf("ListObjects after delete: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestVersioningLifecycle(t *testing.T) {
 	v2req.ETag = "etag-v2"
 	v2 := mustCommit(t, m, v2req)
 
-	res, err := m.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID, Versions: true})
+	res, err := m.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID, Versions: true, MaxKeys: meta.DefaultMaxKeys})
 	if err != nil {
 		t.Fatalf("versions listing: %v", err)
 	}
@@ -943,5 +943,150 @@ func TestUpdateBucketPreservesCreatedAt(t *testing.T) {
 	}
 	if !after.CreatedAt.Equal(got.CreatedAt) || after.Versioning != "Enabled" {
 		t.Fatalf("update = %+v, want CreatedAt %v preserved", after, got.CreatedAt)
+	}
+}
+
+// TestSuspendedVersioningNullVersionCoordinates covers the coordinator half of
+// S3's suspended-versioning semantics (the gateway mints the literal "null"
+// version id): a suspended write replaces only the null version and retains all
+// non-null versions; a suspended delete creates (or removes) a null delete marker
+// without touching retained versions.
+func TestSuspendedVersioningNullVersionCoordinates(t *testing.T) {
+	ctx := context.Background()
+	m := newMeta(t)
+	bucket := newBucket(t, m, "Enabled")
+
+	v1 := commitVersion(t, m, bucket, "s", "v1", makeChunks(t, 1))
+	v2 := commitVersion(t, m, bucket, "s", "v2", makeChunks(t, 1))
+
+	cfg, err := m.GetBucket(ctx, bucket.Name)
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	cfg.Versioning = "Suspended"
+	if err := m.UpdateBucket(ctx, cfg); err != nil {
+		t.Fatalf("suspend versioning: %v", err)
+	}
+
+	suspended := func(etag string) contract.CommitResult {
+		t.Helper()
+		req := commitReq(bucket, "s", chunkSize, makeChunks(t, 1))
+		req.VersionID = contract.VersionID("null")
+		req.ETag = etag
+		res, err := m.CommitObject(ctx, req)
+		if err != nil {
+			t.Fatalf("suspended commit %s: %v", etag, err)
+		}
+		return res
+	}
+	first := suspended("null-1")
+	if first.VersionID != "null" {
+		t.Fatalf("suspended commit version id = %q, want null", first.VersionID)
+	}
+	// A second suspended write replaces the null version.
+	second := suspended("null-2")
+	_ = second
+
+	manifest, err := m.GetManifest(ctx, bucket.Name, "s", "")
+	if err != nil {
+		t.Fatalf("GetManifest latest: %v", err)
+	}
+	if manifest.ETag != "null-2" {
+		t.Fatalf("latest etag = %q, want null-2", manifest.ETag)
+	}
+	versions, err := m.ListVersions(ctx, bucket.BucketID)
+	if err != nil {
+		t.Fatalf("ListVersions: %v", err)
+	}
+	if len(versions) != 3 {
+		t.Fatalf("live versions = %d, want 3 (v1, v2, null): %+v", len(versions), versions)
+	}
+	seen := map[contract.VersionID]bool{}
+	for _, v := range versions {
+		seen[v.VersionID] = true
+	}
+	if !seen[v1.VersionID] || !seen[v2.VersionID] || !seen["null"] {
+		t.Fatalf("retained versions = %v, want %s, %s and null", seen, v1.VersionID, v2.VersionID)
+	}
+	// The replaced null version is tombstoned: only one null row stays live.
+	nullLive := 0
+	for _, v := range versions {
+		if v.VersionID == "null" {
+			nullLive++
+		}
+	}
+	if nullLive != 1 {
+		t.Fatalf("live null versions = %d, want 1", nullLive)
+	}
+	// Retained non-null versions remain readable.
+	for _, vid := range []contract.VersionID{v1.VersionID, v2.VersionID} {
+		if _, err := m.GetManifest(ctx, bucket.Name, "s", vid); err != nil {
+			t.Fatalf("GetManifest retained version %s: %v", vid, err)
+		}
+	}
+
+	// Suspended DELETE creates a null delete marker; the object disappears but the
+	// retained versions survive.
+	if _, marker, err := m.DeleteObject(ctx, bucket.Name, "s", "", false); err != nil || !marker {
+		t.Fatalf("suspended delete = marker %v, err %v", marker, err)
+	}
+	// The latest entry is now a delete marker; a data-path GET reports 405 (the
+	// gateway maps it to NoSuchKey/delete-marker semantics).
+	if _, err := m.GetManifest(ctx, bucket.Name, "s", ""); !errors.Is(err, coerr.ErrMethodNotAllowed) {
+		t.Fatalf("GET after suspended delete = %v, want MethodNotAllowed (delete marker)", err)
+	}
+	versions, _ = m.ListVersions(ctx, bucket.BucketID)
+	markers, live := 0, 0
+	for _, v := range versions {
+		if v.IsDeleteMarker {
+			markers++
+			if v.VersionID != "null" {
+				t.Fatalf("suspended delete marker version id = %q, want null", v.VersionID)
+			}
+			continue
+		}
+		live++
+	}
+	if markers != 1 || live != 2 {
+		t.Fatalf("after suspended delete: %d markers, %d live versions (want 1/2): %+v", markers, live, versions)
+	}
+
+	// Deleting again removes the null marker and restores the newest retained
+	// version as latest.
+	if _, marker, err := m.DeleteObject(ctx, bucket.Name, "s", "", false); err != nil || !marker {
+		t.Fatalf("second suspended delete = marker %v, err %v", marker, err)
+	}
+	manifest, err = m.GetManifest(ctx, bucket.Name, "s", "")
+	if err != nil {
+		t.Fatalf("GetManifest after marker removal: %v", err)
+	}
+	if manifest.VersionID != v2.VersionID {
+		t.Fatalf("latest after marker removal = %s, want %s", manifest.VersionID, v2.VersionID)
+	}
+
+	// "null" is rejected outside a suspended bucket.
+	enabled := newBucket(t, m, "Enabled")
+	bad := commitReq(enabled, "x", chunkSize, makeChunks(t, 1))
+	bad.VersionID = contract.VersionID("null")
+	if _, err := m.CommitObject(ctx, bad); err == nil {
+		t.Fatalf("expected the literal null version id to be rejected on an enabled bucket")
+	}
+}
+
+// TestMaxKeysZeroReturnsEmptyPage: 0 is an explicit "return nothing" request, not
+// "use the default".
+func TestMaxKeysZeroReturnsEmptyPage(t *testing.T) {
+	ctx := context.Background()
+	m := newMeta(t)
+	bucket := newBucket(t, m, "")
+	for _, key := range []string{"a", "b"} {
+		mustCommit(t, m, commitReq(bucket, key, chunkSize, makeChunks(t, 1)))
+	}
+	res, err := m.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID, MaxKeys: 0})
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if len(res.Entries) != 0 || res.KeyCount != 0 || res.IsTruncated || res.NextContinuationToken != "" {
+		t.Fatalf("max-keys=0 = %+v, want empty non-truncated page", res)
 	}
 }

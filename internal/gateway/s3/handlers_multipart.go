@@ -121,10 +121,12 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 		s.fail(w, r, err)
 		return
 	}
+	// The version id is minted here so every part can bind it in its chunk AAD
+	// and CompleteUpload can promote it into the manifest. Suspended versioning
+	// uses the literal "null" (docs/05 §5.1).
+	versionID, _ := s.mintVersionID(b)
 	uploadMeta := contract.CommitRequest{
-		// The version id is minted here so every part can bind it in its chunk
-		// AAD and CompleteUpload can promote it into the manifest.
-		VersionID:    contract.VersionID(s.newUUID()),
+		VersionID:    versionID,
 		BucketID:     b.BucketID,
 		Key:          t.Key,
 		ChunkSize:    s.cfg.ChunkSize,
@@ -422,9 +424,7 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 		scheme = "https"
 	}
 	location := fmt.Sprintf("%s://%s/%s/%s", scheme, r.Host, t.Bucket, t.Key)
-	if b.Versioning == "Enabled" {
-		w.Header().Set("x-amz-version-id", string(res.VersionID))
-	}
+	versionHeader(w.Header(), b, res.VersionID)
 	writeXML(w, http.StatusOK, completeMultipartUploadResult{
 		Location: location,
 		Bucket:   b.Name,
@@ -493,6 +493,19 @@ func (s *Server) handleListParts(w http.ResponseWriter, r *http.Request, t targe
 	marker, _ := strconv.Atoi(r.URL.Query().Get("part-number-marker"))
 	sort.Slice(parts, func(i, j int) bool { return parts[i].PartNumber < parts[j].PartNumber })
 
+	if maxParts == 0 {
+		// S3: max-parts=0 is an empty page, never an index-out-of-range.
+		writeXML(w, http.StatusOK, listPartsResult{
+			Bucket:           b.Name,
+			Key:              t.Key,
+			UploadID:         string(uploadID),
+			PartNumberMarker: marker,
+			MaxParts:         0,
+			IsTruncated:      false,
+		})
+		return
+	}
+
 	res := listPartsResult{
 		Bucket:           b.Name,
 		Key:              t.Key,
@@ -554,6 +567,18 @@ func (s *Server) handleListMultipartUploads(w http.ResponseWriter, r *http.Reque
 		return uploads[i].UploadID < uploads[j].UploadID
 	})
 
+	if maxUploads == 0 {
+		writeXML(w, http.StatusOK, listMultipartUploadsResult{
+			Bucket:         b.Name,
+			KeyMarker:      encodeKey(keyMarker, encodingType),
+			UploadIDMarker: uploadIDMarker,
+			Prefix:         encodeKey(prefix, encodingType),
+			Delimiter:      encodeKey(delimiter, encodingType),
+			MaxUploads:     0,
+			IsTruncated:    false,
+		})
+		return
+	}
 	res := listMultipartUploadsResult{
 		Bucket:         b.Name,
 		KeyMarker:      encodeKey(keyMarker, encodingType),

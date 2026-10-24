@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"encoding/xml"
 	"flag"
 	"fmt"
@@ -12,6 +14,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -46,33 +50,7 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.URL.Query().Get("list-type") == "2" || r.URL.Query().Has("prefix") {
-			bucket := strings.TrimPrefix(path, "/")
-			prefix := r.URL.Query().Get("prefix")
-			w.Header().Set("Content-Type", "application/xml")
-			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><IsTruncated>false</IsTruncated>`)
-			var keys []string
-			for k := range f.objects {
-				if strings.HasPrefix(k, "/"+bucket+"/") {
-					keys = append(keys, strings.TrimPrefix(k, "/"+bucket+"/"))
-				}
-			}
-			// deterministic order
-			for i := 0; i < len(keys); i++ {
-				for j := i + 1; j < len(keys); j++ {
-					if keys[j] < keys[i] {
-						keys[i], keys[j] = keys[j], keys[i]
-					}
-				}
-			}
-			for _, k := range keys {
-				if !strings.HasPrefix(k, prefix) {
-					continue
-				}
-				data := f.objects["/"+bucket+"/"+k]
-				fmt.Fprintf(w, `<Contents><Key>%s</Key><Size>%d</Size><ETag>"%s"</ETag><LastModified>2026-01-02T03:04:05Z</LastModified></Contents>`,
-					xmlEscape(k), len(data), f.etagFor(k, data))
-			}
-			fmt.Fprint(w, `</ListBucketResult>`)
+			f.list(w, r)
 			return
 		}
 		data, ok := f.objects[path]
@@ -106,8 +84,10 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	case http.MethodDelete:
 		name := strings.TrimPrefix(path, "/")
-		if _, ok := f.objects[path]; ok {
+		if strings.Contains(name, "/") {
+			// Object deletes are idempotent in S3: 204 whether or not it existed.
 			delete(f.objects, path)
+			delete(f.etags, path)
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -120,6 +100,64 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+// list implements real ListObjectsV2 pagination: sorted keys, max-keys, and a
+// continuation token that is a key marker (the same semantics the coordinator
+// uses: resume strictly after the last emitted key, even if it was deleted).
+func (f *fakeS3) list(w http.ResponseWriter, r *http.Request) {
+	bucket := strings.TrimPrefix(r.URL.Path, "/")
+	prefix := r.URL.Query().Get("prefix")
+	token := r.URL.Query().Get("continuation-token")
+	maxKeys := 1000
+	if raw := r.URL.Query().Get("max-keys"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n < maxKeys {
+			maxKeys = n
+		}
+	}
+	after := ""
+	if token != "" {
+		decoded, err := base64.StdEncoding.DecodeString(token)
+		if err != nil {
+			writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "bad continuation token")
+			return
+		}
+		after = string(decoded)
+	}
+	var keys []string
+	for k := range f.objects {
+		if strings.HasPrefix(k, "/"+bucket+"/") {
+			key := strings.TrimPrefix(k, "/"+bucket+"/")
+			if strings.HasPrefix(key, prefix) && key > after {
+				keys = append(keys, key)
+			}
+		}
+	}
+	sort.Strings(keys)
+	truncated := false
+	if len(keys) > maxKeys {
+		keys = keys[:maxKeys]
+		truncated = true
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult>`)
+	fmt.Fprintf(w, `<IsTruncated>%t</IsTruncated>`, truncated)
+	if truncated && len(keys) > 0 {
+		next := base64.StdEncoding.EncodeToString([]byte(keys[len(keys)-1]))
+		fmt.Fprintf(w, `<NextContinuationToken>%s</NextContinuationToken>`, next)
+	}
+	for _, k := range keys {
+		data := f.objects["/"+bucket+"/"+k]
+		fmt.Fprintf(w, `<Contents><Key>%s</Key><Size>%d</Size><ETag>"%s"</ETag><LastModified>2026-01-02T03:04:05Z</LastModified></Contents>`,
+			xmlEscape(k), len(data), f.etagFor(k, data))
+	}
+	fmt.Fprint(w, `</ListBucketResult>`)
+}
+
+func (f *fakeS3) putObject(bucket, key string, data []byte) {
+	path := "/" + bucket + "/" + key
+	f.objects[path] = data
+	f.etags[path] = fmt.Sprintf("%x", sha256.Sum256(data))[:16]
 }
 
 func (f *fakeS3) etagFor(key string, data []byte) string {
@@ -274,6 +312,98 @@ func TestRunCPRequiresRecursiveForDirectory(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "recursive") {
 		t.Fatalf("error should mention --recursive: %q", stderr)
+	}
+}
+
+func TestLSPaginatesToCompletion(t *testing.T) {
+	fake := newFakeS3()
+	for i := 0; i < 2500; i++ {
+		fake.putObject("dev-bucket", fmt.Sprintf("bulk/object-%04d.bin", i), []byte("x"))
+	}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	cliEnv(t, srv.URL)
+
+	out, stderr, code := runCLI(t, "ls", "--json", "s3://dev-bucket/bulk/")
+	if code != 0 {
+		t.Fatalf("ls exit %d: %s", code, stderr)
+	}
+	var objs []objectJSON
+	if err := json.Unmarshal([]byte(out), &objs); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(objs) != 2500 {
+		t.Fatalf("ls returned %d objects, want 2500 (pagination missing?)", len(objs))
+	}
+	if stderr != "" {
+		t.Fatalf("pagination should not warn any more, stderr = %q", stderr)
+	}
+
+	// Human output must also contain every key.
+	human, _, code := runCLI(t, "ls", "s3://dev-bucket/bulk/")
+	if code != 0 {
+		t.Fatalf("human ls exit %d", code)
+	}
+	if n := strings.Count(human, "bulk/object-"); n != 2500 {
+		t.Fatalf("human table has %d keys, want 2500", n)
+	}
+}
+
+func TestRecursiveDownloadPaginates(t *testing.T) {
+	fake := newFakeS3()
+	for i := 0; i < 2500; i++ {
+		fake.putObject("dev-bucket", fmt.Sprintf("bulk/object-%04d.bin", i), []byte{byte(i)})
+	}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	cliEnv(t, srv.URL)
+
+	dst := filepath.Join(t.TempDir(), "restore")
+	if _, stderr, code := runCLI(t, "cp", "-r", "--quiet", "s3://dev-bucket/bulk/", dst); code != 0 {
+		t.Fatalf("recursive download exit %d: %s", code, stderr)
+	}
+	count := 0
+	err := filepath.WalkDir(dst, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			count++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2500 {
+		t.Fatalf("downloaded %d files, want 2500 (recursive cp stopped at a page boundary)", count)
+	}
+}
+
+func TestRecursiveRMPaginates(t *testing.T) {
+	fake := newFakeS3()
+	for i := 0; i < 2500; i++ {
+		fake.putObject("dev-bucket", fmt.Sprintf("bulk/object-%04d.bin", i), []byte("x"))
+	}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	cliEnv(t, srv.URL)
+
+	out, stderr, code := runCLI(t, "rm", "-r", "--json", "s3://dev-bucket/bulk/")
+	if code != 0 {
+		t.Fatalf("rm -r exit %d: %s", code, stderr)
+	}
+	var deleted []string
+	if err := json.Unmarshal([]byte(out), &deleted); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(deleted) != 2500 {
+		t.Fatalf("rm -r deleted %d keys, want 2500", len(deleted))
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.objects) != 0 {
+		t.Fatalf("%d objects remain after rm -r", len(fake.objects))
 	}
 }
 

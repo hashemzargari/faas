@@ -13,10 +13,36 @@ import (
 	"github.com/fass-storage/fass/pkg/sdk"
 )
 
-// maxListPage is the S3 listing page size. pkg/sdk currently returns one page
-// and its truncated flag; recursive operations therefore operate on the first
-// page and warn when more keys exist (documented in docs/08-operations.md).
+// maxListPage is the S3 listing page size. Listings always page to completion
+// (S3 caps a page at 1000 keys); recursive operations must never silently stop
+// at a page boundary, because a partial migration is worse than a failure.
 const maxListPage = 1000
+
+// forEachObject streams every object under prefix, page by page. It is the only
+// listing primitive used by recursive cp/rm/ls so no call site can accidentally
+// operate on just the first page.
+func forEachObject(ctx context.Context, client *sdk.Client, bucket, prefix string, fn func(sdk.Object) error) error {
+	token := ""
+	for {
+		objs, next, truncated, err := client.ListObjectsV2Page(ctx, bucket, prefix, token, maxListPage)
+		if err != nil {
+			return sdkError("list s3://"+bucket+"/"+prefix, err)
+		}
+		for _, o := range objs {
+			if err := fn(o); err != nil {
+				return err
+			}
+		}
+		if !truncated || next == "" {
+			return nil
+		}
+		if next == token {
+			// Defensive: a gateway returning the same token would loop forever.
+			return servicef(nil, "list s3://%s/%s: continuation token did not advance", bucket, prefix)
+		}
+		token = next
+	}
+}
 
 // statPath is os.Stat behind a function variable so tests can simulate paths.
 var statPath = os.Stat
@@ -70,12 +96,12 @@ func runLS(ctx context.Context, g *globalOpts, args []string, stdout io.Writer) 
 	if err != nil {
 		return err
 	}
-	objs, truncated, err := client.ListObjectsV2(ctx, ref.Bucket, ref.Key, maxListPage)
-	if err != nil {
-		return sdkError("list s3://"+ref.Bucket, err)
-	}
-	if truncated {
-		fmt.Fprintf(os.Stderr, "fass: warning: listing truncated at %d objects (the SDK page limit); narrow the prefix\n", maxListPage)
+	var objs []sdk.Object
+	if err := forEachObject(ctx, client, ref.Bucket, ref.Key, func(o sdk.Object) error {
+		objs = append(objs, o)
+		return nil
+	}); err != nil {
+		return err
 	}
 	if g.jsonOut {
 		out := make([]objectJSON, 0, len(objs))
@@ -257,18 +283,8 @@ func uploadFile(ctx context.Context, g *globalOpts, client *sdk.Client, path, bu
 // downloadPath copies an S3 object or prefix to the local filesystem.
 func downloadPath(ctx context.Context, g *globalOpts, client *sdk.Client, src s3URL, dst string, recursive bool, stdout, stderr io.Writer) ([]transfer, error) {
 	if recursive {
-		objs, truncated, err := client.ListObjectsV2(ctx, src.Bucket, src.Key, maxListPage)
-		if err != nil {
-			return nil, sdkError("list "+src.String(), err)
-		}
-		if truncated {
-			fmt.Fprintf(stderr, "fass: warning: listing truncated at %d objects (the SDK page limit); narrow the prefix\n", maxListPage)
-		}
-		if len(objs) == 0 {
-			return nil, nil
-		}
-		out := make([]transfer, 0, len(objs))
-		for _, o := range objs {
+		var out []transfer
+		err := forEachObject(ctx, client, src.Bucket, src.Key, func(o sdk.Object) error {
 			rel := strings.TrimPrefix(o.Key, src.Key)
 			rel = strings.TrimPrefix(rel, "/")
 			if rel == "" {
@@ -276,15 +292,19 @@ func downloadPath(ctx context.Context, g *globalOpts, client *sdk.Client, src s3
 			}
 			target, err := safeJoin(dst, rel)
 			if err != nil {
-				return out, err
+				return err
 			}
 			t, err := downloadFile(ctx, client, src.Bucket, o.Key, target, o.Size)
 			if err != nil {
 				fmt.Fprintf(stderr, "fass: download s3://%s/%s: %v\n", src.Bucket, o.Key, err)
-				return out, err
+				return err
 			}
 			out = append(out, t)
 			printTransfer(stdout, g, "download", t)
+			return nil
+		})
+		if err != nil {
+			return out, err
 		}
 		return out, nil
 	}
@@ -362,38 +382,32 @@ func serverSideCopy(ctx context.Context, g *globalOpts, client *sdk.Client, src,
 		return []transfer{t}, nil
 	}
 
-	objs, truncated, err := client.ListObjectsV2(ctx, src.Bucket, src.Key, maxListPage)
-	if err != nil {
-		return nil, sdkError("list "+src.String(), err)
-	}
-	if truncated {
-		fmt.Fprintf(stderr, "fass: warning: listing truncated at %d objects (the SDK page limit); narrow the prefix\n", maxListPage)
-	}
 	prefix := dst.Key
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-	out := make([]transfer, 0, len(objs))
-	for _, o := range objs {
+	var out []transfer
+	err := forEachObject(ctx, client, src.Bucket, src.Key, func(o sdk.Object) error {
 		rel := strings.TrimPrefix(o.Key, src.Key)
 		rel = strings.TrimPrefix(rel, "/")
 		key := prefixJoin(prefix, rel)
 		body, err := client.GetObject(ctx, src.Bucket, o.Key)
 		if err != nil {
 			fmt.Fprintf(stderr, "fass: copy s3://%s/%s: %v\n", src.Bucket, o.Key, err)
-			return out, sdkError("copy s3://"+src.Bucket+"/"+o.Key, err)
+			return sdkError("copy s3://"+src.Bucket+"/"+o.Key, err)
 		}
 		etag, perr := client.PutObject(ctx, dst.Bucket, key, body, o.Size, "application/octet-stream")
 		body.Close()
 		if perr != nil {
 			fmt.Fprintf(stderr, "fass: copy s3://%s/%s: %v\n", src.Bucket, o.Key, perr)
-			return out, sdkError("copy to s3://"+dst.Bucket+"/"+key, perr)
+			return sdkError("copy to s3://"+dst.Bucket+"/"+key, perr)
 		}
 		t := transfer{source: s3URL{src.Bucket, o.Key}.String(), dest: s3URL{dst.Bucket, key}.String(), size: o.Size, etag: etag}
 		out = append(out, t)
 		printTransfer(stdout, g, "copy", t)
-	}
-	return out, nil
+		return nil
+	})
+	return out, err
 }
 
 func printTransfer(w io.Writer, g *globalOpts, verb string, t transfer) {
@@ -446,14 +460,7 @@ func runRM(ctx context.Context, g *globalOpts, args []string, recursive bool, st
 			fmt.Fprintf(stdout, "deleted %s\n", ref.String())
 		}
 	} else {
-		objs, truncated, err := client.ListObjectsV2(ctx, ref.Bucket, ref.Key, maxListPage)
-		if err != nil {
-			return sdkError("list "+ref.String(), err)
-		}
-		if truncated {
-			fmt.Fprintf(os.Stderr, "fass: warning: listing truncated at %d objects (the SDK page limit); narrow the prefix\n", maxListPage)
-		}
-		for _, o := range objs {
+		err := forEachObject(ctx, client, ref.Bucket, ref.Key, func(o sdk.Object) error {
 			if err := client.DeleteObject(ctx, ref.Bucket, o.Key); err != nil {
 				fmt.Fprintf(os.Stderr, "fass: delete s3://%s/%s: %v\n", ref.Bucket, o.Key, err)
 				return sdkError("delete s3://"+ref.Bucket+"/"+o.Key, err)
@@ -462,8 +469,12 @@ func runRM(ctx context.Context, g *globalOpts, args []string, recursive bool, st
 			if !g.quiet && !g.jsonOut {
 				fmt.Fprintf(stdout, "deleted s3://%s/%s\n", ref.Bucket, o.Key)
 			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
-		if len(objs) == 0 && !g.quiet && !g.jsonOut {
+		if len(deleted) == 0 && !g.quiet && !g.jsonOut {
 			fmt.Fprintln(stdout, "no objects matched")
 		}
 	}

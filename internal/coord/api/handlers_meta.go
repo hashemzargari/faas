@@ -10,6 +10,7 @@ import (
 	"github.com/fass-storage/fass/internal/contract"
 	"github.com/fass-storage/fass/internal/coord/coerr"
 	"github.com/fass-storage/fass/internal/coord/id"
+	"github.com/fass-storage/fass/internal/coord/meta"
 )
 
 // ---------------------------------------------------------------------------
@@ -357,7 +358,7 @@ func (s *Server) handleListObjects(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, coerr.Invalidf("bucket or bucket_id is required"))
 		return
 	}
-	maxKeys, err := intQuery(r, "max_keys", 0)
+	maxKeys, err := intQuery(r, "max_keys", meta.DefaultMaxKeys)
 	if err != nil {
 		writeError(w, r, err)
 		return

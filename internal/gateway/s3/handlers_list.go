@@ -52,6 +52,20 @@ func (s *Server) handleListObjects(w http.ResponseWriter, r *http.Request, t tar
 		return
 	}
 	marker := r.URL.Query().Get("marker")
+	if maxKeys == 0 {
+		// S3: max-keys=0 is a valid empty page, not "use the default". The
+		// coordinator treats 0 as "default", so answer here.
+		writeXML(w, http.StatusOK, listObjectsV1Result{
+			Name:         b.Name,
+			Prefix:       encodeKey(prefix, encodingType),
+			Marker:       encodeKey(marker, encodingType),
+			MaxKeys:      0,
+			Delimiter:    encodeKey(delimiter, encodingType),
+			IsTruncated:  false,
+			EncodingType: encodingType,
+		})
+		return
+	}
 	result, err := s.coord.ListObjects(r.Context(), contract.ListRequest{
 		BucketID:   b.BucketID,
 		Prefix:     prefix,
@@ -129,6 +143,21 @@ func (s *Server) handleListObjectsV2(w http.ResponseWriter, r *http.Request, t t
 	continuation := q.Get("continuation-token")
 	startAfter := q.Get("start-after")
 	fetchOwner := strings.EqualFold(q.Get("fetch-owner"), "true")
+
+	if maxKeys == 0 {
+		writeXML(w, http.StatusOK, listObjectsV2Result{
+			Name:              b.Name,
+			Prefix:            encodeKey(prefix, encodingType),
+			KeyCount:          0,
+			MaxKeys:           0,
+			Delimiter:         encodeKey(delimiter, encodingType),
+			IsTruncated:       false,
+			ContinuationToken: continuation,
+			StartAfter:        encodeKey(startAfter, encodingType),
+			EncodingType:      encodingType,
+		})
+		return
+	}
 
 	result, err := s.coord.ListObjects(r.Context(), contract.ListRequest{
 		BucketID:          b.BucketID,
@@ -233,7 +262,7 @@ func (s *Server) handleListObjectVersions(w http.ResponseWriter, r *http.Request
 		}
 		lastKey, lastVersion = e.Key, string(e.VersionID)
 		if e.IsDeleteMarker {
-			res.DeleteMarkers = append(res.DeleteMarkers, deleteMarkerXML{
+			res.Entries = append(res.Entries, deleteMarkerXML{
 				Key:          encodeKey(e.Key, encodingType),
 				VersionID:    string(e.VersionID),
 				IsLatest:     e.IsLatest,
@@ -242,7 +271,7 @@ func (s *Server) handleListObjectVersions(w http.ResponseWriter, r *http.Request
 			})
 			continue
 		}
-		res.Versions = append(res.Versions, versionXML{
+		res.Entries = append(res.Entries, versionXML{
 			Key:          encodeKey(e.Key, encodingType),
 			VersionID:    string(e.VersionID),
 			IsLatest:     e.IsLatest,

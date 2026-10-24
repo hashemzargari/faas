@@ -221,6 +221,55 @@ func TestHealthGatewayDown(t *testing.T) {
 	}
 }
 
+func TestRepairStatusFromCoordinator(t *testing.T) {
+	snap := devTopology()
+	coord := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/topology":
+			writeJSONForTest(w, snap)
+		case "/v1/repair/status":
+			writeJSONForTest(w, map[string]any{
+				"pending":                 3,
+				"running":                 1,
+				"failed":                  2,
+				"oldest_pending_age":      45.0,
+				"bytes_repaired_last_24h": 3 << 20,
+				"throttled":               true,
+				"future_field":            "kept",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer coord.Close()
+	adminEnv(t, coord.URL)
+
+	out, stderr, code := runCLI(t, "repair", "status", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	if got["pending"] != 3.0 || got["running"] != 1.0 || got["failed"] != 2.0 {
+		t.Fatalf("queue counters = %v", got)
+	}
+	if got["throttled"] != true || got["future_field"] != "kept" {
+		t.Fatalf("fields dropped: %v", got)
+	}
+
+	human, _, code := runCLI(t, "repair", "status")
+	if code != 0 {
+		t.Fatalf("human exit %d", code)
+	}
+	for _, want := range []string{"source: coordinator /v1/repair/status", "oldest_pending_age", "3.0 MiB", "throttled", "yes"} {
+		if !strings.Contains(human, want) {
+			t.Errorf("human repair status missing %q:\n%s", want, human)
+		}
+	}
+}
+
 func TestRepairStatusDerived(t *testing.T) {
 	snap := devTopology()
 	snap.Agents[0].State = "offline"

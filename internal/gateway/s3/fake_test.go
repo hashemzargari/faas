@@ -41,7 +41,15 @@ type fakeCoord struct {
 	partContents map[contract.UploadID]map[int][]byte
 	// lastList records the most recent ListObjects request for assertions.
 	lastList contract.ListRequest
-	nextID   int
+	// committedVersion records the VersionID of the last CommitObject.
+	committedVersion contract.VersionID
+	// versionsResult, when set, is returned verbatim for version listings so a
+	// test can supply a precisely interleaved history.
+	versionsResult *contract.ListResult
+	// listErr, when set, is returned by ListObjects to model a coordinator
+	// validation failure.
+	listErr error
+	nextID  int
 }
 
 type fakeUpload struct {
@@ -190,6 +198,7 @@ func (f *fakeCoord) ResolvePlacement(ctx context.Context, req contract.Placement
 func (f *fakeCoord) CommitObject(ctx context.Context, req contract.CommitRequest) (contract.CommitResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.committedVersion = req.VersionID
 	m := contract.Manifest{
 		TenantID:    "t1",
 		ProjectID:   "p1",
@@ -255,6 +264,10 @@ func (f *fakeCoord) DeleteObject(ctx context.Context, bucket, key string, versio
 		return v, false, nil
 	}
 	delete(f.latest, id)
+	if b.Versioning == "Suspended" {
+		// A delete on a suspended bucket creates a null delete marker.
+		return contract.VersionID("null"), true, nil
+	}
 	marker := b.Versioning == "Enabled"
 	return v, marker, nil
 }
@@ -263,6 +276,12 @@ func (f *fakeCoord) ListObjects(ctx context.Context, req contract.ListRequest) (
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lastList = req
+	if f.listErr != nil {
+		return contract.ListResult{}, f.listErr
+	}
+	if req.Versions && f.versionsResult != nil {
+		return *f.versionsResult, nil
+	}
 	prefix := string(req.BucketID) + "\x00"
 	type entry struct {
 		key string
@@ -623,7 +642,7 @@ func (o *fakeOffloader) WritePart(ctx context.Context, spec offloader.ObjectSpec
 	ref := contract.ChunkRef{
 		Index:         0,
 		CiphertextLen: len(data) + 28,
-		ShardSetID:    contract.ShardSetIDForScoped(spec.BucketID, spec.Key, spec.VersionID, fmt.Sprintf("part/%d", partNumber), 0),
+		ShardSetID:    contract.ShardSetIDForScoped(spec.BucketID, spec.Key, spec.VersionID, contract.NewUUID(), 0),
 		AADChunkIndex: 0,
 	}
 	o.coord.mu.Lock()

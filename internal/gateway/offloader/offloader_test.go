@@ -332,7 +332,7 @@ func TestLostShardsStillReadable(t *testing.T) {
 	for g := 0; g < testParams.GeoN+testParams.GeoK; g++ {
 		for i := 0; i < testParams.LocalK; i++ {
 			slot := m.Chunks[0].Slots[g*testParams.ShardsPerGroup()+i]
-			id := contract.ShardSetIDFor(m.BucketID, m.Key, m.VersionID, 0)
+			id := m.Chunks[0].ShardSetID
 			e.agents.mu.Lock()
 			delete(e.agents.shards, shardKey(slot.Endpoint, id, g, i))
 			e.agents.mu.Unlock()
@@ -348,7 +348,7 @@ func TestWholeGeoGroupLostStillReadable(t *testing.T) {
 	payload := randomPayload(t, 2<<20)
 	m := e.write(t, payload)
 
-	id := contract.ShardSetIDFor(m.BucketID, m.Key, m.VersionID, 0)
+	id := m.Chunks[0].ShardSetID
 	// Lose the parity geo group entirely (group 2).
 	for i := 0; i < testParams.ShardsPerGroup(); i++ {
 		slot := m.Chunks[0].Slots[2*testParams.ShardsPerGroup()+i]
@@ -505,17 +505,62 @@ func TestDeferredChecksums(t *testing.T) {
 	}
 }
 
-// TestSinglePutStampsGoldenShardSetID pins the single-PUT derivation: the
-// stamped id must stay byte-identical to contract.ShardSetIDFor (no scope), so
-// objects written before the field existed still resolve.
-func TestSinglePutStampsGoldenShardSetID(t *testing.T) {
+// TestWritesWithRepeatedCoordinatesGetDisjointShardSets is the structural
+// regression guard for the whole collision class: two writes with *identical*
+// bucket/key/version/chunk coordinates (e.g. two suspended PUTs, or a retry)
+// must derive disjoint shard-set ids and both must succeed. Identity comes from a
+// random per-write scope, never from repeating coordinates.
+func TestWritesWithRepeatedCoordinatesGetDisjointShardSets(t *testing.T) {
 	e := newEnv(t)
-	m := e.write(t, randomPayload(t, 1<<20))
-	for _, ch := range m.Chunks {
-		want := contract.ShardSetIDFor(m.BucketID, m.Key, m.VersionID, ch.Index)
-		if ch.ShardSetID != want {
-			t.Fatalf("chunk %d stamped id = %s, want %s", ch.Index, ch.ShardSetID, want)
+	first := randomPayload(t, 300<<10)
+	second := randomPayload(t, 300<<10)
+
+	m1 := e.write(t, first)
+	m2 := e.write(t, second) // same spec: same bucket, key, version and chunk index
+	if len(m1.Chunks) == 0 || len(m2.Chunks) == 0 {
+		t.Fatal("no chunks written")
+	}
+	seen := make(map[contract.ShardSetID]bool)
+	for _, ref := range append(append([]contract.ChunkRef(nil), m1.Chunks...), m2.Chunks...) {
+		if ref.ShardSetID == "" {
+			t.Fatalf("chunk %d has no stamped shard-set id", ref.Index)
 		}
+		if seen[ref.ShardSetID] {
+			t.Fatalf("shard-set id %s reused across two writes with identical coordinates", ref.ShardSetID)
+		}
+		seen[ref.ShardSetID] = true
+	}
+	// The second write must also be readable (its shards did not hit immutable
+	// addresses from the first).
+	if got := e.read(t, m2, nil); !bytes.Equal(got, second) {
+		t.Fatal("second write with identical coordinates was not readable")
+	}
+}
+
+// TestLegacyShardSetFallback proves objects written before ChunkRef.ShardSetID
+// existed still read: when the field is empty the read path recreates the old
+// (bucket, key, version, index) derivation.
+func TestLegacyShardSetFallback(t *testing.T) {
+	e := newEnv(t)
+	payload := randomPayload(t, 1<<20)
+	m := e.write(t, payload)
+
+	for i := range m.Chunks {
+		ref := &m.Chunks[i]
+		legacyID := contract.ShardSetIDFor(m.BucketID, m.Key, m.VersionID, ref.Index)
+		for _, slot := range ref.Slots {
+			key := shardKey(slot.Endpoint, ref.ShardSetID, slot.GeoGroup, slot.LocalIndex)
+			legacyKey := shardKey(slot.Endpoint, legacyID, slot.GeoGroup, slot.LocalIndex)
+			e.agents.mu.Lock()
+			data := e.agents.shards[key]
+			delete(e.agents.shards, key)
+			e.agents.shards[legacyKey] = data
+			e.agents.mu.Unlock()
+		}
+		ref.ShardSetID = "" // pre-field manifest
+	}
+	if got := e.read(t, m, nil); !bytes.Equal(got, payload) {
+		t.Fatal("legacy object without stamped shard-set ids is unreadable")
 	}
 }
 
@@ -550,9 +595,10 @@ func TestMultipartPartsHaveDisjointShardSets(t *testing.T) {
 	if part1.Chunks[0].ShardSetID == part2.Chunks[0].ShardSetID {
 		t.Fatal("part 2 chunk 0 reused part 1's shard-set id")
 	}
-	// The scoped derivation is exactly what distinguishes them.
-	if want := contract.ShardSetIDForScoped(e.spec.BucketID, e.spec.Key, e.spec.VersionID, "part/2", 0); part2.Chunks[0].ShardSetID != want {
-		t.Fatalf("part 2 chunk 0 = %s, want %s", part2.Chunks[0].ShardSetID, want)
+	// Neither id may equal the legacy coordinate-only derivation.
+	legacy2 := contract.ShardSetIDFor(e.spec.BucketID, e.spec.Key, e.spec.VersionID, 0)
+	if part2.Chunks[0].ShardSetID == legacy2 {
+		t.Fatalf("part 2 reused the legacy coordinate-derived id %s", legacy2)
 	}
 }
 
@@ -597,5 +643,27 @@ func TestMultipartRoundTrip(t *testing.T) {
 	rng := &ByteRange{Start: int64(len(part1Payload)) - 100, Length: 200}
 	if got := e.read(t, m, rng); !bytes.Equal(got, want[rng.Start:rng.Start+rng.Length]) {
 		t.Fatalf("ranged multipart read mismatch")
+	}
+}
+
+// TestMultipartUploadsAreScopedPerUpload: on a Suspended bucket every upload
+// writes version "null", so two uploads of the same key/part must still derive
+// distinct shard-set ids (otherwise the second write hits immutable shards).
+func TestMultipartUploadsAreScopedPerUpload(t *testing.T) {
+	e := newEnv(t)
+	spec := e.spec
+	spec.VersionID = contract.VersionID("null")
+	payload := randomPayload(t, 200<<10)
+
+	p1, err := e.off.WritePart(context.Background(), spec, "upload-A", 1, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := e.off.WritePart(context.Background(), spec, "upload-B", 1, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p1.Chunks[0].ShardSetID == p2.Chunks[0].ShardSetID {
+		t.Fatalf("two uploads of version null reused shard-set id %s", p1.Chunks[0].ShardSetID)
 	}
 }

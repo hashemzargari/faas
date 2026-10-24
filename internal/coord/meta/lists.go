@@ -55,10 +55,10 @@ func decodeToken(s string) (listToken, error) {
 	var t listToken
 	raw, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
-		return t, coerr.Invalidf("malformed continuation token")
+		return t, coerr.E(400, "InvalidArgument", "The continuation token provided is incorrect")
 	}
 	if err := json.Unmarshal(raw, &t); err != nil {
-		return t, coerr.Invalidf("malformed continuation token")
+		return t, coerr.E(400, "InvalidArgument", "The continuation token provided is incorrect")
 	}
 	return t, nil
 }
@@ -144,12 +144,20 @@ func (s *Service) listObjects(ctx context.Context, req contract.ListRequest, key
 	if req.BucketID == "" {
 		return result, coerr.Invalidf("bucket_id is required")
 	}
+	// MaxKeys == 0 is the S3 "return nothing" request (max-keys=0); callers that
+	// want the default page pass a positive value. Negative is treated as unset
+	// for internal callers that predate the explicit contract.
 	maxKeys := req.MaxKeys
-	if maxKeys <= 0 {
+	if maxKeys < 0 {
 		maxKeys = DefaultMaxKeys
 	}
 	if maxKeys > MaxMaxKeys {
 		maxKeys = MaxMaxKeys
+	}
+	if maxKeys == 0 {
+		result.Entries = []contract.ObjectEntry{}
+		result.KeyCount = 0
+		return result, nil
 	}
 	var token *listToken
 	if req.ContinuationToken != "" {

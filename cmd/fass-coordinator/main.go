@@ -27,6 +27,7 @@ import (
 	"github.com/fass-storage/fass/internal/coord/api"
 	"github.com/fass-storage/fass/internal/coord/bootstrap"
 	"github.com/fass-storage/fass/internal/coord/gc"
+	"github.com/fass-storage/fass/internal/coord/lifecycle"
 	"github.com/fass-storage/fass/internal/coord/membership"
 	"github.com/fass-storage/fass/internal/coord/placement"
 )
@@ -57,6 +58,13 @@ type config struct {
 	heartbeatInterval time.Duration
 	suspectAfter      time.Duration
 	offlineAfter      time.Duration
+	// devClockOffset shifts the coordinator clock. Dev-only and gated behind
+	// --dev-bootstrap; it exists so lifecycle expiry can be exercised without
+	// waiting days, never as a production backdoor.
+	devClockOffset time.Duration
+	// lifecycle sweep (docs/05 §5.6)
+	lifecycleEnabled  bool
+	lifecycleInterval time.Duration
 }
 
 func run(args []string) error {
@@ -73,7 +81,14 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	now := time.Now
+	if cfg.devBootstrap && cfg.devClockOffset != 0 {
+		offset := cfg.devClockOffset
+		now = func() time.Time { return time.Now().Add(offset) }
+		logger.Warn("DEV CLOCK OFFSET ACTIVE: coordinator clock is shifted (dev-bootstrap only)", "offset", offset.String())
+	}
 	svc, err := coord.Open(ctx, cfg.dataDir, coord.Config{
+		Now:         now,
 		Maintenance: cfg.maintenance,
 		Membership: membership.Config{
 			HeartbeatInterval: cfg.heartbeatInterval,
@@ -126,6 +141,16 @@ func run(args []string) error {
 		logger.Info("deletion GC enabled", "interval", cfg.gcInterval.String(), "batch", cfg.gcBatch)
 	} else {
 		logger.Warn("deletion GC disabled: tombstoned shards will accumulate")
+	}
+	// Lifecycle expiry sweep (docs/05 §5.6): metadata-first, retention-aware.
+	if cfg.lifecycleEnabled {
+		lifecycleExec := lifecycle.New(svc.Meta, lifecycle.Config{
+			Interval: cfg.lifecycleInterval,
+			Now:      now,
+			Logger:   logger,
+		})
+		go lifecycleExec.Run(ctx)
+		logger.Info("lifecycle sweep enabled", "interval", cfg.lifecycleInterval.String())
 	}
 	handler := server.Handler()
 	httpSrv := &http.Server{
@@ -190,6 +215,9 @@ func parseConfig(args []string) (config, error) {
 	fs.DurationVar(&cfg.heartbeatInterval, "heartbeat-interval", envDuration("FASS_COORDINATOR_HEARTBEAT_INTERVAL", membership.DefaultHeartbeatInterval), "expected agent heartbeat interval")
 	fs.DurationVar(&cfg.suspectAfter, "suspect-after", envDuration("FASS_COORDINATOR_SUSPECT_AFTER", membership.DefaultSuspectAfter), "mark an agent SUSPECT after this much silence")
 	fs.DurationVar(&cfg.offlineAfter, "offline-after", envDuration("FASS_COORDINATOR_OFFLINE_AFTER", membership.DefaultOfflineAfter), "mark an agent OFFLINE after this much silence")
+	fs.BoolVar(&cfg.lifecycleEnabled, "lifecycle", envBoolDefault("FASS_COORDINATOR_LIFECYCLE", true), "run the S3 lifecycle expiry sweep")
+	fs.DurationVar(&cfg.lifecycleInterval, "lifecycle-interval", envDuration("FASS_COORDINATOR_LIFECYCLE_INTERVAL", lifecycle.DefaultInterval), "lifecycle sweep interval")
+	fs.DurationVar(&cfg.devClockOffset, "dev-clock-offset", envDuration("FASS_COORDINATOR_DEV_CLOCK_OFFSET", 0), "DEV ONLY (requires --dev-bootstrap): shift the coordinator clock by this duration; used by the compat suite to test lifecycle without waiting days")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}

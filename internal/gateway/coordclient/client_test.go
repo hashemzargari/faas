@@ -272,6 +272,15 @@ func TestListObjectsQuery(t *testing.T) {
 		q.Get("key_marker") != "k1" || q.Get("version_id_marker") != "v1" {
 		t.Fatalf("query = %v", q)
 	}
+
+	// max_keys is sent verbatim: 0 means an explicit empty page, not "absent".
+	if _, err := c.ListObjects(context.Background(), contract.ListRequest{BucketID: "bucket-1", MaxKeys: 0}); err != nil {
+		t.Fatal(err)
+	}
+	_, _, q2, _ := rec.last()
+	if got, ok := q2["max_keys"]; !ok || len(got) != 1 || got[0] != "0" {
+		t.Fatalf("max_keys query = %v, want [\"0\"] (always sent verbatim)", q2)
+	}
 }
 
 func TestErrorMapping(t *testing.T) {

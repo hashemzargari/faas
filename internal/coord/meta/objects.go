@@ -153,8 +153,12 @@ func (s *Service) CommitObject(ctx context.Context, req contract.CommitRequest) 
 	if req.VersionID == "" {
 		return result, coerr.Invalidf("version_id is required (the gateway assigns it before encryption)")
 	}
-	if err := id.Validate(string(req.VersionID)); err != nil {
-		return result, coerr.Invalidf("version_id must be a UUIDv4: %v", err)
+	// "null" is S3's version id for objects written while versioning is
+	// suspended; whether the bucket may use it is checked inside the transaction.
+	if req.VersionID != "null" {
+		if err := id.Validate(string(req.VersionID)); err != nil {
+			return result, coerr.Invalidf("version_id must be a UUIDv4 (or the literal null for a suspended bucket): %v", err)
+		}
 	}
 	if req.Size < 0 || req.Size > MaxObjectSize {
 		return result, coerr.ErrEntityTooLarge
@@ -176,16 +180,24 @@ func (s *Service) CommitObject(ctx context.Context, req contract.CommitRequest) 
 			return err
 		}
 		now := s.now()
+		suspended := bucket.Versioning == "Suspended"
+		if req.VersionID == "null" && !suspended {
+			return coerr.Invalidf("version_id \"null\" is only valid for a bucket with suspended versioning")
+		}
 
-		// Idempotent retry: the version id is already committed.
-		if existing, err := storage.GetJSON[versionRecord](tx, spaceVersionIDs, versionIDKey(req.BucketID, req.Key, req.VersionID)); err == nil {
-			if existing.Key == req.Key && existing.Size == req.Size && existing.ETag == req.ETag && !existing.Deleted && !existing.IsDeleteMarker {
-				result = contract.CommitResult{VersionID: existing.VersionID, ETag: existing.ETag}
-				return nil
+		// Idempotent retry: the version id is already committed. Suspended-bucket
+		// writes reuse the "null" id by design, so they are replacements, not
+		// duplicates.
+		if req.VersionID != "null" {
+			if existing, err := storage.GetJSON[versionRecord](tx, spaceVersionIDs, versionIDKey(req.BucketID, req.Key, req.VersionID)); err == nil {
+				if existing.Key == req.Key && existing.Size == req.Size && existing.ETag == req.ETag && !existing.Deleted && !existing.IsDeleteMarker {
+					result = contract.CommitResult{VersionID: existing.VersionID, ETag: existing.ETag}
+					return nil
+				}
+				return coerr.E(409, coerr.CodeConflict, "version_id %s already exists for a different object version", req.VersionID)
+			} else if !errors.Is(err, storage.ErrNotFound) {
+				return err
 			}
-			return coerr.E(409, coerr.CodeConflict, "version_id %s already exists for a different object version", req.VersionID)
-		} else if !errors.Is(err, storage.ErrNotFound) {
-			return err
 		}
 
 		latest, err := getLatest(tx, req.BucketID, req.Key)
@@ -258,12 +270,28 @@ func (s *Service) CommitObject(ctx context.Context, req contract.CommitRequest) 
 			Retention:    req.Retention,
 		}
 
-		// Unversioned (and Suspended, v1 simplification) buckets keep one live
-		// version: the previous one becomes a tombstone waiting for shard GC.
+		// Version retention on overwrite:
+		//   Enabled   — history is retained;
+		//   Suspended — S3 semantics: the write replaces the existing null version
+		//               and every non-null version is retained;
+		//   (default) — single live version; the previous one is tombstoned.
 		versioned := bucket.Versioning == "Enabled"
-		if !versioned && latest != nil {
-			if err := s.tombstoneVersion(tx, bucket, latest, now, "overwrite"); err != nil {
+		switch {
+		case versioned:
+			// nothing to tombstone
+		case suspended:
+			if oldNull, err := storage.GetJSON[versionRecord](tx, spaceVersionIDs, versionIDKey(req.BucketID, req.Key, "null")); err == nil && !oldNull.Deleted {
+				if err := s.tombstoneRecord(tx, oldNull, now, "replace null version"); err != nil {
+					return err
+				}
+			} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
 				return err
+			}
+		default:
+			if latest != nil {
+				if err := s.tombstoneVersion(tx, bucket, latest, now, "overwrite"); err != nil {
+					return err
+				}
 			}
 		}
 		if err := storage.PutJSON(tx, spaceVersions, versionKey(req.BucketID, req.Key, seq), rec); err != nil {
@@ -334,6 +362,12 @@ func (s *Service) tombstoneVersion(tx *storage.WriteTx, bucket Bucket, latest *l
 	if err != nil {
 		return fmt.Errorf("meta: load version for tombstone: %w", err)
 	}
+	return s.tombstoneRecord(tx, rec, now, reason)
+}
+
+// tombstoneRecord marks one version deleted, persists both indexes and queues its
+// shards for GC (metadata-first deletion).
+func (s *Service) tombstoneRecord(tx *storage.WriteTx, rec versionRecord, now time.Time, reason string) error {
 	rec.Deleted = true
 	rec.DeletedAt = &now
 	if err := storage.PutJSON(tx, spaceVersionIDs, versionIDKey(rec.BucketID, rec.Key, rec.VersionID), rec); err != nil {
@@ -341,6 +375,9 @@ func (s *Service) tombstoneVersion(tx *storage.WriteTx, bucket Bucket, latest *l
 	}
 	if err := storage.PutJSON(tx, spaceVersions, versionKey(rec.BucketID, rec.Key, rec.Seq), rec); err != nil {
 		return err
+	}
+	if rec.ManifestHash == "" {
+		return nil // zero-byte object or delete marker: nothing to collect
 	}
 	return s.enqueueDeletion(tx, DeletionItem{
 		BucketID:     rec.BucketID,
@@ -453,6 +490,13 @@ func (s *Service) DeleteObject(ctx context.Context, bucket, key string, version 
 			return nil
 		}
 
+		// Suspended versioning: a DELETE without a version id operates on the
+		// "null" version only and inserts a null delete marker, retaining every
+		// non-null version (S3 semantics; docs/05 §5.1).
+		if cfg.Versioning == "Suspended" {
+			return s.suspendedDelete(tx, cfg, key, latest, now, bypassGovernance, &outVersion, &marker)
+		}
+
 		if cfg.Versioning == "Enabled" {
 			// Deleting an object that already has a delete marker as its latest
 			// version removes that marker instead of stacking another one.
@@ -538,6 +582,64 @@ func (s *Service) DeleteObject(ctx context.Context, bucket, key string, version 
 		return nil
 	})
 	return outVersion, marker, err
+}
+
+// suspendedDelete implements DELETE without a version id on a bucket whose
+// versioning is suspended: only the null version is affected. Removing an
+// existing null delete marker restores the previous version; otherwise the null
+// object version (if any) is replaced by a null delete marker and every non-null
+// version is retained.
+func (s *Service) suspendedDelete(tx *storage.WriteTx, cfg contract.BucketConfig, key string, latest *latestRecord, now time.Time, bypass bool, outVersion *contract.VersionID, marker *bool) error {
+	if latest != nil && latest.DeleteMarker && latest.VersionID == "null" {
+		rec, err := resolveVersion(tx, cfg.BucketID, key, "null")
+		if err != nil {
+			return err
+		}
+		if err := s.tombstoneRecord(tx, rec, now, "delete marker"); err != nil {
+			return err
+		}
+		if err := s.recomputeLatest(tx, cfg.BucketID, key, now); err != nil {
+			return err
+		}
+		*outVersion, *marker = "null", true
+		return nil
+	}
+	if nullRec, err := storage.GetJSON[versionRecord](tx, spaceVersionIDs, versionIDKey(cfg.BucketID, key, "null")); err == nil && !nullRec.Deleted {
+		if err := checkRetention(nullRec, now, bypass); err != nil {
+			return err
+		}
+		if err := s.tombstoneRecord(tx, nullRec, now, "delete null version"); err != nil {
+			return err
+		}
+	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return err
+	}
+	seq, err := nextSeq(tx, "version")
+	if err != nil {
+		return err
+	}
+	markerID := contract.VersionID("null")
+	rec := versionRecord{
+		BucketID:       cfg.BucketID,
+		Key:            key,
+		VersionID:      markerID,
+		Seq:            seq,
+		IsDeleteMarker: true,
+		CreatedAt:      now,
+		StorageClass:   "STANDARD",
+	}
+	if err := storage.PutJSON(tx, spaceVersions, versionKey(cfg.BucketID, key, seq), rec); err != nil {
+		return err
+	}
+	if err := storage.PutJSON(tx, spaceVersionIDs, versionIDKey(cfg.BucketID, key, markerID), rec); err != nil {
+		return err
+	}
+	latestRec := latestRecord{Key: key, VersionID: markerID, Seq: seq, DeleteMarker: true, LastModified: now, StorageClass: "STANDARD"}
+	if err := storage.PutJSON(tx, spaceLatest, latestKey(cfg.BucketID, key), latestRec); err != nil {
+		return err
+	}
+	*outVersion, *marker = markerID, true
+	return nil
 }
 
 // recomputeLatest flips (bucket, key)'s latest pointer to the highest-sequence
