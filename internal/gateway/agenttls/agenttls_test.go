@@ -97,7 +97,7 @@ func TestStrictModeRejectsPlaintextAgent(t *testing.T) {
 	ca, dir := testCA(t)
 	_ = dir
 	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, "plain")
+		_, _ = io.WriteString(w, `{"tls":false,"insecure":true}`)
 	}))
 	defer plain.Close()
 	hostPort := strings.TrimPrefix(plain.URL, "http://")
@@ -125,6 +125,10 @@ func TestStrictModeRejectsPlaintextAgent(t *testing.T) {
 func TestAutoModeAllowsPlaintextDuringRolloutAndWarns(t *testing.T) {
 	ca, _ := testCA(t)
 	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "healthz") {
+			_, _ = io.WriteString(w, `{"tls":false,"insecure":true}`)
+			return
+		}
 		_, _ = io.WriteString(w, "plain")
 	}))
 	defer plain.Close()
@@ -146,6 +150,31 @@ func TestAutoModeAllowsPlaintextDuringRolloutAndWarns(t *testing.T) {
 	resp.Body.Close()
 	if !strings.Contains(logs.String(), "plaintext") {
 		t.Fatalf("downgrade was not logged: %s", logs.String())
+	}
+}
+
+// TestAutoModeNeverDowngradesATLSAgent: a TLS agent that rejects our client
+// certificate (or otherwise fails the handshake) must not be silently downgraded
+// to plaintext by --agent-tls=auto. Only an agent that *answers* plaintext
+// /v1/healthz with tls=false/insecure=true may be used in plaintext.
+func TestAutoModeNeverDowngradesATLSAgent(t *testing.T) {
+	ca, dir := pki.InitCA(t.TempDir(), pki.CAOptions{CommonName: "no-downgrade"})
+	_ = dir
+	// TLS agent requiring client certs: our auto client has none.
+	plainCertAgent := startTLSAgent(t, ca, t.TempDir(), time.Hour, true)
+	var logs syncBuffer
+	client, info, err := NewClient(Options{Mode: ModeAuto, CAFile: ca.CertFile, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Insecure {
+		t.Fatalf("auto mode reported insecure")
+	}
+	if _, err := plainCertAgent.get(t, client); err == nil {
+		t.Fatal("auto mode accepted a TLS agent that rejected our certificate")
+	}
+	if strings.Contains(logs.String(), "still plaintext") {
+		t.Fatalf("auto mode logged a plaintext downgrade for a TLS agent: %s", logs.String())
 	}
 }
 

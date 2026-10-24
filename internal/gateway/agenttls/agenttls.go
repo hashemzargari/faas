@@ -14,11 +14,14 @@
 package agenttls
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -168,28 +171,69 @@ type transport struct {
 }
 
 func (t *transport) dialTLS(ctx context.Context, network, addr string) (net.Conn, error) {
+	// Known-plaintext endpoints skip the doomed TLS attempt entirely (auto mode
+	// only; --require-mtls never reaches this map).
+	if t.mode == ModeAuto && !t.requireMTLS && t.isPlaintext(addr) {
+		return t.dialer.DialContext(ctx, network, addr)
+	}
 	conn, err := t.dialer.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
 	tlsConn := tls.Client(conn, t.configFor(addr))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		if t.mode == ModeAuto && !t.requireMTLS && isPlaintextPeer(err) {
-			// Mixed-mode rollout: the endpoint is still a plaintext agent. The
-			// plaintext server usually closes the connection after choking on our
-			// ClientHello, so dial a fresh one before returning it.
-			_ = tlsConn.Close()
-			plain, derr := t.dialer.DialContext(ctx, network, addr)
-			if derr != nil {
-				return nil, derr
-			}
-			t.notePlaintext(addr)
-			return plain, nil
-		}
 		_ = conn.Close()
+		// During a mixed-mode rollout an endpoint may still be a plaintext agent.
+		// Only downgrade when that endpoint *proves* it is insecure by answering a
+		// plaintext /v1/healthz with tls=false/insecure=true. A TLS agent that
+		// rejects our certificate must never be silently downgraded.
+		if t.mode == ModeAuto && !t.requireMTLS && t.confirmPlaintext(ctx, addr) {
+			t.notePlaintext(addr)
+			return t.dialer.DialContext(ctx, network, addr)
+		}
 		return nil, pki.ExplainTLSHandshakeError(err, addr)
 	}
 	return tlsConn, nil
+}
+
+// confirmPlaintext probes addr with a plaintext GET /v1/healthz and reports
+// whether it is a deliberately insecure agent. Any other outcome (TLS agent,
+// network error, unexpected body) returns false, so auto mode fails closed.
+func (t *transport) confirmPlaintext(ctx context.Context, addr string) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	conn, err := t.dialer.DialContext(probeCtx, "tcp", addr)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	req := "GET /v1/healthz HTTP/1.1\r\nHost: " + addr + "\r\nConnection: close\r\n\r\n"
+	if _, err := io.WriteString(conn, req); err != nil {
+		return false
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(io.LimitReader(conn, 16<<10)), nil)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return false
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Insecure bool  `json:"insecure"`
+		TLS      *bool `json:"tls"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&body); err != nil {
+		return false
+	}
+	if body.TLS != nil && !*body.TLS {
+		return true
+	}
+	return body.Insecure
+}
+
+func (t *transport) isPlaintext(addr string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.plaintext[addr]
 }
 
 func (t *transport) configFor(addr string) *tls.Config {
@@ -224,28 +268,6 @@ func (t *transport) plaintextPeers() []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-func isPlaintextPeer(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	for _, marker := range []string{
-		"first record does not look like a TLS handshake",
-		"server gave HTTP response to HTTPS client",
-		"tls: oversized record",
-		// An HTTP server that does not understand TLS typically closes after
-		// reading the ClientHello, which surfaces as EOF/reset on our side.
-		"EOF",
-		"connection reset by peer",
-		"broken pipe",
-	} {
-		if strings.Contains(msg, marker) {
-			return true
-		}
-	}
-	return false
 }
 
 // ErrPlaintextPeer reports that a peer spoke plaintext while strict TLS was

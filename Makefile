@@ -26,6 +26,15 @@ e2e: build
 compat: build
 	$(GOENV) go test -count=1 -tags=compat ./test/compat/...
 
+# Third-party client matrix against a live cluster. `compat-clients` is
+# plaintext dev; `compat-clients-tls` runs the same 16 checks with mTLS on the
+# shard transport (throwaway CA minted into a temp dir, never in the repo).
+compat-clients: build
+	bash scripts/compat.sh
+
+compat-clients-tls: build
+	COMPAT_TLS=1 bash scripts/compat.sh
+
 chaos: build
 	$(GOENV) go test -count=1 -tags=chaos ./test/chaos/...
 

@@ -10,7 +10,16 @@
 #   - rclone    (.dev/rclone or $PATH)
 #   - s3cmd     (.dev/venv/bin/s3cmd or $PATH)
 #
-#   ./scripts/compat.sh
+#   ./scripts/compat.sh                 # plaintext dev cluster (default)
+#   COMPAT_TLS=1 ./scripts/compat.sh    # mTLS on the data plane (agents+gateway)
+#
+# TLS mode mints a throwaway CA and certificates into the run's temp dir with
+# `fass-gateway pki` (the same stdlib-only CA an operator uses), starts the 12
+# agents with --require-mtls and the gateway with --agent-tls=require
+# --require-mtls. The coordinator stays plaintext in this dev matrix and the
+# gateway opts in explicitly with --coordinator-insecure; the control-plane TLS
+# client is covered by unit tests and docs/08. The S3 edge stays HTTP (clients
+# are unchanged), so the matrix proves the shard transport, not the frontend.
 #
 # Exit code is non-zero if any *detected* client fails a check.
 set -uo pipefail
@@ -51,6 +60,24 @@ wait_http() { local i; for ((i = 0; i < ${2:-40} * 4; i++)); do curl -sf -m 1 "$
 echo "== build =="
 go build -o bin/ ./cmd/... || { echo "build failed"; exit 1; }
 
+TLS_MODE=${COMPAT_TLS:-0}
+AGENT_SEC_ARGS=(--insecure)
+GW_SEC_ARGS=()
+if [[ "$TLS_MODE" == "1" ]]; then
+  echo "== data-plane mTLS (COMPAT_TLS=1) =="
+  # Throwaway CA + certs in the temp dir; never in the repo. The server cert
+  # carries the announcement hostname (agents advertise hostname:port) and the
+  # loopback IP so the gateway's per-dial ServerName verifies either way.
+  ./bin/fass-gateway pki init --dir "$T/ca" >/dev/null || { echo "pki init failed"; exit 1; }
+  ./bin/fass-gateway pki issue-server --ca-dir "$T/ca" --dir "$T/agent" \
+    --dns "$(hostname)" --ip 127.0.0.1 --ttl 24h >/dev/null || { echo "pki issue-server failed"; exit 1; }
+  ./bin/fass-gateway pki issue-client --ca-dir "$T/ca" --dir "$T/gw" \
+    --identity gateway-compat --ttl 24h >/dev/null || { echo "pki issue-client failed"; exit 1; }
+  AGENT_SEC_ARGS=(--tls-cert="$T/agent/tls.crt" --tls-key="$T/agent/tls.key" --tls-ca="$T/ca/ca.crt" --require-mtls)
+  GW_SEC_ARGS=(--ca-cert="$T/ca/ca.crt" --client-cert="$T/gw/tls.crt" --client-key="$T/gw/tls.key" \
+    --agent-tls=require --require-mtls --coordinator-insecure)
+fi
+
 echo "== cluster (coordinator dev-bootstrap + 12 agents + gateway) =="
 # Optional PostgreSQL backend: set FASS_COMPAT_POSTGRES_DSN to an administrative
 # DSN (a database the user can create/drop in). The script creates a fresh
@@ -78,15 +105,15 @@ PIDS+=($!)
 wait_http "http://127.0.0.1:$COORD/healthz" 40 || { echo "coordinator failed: see $T/coord.log"; exit 1; }
 grep -o 'FASS_DEV_BOOTSTRAP .*' "$T/coord.log" | head -1 | cut -d' ' -f2- >"$T/boot.json"
 
-python3 - "$T" "$COORD" "$AGENT" >"$T/agents.sh" <<'PY'
+python3 - "$T" "$COORD" "$AGENT" "${AGENT_SEC_ARGS[*]}" >"$T/agents.sh" <<'PY'
 import json, sys
-tmp, coord, base = sys.argv[1], sys.argv[2], int(sys.argv[3])
+tmp, coord, base, sec = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 d = json.load(open(f"{tmp}/boot.json"))
 for i, a in enumerate(d["agents"]):
     print(f'./bin/fass-agent --nexus-id={a["nexus_id"]} --node-id={a["node_id"]} '
           f'--disk={tmp}/disks/a{i} --port={base+i} --coordinator-url=http://127.0.0.1:{coord} '
           f'--secret={a["secret"]} --disk-id={a["disk_id"]} --repair=false --scrub=false '
-          f'--log-level=warn --insecure >>{tmp}/agent{i}.log 2>&1 & echo $! >>{tmp}/pids')
+          f'--log-level=warn {sec} >>{tmp}/agent{i}.log 2>&1 & echo $! >>{tmp}/pids')
 PY
 bash "$T/agents.sh"
 PIDS+=($(cat "$T/pids" 2>/dev/null))
@@ -108,9 +135,19 @@ SEED=$(python3 -c 'import secrets;print(secrets.token_hex(32))')
 ./bin/fass-gateway --coordinator="http://127.0.0.1:$COORD" --listen="127.0.0.1:$GW" \
   --admin-listen="127.0.0.1:$GWADMIN" --dev --region=eu-west-1 \
   --geo-n 2 --geo-k 1 --local-n 3 --local-k 1 --chunk-size 6291456 \
-  --default-redundancy-class dev-rc --key-seed "$SEED" >"$T/gw.log" 2>&1 &
+  --default-redundancy-class dev-rc --key-seed "$SEED" "${GW_SEC_ARGS[@]}" >"$T/gw.log" 2>&1 &
 PIDS+=($!)
 wait_http "http://127.0.0.1:$GWADMIN/healthz" 40 || { echo "gateway failed: see $T/gw.log"; exit 1; }
+
+# The health endpoint must tell the truth about what is encrypted.
+SEC=$(curl -sS "http://127.0.0.1:$GWADMIN/healthz")
+if [[ "$TLS_MODE" == "1" ]]; then
+  echo "$SEC" | grep -q '"insecure":false' && echo "$SEC" | grep -q '"agent_mode":"require"' \
+    || { echo "gateway healthz does not report TLS mode: $SEC"; exit 1; }
+  echo "   gateway security: $(echo "$SEC" | python3 -c 'import sys,json;print(json.dumps(json.load(sys.stdin)["security"],sort_keys=True))')"
+else
+  echo "$SEC" | grep -q '"insecure":true' || { echo "plaintext gateway healthz is not explicit: $SEC"; exit 1; }
+fi
 
 export AWS_ACCESS_KEY_ID=dev-access-key AWS_SECRET_ACCESS_KEY=dev-secret-key AWS_DEFAULT_REGION=eu-west-1
 export AWS_EC2_METADATA_DISABLED=true
@@ -211,5 +248,10 @@ else
 fi
 
 echo
-if [[ $FAIL -eq 0 ]]; then echo "COMPAT: PASS"; else echo "COMPAT: FAIL (logs in $T)"; fi
+if [[ $FAIL -eq 0 ]]; then
+  echo "COMPAT: PASS ($([[ "$TLS_MODE" == "1" ]] && echo "data plane mTLS" || echo "data plane plaintext, --insecure"))"
+  [[ "${COMPAT_KEEP:-0}" == "1" ]] || rm -rf "$T"
+else
+  echo "COMPAT: FAIL (logs in $T)"
+fi
 exit $FAIL
