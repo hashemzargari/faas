@@ -119,12 +119,22 @@ type EncryptionMeta struct {
 
 // ChunkRef is everything needed to read one chunk, minus the bytes.
 type ChunkRef struct {
-	Index         int       `json:"index"`
-	Params        ec.Params `json:"params"`
-	CiphertextLen int       `json:"ciphertext_len"`
-	ShardSize     int       `json:"shard_size"`
-	Slots         []Slot    `json:"slots"`
-	// Checksums[i] is the truncated BLAKE2b-64 of shard i, in slot order.
+	Index int `json:"index"`
+	// ShardSetID is authoritative when non-empty. Multipart parts derive
+	// different ids for the same chunk index (see ShardSetIDForScoped), so
+	// recomputing it from (bucket, key, version, index) alone is valid only for
+	// single-PUT objects and for manifests written before this field existed.
+	ShardSetID    ShardSetID `json:"shard_set_id,omitempty"`
+	Params        ec.Params  `json:"params"`
+	CiphertextLen int        `json:"ciphertext_len"`
+	ShardSize     int        `json:"shard_size"`
+	Slots         []Slot     `json:"slots"`
+	// AADChunkIndex is the chunk index that was bound in the chunk AAD at write
+	// time. For multipart it is part-local (0..n-1 per part); Index is the
+	// object-wide position used for ordering. Read must use this value, never a
+	// re-derived one, or GCM authentication fails.
+	AADChunkIndex int `json:"aad_chunk_index,omitempty"`
+	// Checksums[i] is BigEndian(SHA-256(shard i)[:8]), aligned with shard index.
 	Checksums  []uint64 `json:"checksums"`
 	Generation int      `json:"generation"`
 }
@@ -246,7 +256,11 @@ type ListRequest struct {
 	MaxKeys           int      `json:"max_keys"`
 	StartAfter        string   `json:"start_after"`
 	ContinuationToken string   `json:"continuation_token"`
-	Versions          bool     `json:"versions"`
+	// KeyMarker/VersionIDMarker are the S3 ListObjectVersions markers. They are
+	// distinct from StartAfter: a version listing must resume *within* a key.
+	KeyMarker       string `json:"key_marker,omitempty"`
+	VersionIDMarker string `json:"version_id_marker,omitempty"`
+	Versions        bool   `json:"versions"`
 }
 
 type ObjectEntry struct {
@@ -340,9 +354,13 @@ type UploadInfo struct {
 	// VersionID is the version id the gateway minted at CreateMultipartUpload.
 	// UploadPart binds it in the chunk AAD, and CompleteUpload promotes it to the
 	// manifest, so parts can never be spliced across object versions.
-	VersionID    VersionID `json:"version_id"`
-	Initiated    time.Time `json:"initiated"`
-	StorageClass string    `json:"storage_class"`
+	VersionID VersionID `json:"version_id"`
+	// Encryption is the object-level encryption metadata created with the
+	// upload. Every part must be encrypted under this FileKey; a per-part key
+	// would make all but one part undecryptable from the committed manifest.
+	Encryption   EncryptionMeta `json:"encryption"`
+	Initiated    time.Time      `json:"initiated"`
+	StorageClass string         `json:"storage_class"`
 }
 
 type PartInfo struct {
