@@ -117,6 +117,7 @@ Preset roles: `Owner`, `Admin`, `Member`, `ReadOnly`. Policy JSON uses `syntax_v
 ### 5.1 Versioning
 * Bucket-level; `Enabled` / `Suspended`. Suspension affects future writes only.
 * **Version ID = 128-bit UUIDv4** (not AWS's 32-char base62). Clients must treat it as opaque; we match this because some backup tools persist it.
+* **Exception — suspended versioning uses the literal version id `null`**, per S3: a PUT into a suspended bucket replaces the existing null version and retains all non-null versions; a DELETE creates a `null` delete marker (replacing an existing null version or marker). Rationale: `null` is not cosmetic — tools use it to distinguish "unversioned write" from "a version", and the UUIDv4 rule describes Cubbit's *enabled*-versioning behaviour, which is what its docs describe. Both are opaque to well-behaved clients; we pick the one real clients depend on.
 * Delete without `versionId` ⇒ delete marker, versions retained. Delete with `versionId` ⇒ permanent and irreversible.
 * `DeleteBucket` requires the bucket empty of **objects and versions**.
 
