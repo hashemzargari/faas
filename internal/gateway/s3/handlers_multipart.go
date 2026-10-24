@@ -17,6 +17,11 @@ import (
 
 // multipartModePrefix re-exports the offloader convention that marks part-level
 // encryption metadata (multipart parts bind an empty AAD version).
+//
+// TODO(multipart-version): delete this bridge once UploadPart can read
+// UploadInfo.VersionID via Coordinator.GetUpload; parts must then bind the real
+// version id in their chunk AAD. The write end is UploadPart/UploadPartCopy and
+// the read end is offloader.Read.
 const multipartModePrefix = offloader.MultipartModePrefix
 
 // handleCreateMultipartUpload implements POST /{bucket}/{key}?uploads.
@@ -69,6 +74,9 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	uploadMeta := contract.CommitRequest{
+		// The version id is minted here so CompleteUpload can promote it; parts
+		// cannot bind it until Coordinator.GetUpload is available (TODO above).
+		VersionID:    contract.VersionID(s.newUUID()),
 		BucketID:     b.BucketID,
 		Key:          t.Key,
 		ContentType:  r.Header.Get("Content-Type"),
@@ -149,8 +157,10 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, t targ
 		return
 	}
 
-	// Multipart parts use an empty AAD version until the coordinator can return
-	// the upload's version id; the mode prefix keeps reads consistent.
+	// TODO(multipart-version): replace the empty version id with the upload's
+	// VersionID from Coordinator.GetUpload and drop the multipart: mode prefix.
+	// Multipart parts use an empty AAD version until then; the mode prefix keeps
+	// reads consistent.
 	spec := s.objectSpec(b, t.Key, "", contentLength(r), r.Header.Get("Content-Type"), meta, nil, "STANDARD", b.DefaultRCID)
 	spec.ChunkSize = s.cfg.ChunkSize
 	spec.MaxBytes = s.limits.PartSizeMax

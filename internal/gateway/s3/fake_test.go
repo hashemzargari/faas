@@ -35,9 +35,10 @@ type fakeCoord struct {
 }
 
 type fakeUpload struct {
-	bucket string
-	key    string
-	parts  map[int]contract.PartInfo
+	bucket    string
+	key       string
+	versionID contract.VersionID
+	parts     map[int]contract.PartInfo
 }
 
 func newFakeCoord() *fakeCoord {
@@ -322,7 +323,7 @@ func (f *fakeCoord) CreateUpload(ctx context.Context, bucket, key string, meta c
 	defer f.mu.Unlock()
 	f.nextID++
 	id := contract.UploadID(fmt.Sprintf("upload-%d", f.nextID))
-	f.uploads[id] = &fakeUpload{bucket: bucket, key: key, parts: make(map[int]contract.PartInfo)}
+	f.uploads[id] = &fakeUpload{bucket: bucket, key: key, versionID: meta.VersionID, parts: make(map[int]contract.PartInfo)}
 	return id, nil
 }
 
@@ -357,9 +358,19 @@ func (f *fakeCoord) ListUploads(ctx context.Context, bucketID contract.BucketID)
 	defer f.mu.Unlock()
 	var out []contract.UploadInfo
 	for id, u := range f.uploads {
-		out = append(out, contract.UploadInfo{UploadID: id, BucketID: bucketID, Key: u.key, Initiated: nowUTC(), StorageClass: "STANDARD"})
+		out = append(out, contract.UploadInfo{UploadID: id, BucketID: bucketID, Key: u.key, VersionID: u.versionID, Initiated: nowUTC(), StorageClass: "STANDARD"})
 	}
 	return out, nil
+}
+
+func (f *fakeCoord) GetUpload(ctx context.Context, up contract.UploadID) (contract.UploadInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u, ok := f.uploads[up]
+	if !ok {
+		return contract.UploadInfo{}, contract.ErrNotFound
+	}
+	return contract.UploadInfo{UploadID: up, Key: u.key, VersionID: u.versionID, Initiated: nowUTC(), StorageClass: "STANDARD"}, nil
 }
 
 func (f *fakeCoord) CompleteUpload(ctx context.Context, up contract.UploadID) (contract.CommitResult, error) {
@@ -369,8 +380,11 @@ func (f *fakeCoord) CompleteUpload(ctx context.Context, up contract.UploadID) (c
 	if !ok {
 		return contract.CommitResult{}, contract.ErrNotFound
 	}
-	f.nextID++
-	version := contract.VersionID(fmt.Sprintf("v-%d", f.nextID))
+	version := u.versionID
+	if version == "" {
+		f.nextID++
+		version = contract.VersionID(fmt.Sprintf("v-%d", f.nextID))
+	}
 	b := f.buckets[u.bucket]
 	m := contract.Manifest{
 		TenantID: "t1", ProjectID: "p1", BucketID: b.BucketID, Key: u.key,

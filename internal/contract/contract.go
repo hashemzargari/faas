@@ -307,7 +307,6 @@ type Coordinator interface {
 	CommitPart(ctx context.Context, up UploadID, partNumber int, etag string, size int64, chunks []ChunkRef, enc EncryptionMeta) error
 	ListParts(ctx context.Context, up UploadID) ([]PartInfo, error)
 	ListUploads(ctx context.Context, bucketID BucketID) ([]UploadInfo, error)
-	GetUpload(ctx context.Context, up UploadID) (UploadInfo, error)
 	CompleteUpload(ctx context.Context, up UploadID) (CommitResult, error)
 	AbortUpload(ctx context.Context, up UploadID) error
 

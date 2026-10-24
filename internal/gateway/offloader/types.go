@@ -36,6 +36,9 @@ var (
 
 // MultipartModePrefix marks an EncryptionMeta.Mode written by a multipart part.
 //
+// TODO(multipart-version): temporary bridge; delete it (and the read-path strip)
+// once UploadPart resolves the upload's VersionID through Coordinator.GetUpload.
+//
 // Multipart parts are encrypted before the final object version id exists, so
 // their chunk AAD binds an empty version id rather than the manifest's. The
 // prefix records that decision in the manifest (which is assembled from part 0's

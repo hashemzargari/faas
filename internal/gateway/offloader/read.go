@@ -30,8 +30,10 @@ func (o *Offloader) Read(ctx context.Context, req ReadRequest, w io.Writer) erro
 	}
 
 	aadVersion := string(m.VersionID)
-	// Multipart parts are written before the final version id exists; the mode
-	// prefix marks that they bound an empty AAD version instead.
+	// TODO(multipart-version): delete this strip once parts bind the real version
+	// id (Coordinator.GetUpload); see offloader.MultipartModePrefix.
+	// Multipart parts are written before the final version id is available to the
+	// part path; the mode prefix marks that they bound an empty AAD version.
 	if strings.HasPrefix(m.Encryption.Mode, MultipartModePrefix) {
 		aadVersion = ""
 	}
