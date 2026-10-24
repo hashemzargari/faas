@@ -369,7 +369,11 @@ type AnnounceResult struct {
 }
 
 type Heartbeat struct {
-	AgentID         AgentID   `json:"agent_id"`
+	AgentID AgentID `json:"agent_id"`
+	// DiskID is the physical disk UUID the agent bound at first announce. It is
+	// reported on every heartbeat so the control plane can reconcile a replaced
+	// disk against the agent identity that owns the slot (docs/04 §5.4).
+	DiskID          string    `json:"disk_id"`
 	FreeBytes       int64     `json:"free_bytes"`
 	UsedBytes       int64     `json:"used_bytes"`
 	ShardCount      int64     `json:"shard_count"`

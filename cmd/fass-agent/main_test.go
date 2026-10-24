@@ -33,6 +33,7 @@ func TestParseFlagsDefaults(t *testing.T) {
 func TestParseFlagsValues(t *testing.T) {
 	cfg, err := parseFlags([]string{
 		"--disk", "/data",
+		"--disk-id", "disk-explicit-1",
 		"--port", "7200",
 		"--nexus-id", "nexus-a",
 		"--node-id", "node-1",
@@ -48,7 +49,7 @@ func TestParseFlagsValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
 	}
-	if cfg.disk != "/data" || cfg.port != 7200 || cfg.nexusID != "nexus-a" ||
+	if cfg.disk != "/data" || cfg.diskID != "disk-explicit-1" || cfg.port != 7200 || cfg.nexusID != "nexus-a" ||
 		cfg.nodeID != "node-1" || cfg.coordURL != "coord:7000" || cfg.secret != "abc" ||
 		cfg.reservePct != 7.5 || cfg.maxShard != 8388608 ||
 		cfg.scrub || cfg.repair || cfg.heartbeat != 2*time.Second || cfg.logLevel != "debug" {

@@ -38,6 +38,7 @@ const version = "0.1.0-dev"
 
 type config struct {
 	disk        string
+	diskID      string
 	port        int
 	nexusID     string
 	nodeID      string
@@ -80,6 +81,7 @@ func parseFlags(args []string) (config, error) {
 	fs := flag.NewFlagSet("fass-agent", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.StringVar(&cfg.disk, "disk", "./data", "path to the disk this agent owns")
+	fs.StringVar(&cfg.diskID, "disk-id", "", "authoritative disk UUID for this disk (default: generate/persist in <disk>/state.json; a mismatch with the persisted id refuses to start)")
 	fs.IntVar(&cfg.port, "port", 7100, "shard HTTP listen port (0 picks a free port)")
 	fs.StringVar(&cfg.nexusID, "nexus-id", "", "nexus (site/AZ) this agent belongs to")
 	fs.StringVar(&cfg.nodeID, "node-id", "", "node id reported to the coordinator")
@@ -148,6 +150,7 @@ func run(parent context.Context, cfg config, logger *slog.Logger) error {
 
 	st, err := store.Open(ctx, store.Options{
 		Root:          cfg.disk,
+		DiskID:        cfg.diskID,
 		ReservePct:    cfg.reservePct,
 		MaxShardBytes: cfg.maxShard,
 		Logger:        logger,
@@ -210,6 +213,7 @@ func run(parent context.Context, cfg config, logger *slog.Logger) error {
 		"version", version,
 		"disk", st.Root(),
 		"disk_id", st.DiskID(),
+		"disk_id_explicit", cfg.diskID != "",
 		"shards", st.Stats().ShardCount,
 		"port", port,
 		"node_id", cfg.nodeID,
@@ -368,6 +372,7 @@ func runMembership(
 	persistAgentState(st.Root(), logger, agentState{
 		AgentID:     res.AgentID,
 		NexusID:     res.NexusID,
+		DiskID:      st.DiskID(),
 		AnnouncedAt: time.Now().UTC(),
 	})
 	select {
@@ -413,6 +418,7 @@ func inventoryDigest(stats store.Stats) string {
 type agentState struct {
 	AgentID     contract.AgentID `json:"agent_id"`
 	NexusID     contract.NexusID `json:"nexus_id"`
+	DiskID      string           `json:"disk_id"`
 	AnnouncedAt time.Time        `json:"announced_at"`
 }
 

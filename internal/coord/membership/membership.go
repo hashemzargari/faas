@@ -815,13 +815,6 @@ func (s *Service) Announce(ctx context.Context, req contract.AnnounceRequest) (c
 			ag, nodeScoped = pending, true
 		}
 
-		pubKey := base64.StdEncoding.EncodeToString(req.PublicKey)
-		if owner, err := tx.Get(spaceAgentPub, []byte(pubKey)); err == nil && string(owner) != string(ag.ID) {
-			return coerr.ErrDuplicatePublicKey
-		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return err
-		}
-
 		if ag.ExpectedPort != 0 && req.Port != ag.ExpectedPort {
 			return coerr.ErrPortMismatch
 		}
@@ -1482,6 +1475,38 @@ func agentLocationKey(node contract.NodeID, disk string) []byte {
 
 func nodeSlotKey(node contract.NodeID, slot string) []byte {
 	return agentLocationKey(node, "#"+slot)
+}
+
+// findNodeScopedPending finds the node-scoped pending registration on node whose
+// one-time secret matches. Matching by secret (constant-time) is what allows
+// several pending disks on the same node: the secret identifies the slot the
+// operator provisioned, not merely the node.
+func findNodeScopedPending(tx *storage.WriteTx, node contract.NodeID, secret string) (Agent, bool, error) {
+	sum := sha256.Sum256([]byte(secret))
+	prefix := []byte(string(node) + "\x00")
+	var (
+		found Agent
+		ok    bool
+	)
+	err := tx.Scan(spaceAgentLoc, prefix, func(key, value []byte) error {
+		suffix := key[len(prefix):]
+		if len(suffix) == 0 || suffix[0] != '#' {
+			return nil // exact disk binding, handled before this fallback
+		}
+		ag, err := storage.GetJSON[Agent](tx, spaceAgents, value)
+		if err != nil {
+			return err
+		}
+		if ag.State != StatePending || len(ag.SecretHash) == 0 {
+			return nil
+		}
+		if subtle.ConstantTimeCompare(sum[:], ag.SecretHash) == 1 {
+			found, ok = ag, true
+			return storage.StopScan()
+		}
+		return nil
+	})
+	return found, ok, err
 }
 
 func clamp01(v float64) float64 {
