@@ -677,3 +677,17 @@ fass-gateway pki issue-server --ca-dir /etc/fass/pki/ca --dir /etc/fass/pki/agen
 The transition is a state, not an option: compat/tests assert that strict mode
 rejects a plaintext peer, and an expired certificate fails with an actionable
 `renew/re-enroll` message rather than an opaque handshake error.
+
+### 4.4 Verifying the shipped matrix in both modes
+
+```console
+make compat-clients       # 16 checks, plaintext dev cluster (--insecure)
+make compat-clients-tls   # same 16 checks with mTLS on the shard transport
+```
+
+`COMPAT_TLS=1` mints a throwaway CA under the run's temp directory with
+`fass-gateway pki`, starts the 12 agents with `--require-mtls` and the gateway
+with `--agent-tls=require --require-mtls`; the coordinator stays plaintext in
+this dev matrix and the gateway opts in explicitly with `--coordinator-insecure`.
+Nothing is written to the repository and the temp directory is removed on
+success (`COMPAT_KEEP=1` keeps the logs).
