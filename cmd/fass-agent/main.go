@@ -54,19 +54,27 @@ type config struct {
 	tlsClientKey  string
 	requireMTLS   bool
 	insecure      bool
-	hostname      string
-	reservePct    float64
-	maxShard      int64
-	scrub         bool
-	scrubPeriod   time.Duration
-	scrubRate     int64
-	repair        bool
-	repairWork    int
-	repairFetch   int
-	heartbeat     time.Duration
-	shutdown      time.Duration
-	logLevel      string
-	showVersion   bool
+
+	// Control-plane (agent -> coordinator) TLS is configured independently of
+	// the shard listener: different CA and identity are legitimate.
+	coordCA         string
+	coordServerName string
+	coordClientCert string
+	coordClientKey  string
+
+	hostname    string
+	reservePct  float64
+	maxShard    int64
+	scrub       bool
+	scrubPeriod time.Duration
+	scrubRate   int64
+	repair      bool
+	repairWork  int
+	repairFetch int
+	heartbeat   time.Duration
+	shutdown    time.Duration
+	logLevel    string
+	showVersion bool
 }
 
 func main() {
@@ -182,7 +190,11 @@ func registerFlags(fs *flag.FlagSet, cfg *config) {
 	fs.IntVar(&cfg.port, "port", 7100, "shard HTTP listen port (0 picks a free port)")
 	fs.StringVar(&cfg.nexusID, "nexus-id", "", "nexus (site/AZ) this agent belongs to")
 	fs.StringVar(&cfg.nodeID, "node-id", "", "node id reported to the coordinator")
-	fs.StringVar(&cfg.coordURL, "coordinator-url", "http://127.0.0.1:7000", "coordinator control-plane URL")
+	fs.StringVar(&cfg.coordURL, "coordinator-url", "http://127.0.0.1:7000", "coordinator control-plane URL (https:// requires --coordinator-ca; http:// requires --insecure)")
+	fs.StringVar(&cfg.coordCA, "coordinator-ca", "", "CA bundle (PEM) used to verify the coordinator's server certificate (independent of --tls-ca)")
+	fs.StringVar(&cfg.coordServerName, "coordinator-server-name", "", "server name verified against the coordinator certificate (default: host from --coordinator-url)")
+	fs.StringVar(&cfg.coordClientCert, "coordinator-client-cert", "", "client certificate presented to a coordinator with --require-mtls (default: --tls-client-cert, then --tls-cert)")
+	fs.StringVar(&cfg.coordClientKey, "coordinator-client-key", "", "client key for --coordinator-client-cert")
 	fs.StringVar(&cfg.secret, "secret", "", "one-time announce secret issued by the coordinator (visible in the process list; prefer --secret-file or FASS_AGENT_SECRET)")
 	fs.StringVar(&cfg.secretFile, "secret-file", "", "file holding the one-time announce secret (one trailing newline is trimmed; mutually exclusive with --secret)")
 	fs.StringVar(&cfg.tlsCert, "tls-cert", "", "PEM certificate for the shard TLS listener (required unless --insecure)")
@@ -226,6 +238,11 @@ func usageFunc(fs *flag.FlagSet) func() {
 		fmt.Fprintln(out, "--tls-cert/--tls-key (and --tls-ca for mTLS or repair); missing material is fatal.")
 		fmt.Fprintln(out, "--insecure is the only way to serve plaintext: it warns on every start and")
 		fmt.Fprintln(out, "/v1/healthz reports {\"tls\":false,\"insecure\":true}.")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Coordinator TLS is configured separately from the shard listener:")
+		fmt.Fprintln(out, "an https:// --coordinator-url requires --coordinator-ca (never silently downgraded),")
+		fmt.Fprintln(out, "an http:// URL requires --insecure, and --coordinator-client-cert/-key supplies the")
+		fmt.Fprintln(out, "agent identity for a coordinator running --require-mtls.")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "Flags:")
 		fs.PrintDefaults()
@@ -337,10 +354,7 @@ func run(parent context.Context, cfg config, logger *slog.Logger) error {
 		return fmt.Errorf("agent identity: %w", err)
 	}
 
-	coord, err := coordclient.New(cfg.coordURL, coordclient.Options{
-		Timeout: 10 * time.Second,
-		Logger:  logger,
-	})
+	coord, err := buildCoordinatorClient(cfg, logger)
 	if err != nil {
 		return fmt.Errorf("coordinator client: %w", err)
 	}
@@ -396,6 +410,7 @@ func run(parent context.Context, cfg config, logger *slog.Logger) error {
 		"nexus_id", cfg.nexusID,
 		"public_key", ident.PublicKeyBase64(),
 		"coordinator", cfg.coordURL,
+		"coordinator_tls", strings.HasPrefix(strings.ToLower(strings.TrimSpace(cfg.coordURL)), "https://"),
 		"secret_source", cfg.secretSource,
 		"tls_enabled", !security.insecure,
 		"insecure", security.insecure,

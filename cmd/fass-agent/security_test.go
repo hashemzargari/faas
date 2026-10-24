@@ -348,6 +348,11 @@ func TestRunTLSListenerEndToEnd(t *testing.T) {
 	env["FASS_AGENT_TLS_KEY"] = server.KeyFile
 	env["FASS_AGENT_TLS_CA"] = caFile
 	env["FASS_AGENT_REPAIR"] = "false"
+	// The control plane is fail-closed too: an https:// coordinator URL needs a
+	// CA bundle even when no announce happens in this test.
+	env["FASS_AGENT_COORDINATOR_URL"] = "https://127.0.0.1:1"
+	env["FASS_AGENT_COORDINATOR_CA"] = caFile
+	env["FASS_AGENT_COORDINATOR_SERVER_NAME"] = "localhost"
 
 	cfg, err := parseFlagsWithEnv(nil, mapEnv(env))
 	if err != nil {

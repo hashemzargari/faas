@@ -19,6 +19,7 @@ import (
 
 	"github.com/fass-storage/fass/internal/agent/uid"
 	"github.com/fass-storage/fass/internal/contract"
+	"github.com/fass-storage/fass/internal/pki"
 )
 
 // Options configures the coordinator client.
@@ -28,6 +29,14 @@ type Options struct {
 	Timeout    time.Duration
 	UserAgent  string
 	Logger     *slog.Logger
+	// TLSEnabled marks the connection as TLS. It is used only for error
+	// annotation: transport failures are wrapped with
+	// pki.ExplainTLSHandshakeError so an operator sees "certificate expired" or
+	// "plaintext peer", not an opaque handshake error.
+	TLSEnabled bool
+	// PeerName names the coordinator in TLS error messages. Defaults to the
+	// host derived from the coordinator URL.
+	PeerName string
 }
 
 // Client is an HTTP coordinator client.
@@ -36,6 +45,8 @@ type Client struct {
 	hc   *http.Client
 	ua   string
 	log  *slog.Logger
+	tls  bool
+	peer string
 }
 
 // New builds a client for baseURL, which may be "host:port" or a full URL.
@@ -60,7 +71,20 @@ func New(baseURL string, opts Options) (*Client, error) {
 	if ua == "" {
 		ua = "fass-agent-coordclient/1"
 	}
-	return &Client{base: base, hc: hc, ua: ua, log: logger.With("component", "coordclient")}, nil
+	peer := opts.PeerName
+	if peer == "" {
+		if u, err := url.Parse(base); err == nil {
+			peer = u.Hostname()
+		}
+	}
+	return &Client{
+		base: base,
+		hc:   hc,
+		ua:   ua,
+		log:  logger.With("component", "coordclient"),
+		tls:  opts.TLSEnabled,
+		peer: peer,
+	}, nil
 }
 
 func normalizeBase(baseURL string, opts Options) (string, error) {
@@ -75,6 +99,11 @@ func normalizeBase(baseURL string, opts Options) (string, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil || u.Host == "" {
 		return "", fmt.Errorf("coordclient: invalid coordinator url %q", baseURL)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+	default:
+		return "", fmt.Errorf("coordclient: unsupported coordinator url scheme %q (want http or https)", u.Scheme)
 	}
 	return strings.TrimRight(u.String(), "/"), nil
 }
@@ -146,6 +175,28 @@ func (c *Client) CommitRepair(ctx context.Context, result contract.RepairResult)
 
 var errNoContent = errors.New("coordclient: no content")
 
+// explainTransportError turns TLS handshake failures into actionable operator
+// messages, including the specific fix for a coordinator that requires mTLS
+// but received no agent client certificate.
+func (c *Client) explainTransportError(err error) error {
+	if !c.tls {
+		return err
+	}
+	peer := c.peer
+	if peer == "" {
+		peer = "coordinator"
+	}
+	explained := pki.ExplainTLSHandshakeError(err, peer)
+	msg := explained.Error()
+	if strings.Contains(msg, "rejected our certificate") ||
+		strings.Contains(msg, "certificate required") ||
+		strings.Contains(msg, "tls: bad certificate") {
+		return fmt.Errorf("%w; the coordinator requires mutual TLS: configure the agent client "+
+			"certificate with --coordinator-client-cert/--coordinator-client-key", explained)
+	}
+	return explained
+}
+
 func (c *Client) doJSON(ctx context.Context, method, path string, in, out any, wantStatuses ...int) error {
 	var reader io.Reader
 	if in != nil {
@@ -166,7 +217,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, in, out any, w
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("request %s %s: %w", method, path, err)
+		return fmt.Errorf("request %s %s: %w", method, path, c.explainTransportError(err))
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))

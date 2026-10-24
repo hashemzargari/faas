@@ -658,6 +658,60 @@ Agent TLS notes:
   inside its renewal window, and a half-written key file during rotation keeps
   the previous certificate serving.
 
+**Agent → coordinator TLS (control plane).** Configured separately from the
+shard listener: it is normal for the coordinator to sit behind a different CA
+than the agent mesh, so the flags are deliberately distinct.
+
+| Agent flag | Env | Meaning |
+|---|---|---|
+| `--coordinator-ca` | `FASS_AGENT_COORDINATOR_CA` | CA bundle that verifies the coordinator's server certificate; **required** for an `https://` coordinator URL |
+| `--coordinator-server-name` | `FASS_AGENT_COORDINATOR_SERVER_NAME` | name verified against the coordinator certificate (default: host from `--coordinator-url`) |
+| `--coordinator-client-cert` / `--coordinator-client-key` | `FASS_AGENT_COORDINATOR_CLIENT_CERT` / `FASS_AGENT_COORDINATOR_CLIENT_KEY` | agent identity presented to a coordinator running `--require-mtls` |
+
+Fail-closed rules (checked at startup, before any announce):
+
+* `https://` coordinator URL **without** `--coordinator-ca` → refuse to start.
+  An `https://` URL is never downgraded to plaintext.
+* `http://` coordinator URL (or a legacy `host:port` value) **without**
+  `--insecure` → refuse to start.
+* `--insecure` together with any `--coordinator-*` TLS flag → refuse to start
+  (ambiguous configuration).
+* `--coordinator-client-cert`/`--coordinator-client-key` must carry the
+  client-auth EKU; a server-only certificate is rejected at startup with an
+  actionable message. When neither flag is set, the agent falls back to the
+  repair identity (`--tls-client-cert/--tls-client-key`), then to a
+  both-usage listener identity, and otherwise connects server-auth-only.
+* If the coordinator is switched to `--require-mtls` and an agent has no client
+  certificate, announce fails with an error naming
+  `--coordinator-client-cert/--coordinator-client-key` — not an opaque
+  handshake failure.
+
+**SAN guidance for the coordinator certificate.** Agents (and gateways) verify
+the certificate against the host in the URL, and deployments announce
+`hostname:port`, so the coordinator certificate needs a **DNS SAN for the
+hostname peers dial** (for example `coordinator.internal`), not just an IP SAN.
+If the dialed address is a load balancer / VIP that is not in the SAN list, set
+`--coordinator-server-name` to a name that *is* in the certificate. Keep the
+coordinator's own certificate rotation on the same `pki` renewal window as the
+rest of the cluster.
+
+```console
+# coordinator (mutual TLS, verifies agent/gateway client certs)
+fass-coordinator --listen :7000 --tls-cert /etc/fass/pki/coordinator/tls.crt \
+  --tls-key /etc/fass/pki/coordinator/tls.key \
+  --tls-client-ca /etc/fass/pki/ca/ca.crt --require-mtls
+
+# agent: encrypted control plane, explicit agent identity for coordinator mTLS
+fass-agent --disk /data --coordinator-url https://coordinator.internal:7000 \
+  --coordinator-ca /etc/fass/pki/ca/ca.crt \
+  --coordinator-client-cert /etc/fass/pki/agent/tls.crt \
+  --coordinator-client-key /etc/fass/pki/agent/tls.key
+```
+
+The control-plane TLS posture is logged at startup
+(`coordinator control-plane TLS enabled`, including the verified server name)
+and is independent of `/v1/healthz`'s shard-listener `tls`/`insecure` fields.
+
 ### 4.2 Rotation without a flag day
 
 Certificates renew inside a window of **one third of their lifetime, capped at
@@ -691,17 +745,34 @@ rejects a plaintext peer, and an expired certificate fails with an actionable
 ### 4.4 Verifying the shipped matrix in both modes
 
 ```console
-make compat-clients       # 16 checks, plaintext dev cluster (--insecure)
-make compat-clients-tls   # same 16 checks with mTLS on the shard transport
+make compat-clients            # 16 checks, plaintext data plane, HTTP edge
+make compat-clients-tls        # mTLS data plane, HTTP edge
+make compat-clients-tls-edge   # mTLS data plane + HTTPS on the S3 edge
+                               # (= COMPAT_TLS=1 COMPAT_EDGE_TLS=1)
 ```
 
 `COMPAT_TLS=1` mints a throwaway CA under the run's temp directory with
 `fass-gateway pki`, starts the 12 agents with `--require-mtls` and the gateway
-with `--agent-tls=require --require-mtls`. The coordinator stays plaintext in
-this dev matrix only because agent → coordinator TLS is not wired yet; the
-gateway opts in explicitly with the transitional `--coordinator-insecure` (see
-the control-plane note in §4.1). When that last hop ships, the mode should run
-with `--coordinator https://… --coordinator-ca …` and the flag should disappear
-from both the script and these docs.
+with `--agent-tls=require --require-mtls`. `COMPAT_EDGE_TLS=1` additionally
+serves the S3 edge with `--tls-cert/--tls-key` from the same CA.
+
+The edge certificate must have a SAN for the host clients dial
+(`--ip 127.0.0.1` and `--dns "$(hostname)"` — the script does both); SNI uses
+that endpoint host. Each client is pointed at the custom CA with its own
+mechanism, which is the friction worth knowing:
+
+| Client | Custom CA | Gotcha |
+|---|---|---|
+| aws-cli v1 | `AWS_CA_BUNDLE=/path/ca.crt` (env) | v1's `--ca-bundle` parsing is unreliable across subcommands; the env var is the dependable path |
+| rclone | global `--ca-cert /path/ca.crt` on every invocation | no per-remote `ca_cert` for the `s3` backend, so it must be in the rclone wrapper/config flags |
+| s3cmd | `ca_certs_file = /path/ca.crt` + `use_https = True` + `check_ssl_certificate = True` in `.s3cfg` | a stale `use_https = False` silently downgrades the client, so verify it in the generated config |
+
+The coordinator stays plaintext in these dev matrices only because
+agent → coordinator TLS is not wired yet; the gateway opts in explicitly with
+the transitional `--coordinator-insecure` (see the control-plane note in §4.1).
+When that last hop ships, the modes should run with
+`--coordinator https://… --coordinator-ca …` and the flag should disappear from
+both the script and these docs; the script's success line reports exactly which
+hops were encrypted (`data plane mTLS; S3 edge HTTPS (custom CA)`).
 Nothing is written to the repository and the temp directory is removed on
 success (`COMPAT_KEEP=1` keeps the logs).
