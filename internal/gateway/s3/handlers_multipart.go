@@ -18,9 +18,10 @@ import (
 
 // cachedUpload is the immutable identity of an in-progress upload.
 type cachedUpload struct {
-	key       string
-	versionID contract.VersionID
-	expires   time.Time
+	key        string
+	versionID  contract.VersionID
+	encryption contract.EncryptionMeta
+	expires    time.Time
 }
 
 // uploadCacheTTL bounds how long upload metadata is cached. Uploads never change
@@ -47,7 +48,12 @@ func (s *Server) resolveUpload(ctx context.Context, uploadID contract.UploadID, 
 		if up.UploadID != uploadID {
 			continue
 		}
-		entry := cachedUpload{key: up.Key, versionID: up.VersionID, expires: now.Add(uploadCacheTTL)}
+		entry := cachedUpload{
+			key:        up.Key,
+			versionID:  up.VersionID,
+			encryption: up.Encryption,
+			expires:    now.Add(uploadCacheTTL),
+		}
 		s.uploadsMu.Lock()
 		if len(s.uploadsCache) > 4096 {
 			s.uploadsCache = make(map[contract.UploadID]cachedUpload)
@@ -108,12 +114,21 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 		s.fail(w, r, ErrAccessDenied.withMessage("Upload rejected by Smart Data Placement policy."))
 		return
 	}
+	// One FileKey for the whole object version, minted before encryption so every
+	// part shares it and the committed manifest can unlock all parts.
+	encMeta, err := s.off.NewEncryptionMeta(r.Context(), b.TenantID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	uploadMeta := contract.CommitRequest{
 		// The version id is minted here so every part can bind it in its chunk
 		// AAD and CompleteUpload can promote it into the manifest.
 		VersionID:    contract.VersionID(s.newUUID()),
 		BucketID:     b.BucketID,
 		Key:          t.Key,
+		ChunkSize:    s.cfg.ChunkSize,
+		Encryption:   encMeta,
 		ContentType:  r.Header.Get("Content-Type"),
 		UserMeta:     meta,
 		Tags:         tags,
@@ -203,6 +218,7 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, t targ
 	}
 	spec := s.objectSpec(b, t.Key, upload.versionID, contentLength(r), r.Header.Get("Content-Type"), meta, nil, "STANDARD", b.DefaultRCID)
 	spec.ChunkSize = s.cfg.ChunkSize
+	spec.Encryption = &upload.encryption
 	spec.MaxBytes = s.limits.PartSizeMax
 	spec.Checksums = checksums
 	spec.DeferredChecksums = s.deferredChecksums(r)
@@ -312,6 +328,7 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, t 
 		_ = pw.CloseWithError(err)
 	}()
 	spec := s.objectSpec(dstBucket, t.Key, upload.versionID, size, manifest.ContentType, manifest.UserMeta, nil, "STANDARD", dstBucket.DefaultRCID)
+	spec.Encryption = &upload.encryption
 	spec.MaxBytes = s.limits.PartSizeMax
 	part, err := s.off.WritePart(ctx, spec, uploadID, partNumber, pr)
 	cancel()

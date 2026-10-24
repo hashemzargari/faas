@@ -57,11 +57,14 @@ func (o *Offloader) Read(ctx context.Context, req ReadRequest, w io.Writer) erro
 		return err
 	}
 
-	chunkSize := m.ChunkSize
-	if chunkSize <= 0 {
-		chunkSize = o.cfg.ChunkSize
+	// Per-chunk plaintext lengths. Multipart parts of arbitrary size make chunk
+	// lengths non-uniform mid-object, so byte ranges must be mapped through a
+	// prefix sum, never through arithmetic on a fixed chunk size.
+	lengths, err := chunkPlaintextLengths(m, frameSize)
+	if err != nil {
+		return err
 	}
-	needed, err := chunkRanges(m, chunkSize, req.Range)
+	needed, err := planChunkRanges(lengths, req.Range)
 	if err != nil {
 		return err
 	}
@@ -75,7 +78,7 @@ func (o *Offloader) Read(ctx context.Context, req ReadRequest, w io.Writer) erro
 		if err != nil {
 			return fmt.Errorf("%w: chunk %d params: %v", ErrManifest, cr.Index, err)
 		}
-		plaintext, err := o.readChunk(ctx, tenant, m.BucketID, req.Bucket, req.Key, aadVersion, codec, ref, enc)
+		plaintext, err := o.readChunk(ctx, tenant, m.BucketID, req.Bucket, req.Key, aadVersion, ref.AADChunkIndex, codec, ref, enc)
 		if err != nil {
 			return err
 		}
@@ -90,33 +93,128 @@ func (o *Offloader) Read(ctx context.Context, req ReadRequest, w io.Writer) erro
 	return nil
 }
 
-// chunkRanges maps the requested range onto chunk slices. A nil range means the
-// whole object.
-func chunkRanges(m contract.Manifest, chunkSize int, rng *ByteRange) ([]chunk.ChunkRange, error) {
+// chunkPlaintextLengths derives each chunk's plaintext length from its
+// ciphertext length.
+//
+// crypto frames a chunk as 28-byte header + plaintext + 28 bytes of GCM
+// nonce/tag per frame, with 1 MiB frames by default, so
+//
+//	ctLen = header + P + overhead*ceil(P/frameSize)
+//
+// has exactly one solution for P. Deriving it (instead of assuming every chunk
+// is full) is what makes multipart objects readable: a part boundary can leave a
+// short chunk anywhere in the object.
+func chunkPlaintextLengths(m contract.Manifest, frameSize int) ([]int64, error) {
+	if frameSize <= 0 {
+		return nil, fmt.Errorf("%w: invalid frame size %d", ErrManifest, frameSize)
+	}
+	lengths := make([]int64, len(m.Chunks))
+	var total int64
+	for i, ref := range m.Chunks {
+		if ref.CiphertextLen < 0 {
+			return nil, fmt.Errorf("%w: chunk %d negative ciphertext length", ErrManifest, i)
+		}
+		p, err := plaintextLenFor(ref.CiphertextLen, frameSize)
+		if err != nil {
+			return nil, fmt.Errorf("%w: chunk %d: %v", ErrManifest, i, err)
+		}
+		lengths[i] = int64(p)
+		total += int64(p)
+	}
+	if m.Size > 0 && total != m.Size {
+		return nil, fmt.Errorf("%w: chunk plaintext lengths sum to %d, manifest says %d", ErrManifest, total, m.Size)
+	}
+	return lengths, nil
+}
+
+// plaintextLenFor inverts the crypto chunk framing equation.
+func plaintextLenFor(ciphertextLen, frameSize int) (int, error) {
+	const header = 28
+	const overhead = 28 // 12-byte nonce + 16-byte GCM tag
+	if ciphertextLen == 0 {
+		return 0, nil
+	}
+	if ciphertextLen < header {
+		return 0, fmt.Errorf("ciphertext shorter than the chunk header")
+	}
+	body := ciphertextLen - header
+	// frameCount is ceil(P/frameSize); start from the lower bound and probe a
+	// couple of candidates to absorb rounding.
+	q := body / (frameSize + overhead)
+	for _, frames := range []int{q, q + 1, q + 2} {
+		if frames < 0 {
+			continue
+		}
+		p := body - overhead*frames
+		if p < 0 {
+			continue
+		}
+		if (frames == 0 && p == 0) || (frames > 0 && (frames-1)*frameSize < p && p <= frames*frameSize) {
+			if frames == (p+frameSize-1)/frameSize {
+				return p, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("ciphertext length %d does not match the frame layout", ciphertextLen)
+}
+
+// planChunkRanges maps an object byte range onto chunk slices using per-chunk
+// plaintext lengths. A nil range reads everything.
+func planChunkRanges(lengths []int64, rng *ByteRange) ([]chunk.ChunkRange, error) {
 	if rng == nil {
-		out := make([]chunk.ChunkRange, 0, len(m.Chunks))
-		for i := range m.Chunks {
-			start := int64(i) * int64(chunkSize)
-			length := int64(chunkSize)
-			if remaining := m.Size - start; remaining < length {
-				length = remaining
-			}
-			if length <= 0 {
-				break
-			}
-			out = append(out, chunk.ChunkRange{Index: i, Offset: 0, Length: length})
+		out := make([]chunk.ChunkRange, 0, len(lengths))
+		for i, l := range lengths {
+			out = append(out, chunk.ChunkRange{Index: i, Offset: 0, Length: l})
 		}
 		return out, nil
 	}
-	if rng.Length <= 0 || rng.Start < 0 {
+	if rng.Start < 0 || rng.Length < 0 {
+		return nil, fmt.Errorf("%w: invalid range", ErrManifest)
+	}
+	if rng.Length == 0 {
 		return nil, nil
 	}
-	end := rng.Start + rng.Length - 1
-	return chunk.MapRange(m.Size, int64(chunkSize), rng.Start, end)
+	end := rng.Start + rng.Length // exclusive
+	var out []chunk.ChunkRange
+	var offset int64
+	for i, l := range lengths {
+		chunkStart, chunkEnd := offset, offset+l
+		offset = chunkEnd
+		if chunkEnd <= rng.Start || chunkStart >= end {
+			continue
+		}
+		lo := max64(rng.Start, chunkStart)
+		hi := min64(end, chunkEnd)
+		if lo >= hi {
+			continue
+		}
+		out = append(out, chunk.ChunkRange{Index: i, Offset: lo - chunkStart, Length: hi - lo})
+		if offset >= end {
+			break
+		}
+	}
+	return out, nil
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // readChunk fetches enough shards for one chunk and reverses coding + encryption.
-func (o *Offloader) readChunk(ctx context.Context, tenant contract.TenantID, bucketID contract.BucketID, bucket, key, aadVersion string, codec *ec.Codec, ref contract.ChunkRef, enc *crypto.ChunkEncryptor) ([]byte, error) {
+// aadIndex is the chunk index that was bound in the AAD when the chunk was
+// written: the global index for a single PUT, the part-local index for a
+// multipart part.
+func (o *Offloader) readChunk(ctx context.Context, tenant contract.TenantID, bucketID contract.BucketID, bucket, key, aadVersion string, aadIndex int, codec *ec.Codec, ref contract.ChunkRef, enc *crypto.ChunkEncryptor) ([]byte, error) {
 	geom := codec.Geometry(ref.CiphertextLen)
 	if geom.CiphertextLen == 0 {
 		return []byte{}, nil
@@ -125,9 +223,12 @@ func (o *Offloader) readChunk(ctx context.Context, tenant contract.TenantID, buc
 		return nil, fmt.Errorf("%w: chunk %d has %d slots, want %d", ErrManifest, ref.Index, len(ref.Slots), geom.TotalShards)
 	}
 
-	// Shard set ids are derived from the object version; multipart parts used an
-	// empty version at write time, which aadVersion reflects.
-	shardSetID := contract.ShardSetIDFor(bucketID, key, contract.VersionID(aadVersion), ref.Index)
+	// Prefer the authoritative shard-set id stamped at write time. Only objects
+	// written before the field existed fall back to the (single-PUT) derivation.
+	shardSetID := ref.ShardSetID
+	if shardSetID == "" {
+		shardSetID = contract.ShardSetIDFor(bucketID, key, contract.VersionID(aadVersion), ref.Index)
+	}
 	shards := make([][]byte, geom.TotalShards)
 	params := ref.Params
 	groupSize := params.ShardsPerGroup()
@@ -175,7 +276,7 @@ func (o *Offloader) readChunk(ctx context.Context, tenant contract.TenantID, buc
 		Bucket:     bucket,
 		Key:        key,
 		VersionID:  aadVersion,
-		ChunkIndex: ref.Index,
+		ChunkIndex: aadIndex,
 	}
 	plaintext, err := enc.DecryptChunk(ciphertext, aad)
 	if err != nil {
@@ -321,4 +422,70 @@ func (o *Offloader) getShardBytes(ctx context.Context, endpoint string, shardSet
 		o.metrics.Inc("fass_gateway_shard_gets_total", map[string]string{"result": "error"})
 	}
 	return nil, false
+}
+
+// chunkAADPlan returns, for every chunk in the manifest, the chunk index that
+// was bound in its AAD at write time.
+//
+// A single PutObject numbers chunks 0..n-1, so the plan is the identity. A
+// multipart object is assembled from parts whose local chunk indices restart at
+// 0, and the coordinator renumbers ChunkRef.Index globally; the stamped
+// (scoped) shard-set id is what lets us recover each chunk's part-local index:
+// parts are sequential and each restarts at 0, so a single forward pass that
+// tries (part, local) then (part+1, 0) always finds the unique position.
+func chunkAADPlan(m contract.Manifest, bucketID contract.BucketID, key, version string) ([]int, error) {
+	plan := make([]int, len(m.Chunks))
+
+	// Fast path: a single PUT (stamped or legacy) where each shard-set id is the
+	// empty-scope derivation of its own dense index.
+	single := true
+	for i, ref := range m.Chunks {
+		want := contract.ShardSetIDForScoped(bucketID, key, contract.VersionID(version), "", i)
+		if ref.ShardSetID != "" {
+			if ref.ShardSetID != want {
+				single = false
+				break
+			}
+			continue
+		}
+		if ref.Index != i {
+			single = false
+			break
+		}
+	}
+	if single {
+		for i := range plan {
+			plan[i] = i
+		}
+		return plan, nil
+	}
+
+	part, local := 1, 0
+	for i, ref := range m.Chunks {
+		want := contract.ShardSetIDForScoped(bucketID, key, contract.VersionID(version),
+			fmt.Sprintf("part/%d", part), local)
+		if ref.ShardSetID == want {
+			plan[i] = local
+			local++
+			continue
+		}
+		// Part boundary: the next part restarts its chunk numbering at 0.
+		part++
+		local = 0
+		want = contract.ShardSetIDForScoped(bucketID, key, contract.VersionID(version),
+			fmt.Sprintf("part/%d", part), 0)
+		if ref.ShardSetID == want {
+			plan[i] = 0
+			local = 1
+			continue
+		}
+		if ref.ShardSetID == "" {
+			// Legacy object without stamped ids: best effort (global index).
+			plan[i] = ref.Index
+			continue
+		}
+		return nil, fmt.Errorf("%w: chunk %d shard-set id %s matches no multipart position",
+			ErrManifest, i, ref.ShardSetID)
+	}
+	return plan, nil
 }

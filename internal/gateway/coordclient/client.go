@@ -444,6 +444,12 @@ func (c *Client) ListObjects(ctx context.Context, req contract.ListRequest) (con
 	if req.Versions {
 		q.Set("versions", "true")
 	}
+	if req.KeyMarker != "" {
+		q.Set("key_marker", req.KeyMarker)
+	}
+	if req.VersionIDMarker != "" {
+		q.Set("version_id_marker", req.VersionIDMarker)
+	}
 	var out contract.ListResult
 	err := c.do(ctx, http.MethodGet, "/v1/objects", q, nil, &out)
 	return out, err

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -370,6 +371,24 @@ func TestCoordinatorEndToEnd(t *testing.T) {
 	}
 	if versions.Entries[0].VersionID != v2.VersionID || !versions.Entries[0].IsLatest {
 		t.Fatalf("newest version not listed first: %+v", versions.Entries[0])
+	}
+
+	// Marker pagination over the wire: pages must resume within a key.
+	var vpage1 contract.ListResult
+	resp = h.doJSON("GET", "/v1/objects?bucket=versioned-bucket&versions=1&max_keys=1", nil, &vpage1)
+	h.mustStatus(resp, http.StatusOK)
+	if len(vpage1.Entries) != 1 || vpage1.Entries[0].VersionID != v2.VersionID || !vpage1.IsTruncated {
+		t.Fatalf("version page 1 = %+v", vpage1)
+	}
+	if vpage1.NextKeyMarker != "versioned.txt" || vpage1.NextVersionIDMarker != string(v2.VersionID) {
+		t.Fatalf("version page 1 markers = %q/%q", vpage1.NextKeyMarker, vpage1.NextVersionIDMarker)
+	}
+	var vpage2 contract.ListResult
+	resp = h.doJSON("GET", "/v1/objects?bucket=versioned-bucket&versions=1&max_keys=1&key_marker="+
+		url.QueryEscape(vpage1.NextKeyMarker)+"&version_id_marker="+url.QueryEscape(vpage1.NextVersionIDMarker), nil, &vpage2)
+	h.mustStatus(resp, http.StatusOK)
+	if len(vpage2.Entries) != 1 || vpage2.Entries[0].VersionID != v1.VersionID || vpage2.IsTruncated {
+		t.Fatalf("version page 2 = %+v", vpage2)
 	}
 
 	// Tags.

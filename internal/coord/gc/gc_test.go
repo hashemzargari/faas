@@ -447,3 +447,111 @@ func TestRunUsesIntervalAndCancels(t *testing.T) {
 		t.Fatalf("Run did not execute a pass: %+v", stats)
 	}
 }
+
+// chunkWithIdentity customises one chunk ref: the object-wide Index and the
+// part-local AAD index differ for multipart objects, and ShardSetID is
+// authoritative.
+func chunkWithIdentity(t *testing.T, index int, aadIndex int, setID contract.ShardSetID) contract.ChunkRef {
+	t.Helper()
+	c := makeChunks(t, 1)[0]
+	c.Index = index
+	c.AADChunkIndex = aadIndex
+	c.ShardSetID = setID
+	return c
+}
+
+// TestGCUsesAuthoritativeMultipartShardSetIDs is the regression test for the
+// multipart collision: two parts both start at chunk index 0, so a derived id
+// from (bucket,key,version,Index) would collide with the other part's live
+// shards — GC must use ChunkRef.ShardSetID, and must target two disjoint sets.
+func TestGCUsesAuthoritativeMultipartShardSetIDs(t *testing.T) {
+	f := newFixture(t)
+	deleter := newFakeDeleter()
+	executor := gc.New(f.m, deleter, gc.Config{Now: func() time.Time { return f.now }, Logger: quietLogger()})
+	ctx := context.Background()
+
+	versionID := contract.VersionID(id.New())
+	const key = "multipart.bin"
+	// Both parts were written with part-local AAD index 0.
+	part1Set := contract.ShardSetIDForScoped(f.bucket.BucketID, key, versionID, "part/1", 0)
+	part2Set := contract.ShardSetIDForScoped(f.bucket.BucketID, key, versionID, "part/2", 0)
+	if part1Set == part2Set {
+		t.Fatalf("scoped derivation collided: %s", part1Set)
+	}
+	chunks := []contract.ChunkRef{
+		chunkWithIdentity(t, 0, 0, part1Set),
+		chunkWithIdentity(t, 1, 0, part2Set),
+	}
+	if _, err := f.m.CommitObject(ctx, contract.CommitRequest{
+		VersionID: versionID, BucketID: f.bucket.BucketID, Key: key,
+		Size: 2 * chunkSize, ETag: "etag-multipart", ChunkSize: chunkSize,
+		Chunks: chunks, ContentType: "application/octet-stream",
+	}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if _, _, err := f.m.DeleteObject(ctx, f.bucket.Name, key, "", false); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	res, err := executor.RunOnce(ctx, f.now.Add(25*time.Hour))
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if res.Completed != 1 || res.Failed != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+	for _, ep := range endpoints {
+		got := deleter.snapshot()[ep]
+		seen := map[contract.ShardSetID]bool{}
+		for _, id := range got {
+			seen[id] = true
+		}
+		if !seen[part1Set] || !seen[part2Set] {
+			t.Fatalf("endpoint %s did not delete both authoritative sets: %v", ep, got)
+		}
+		for _, id := range got {
+			if id != part1Set && id != part2Set {
+				t.Fatalf("endpoint %s deleted unexpected set %s (would be a live part's shards)", ep, id)
+			}
+		}
+		// The collision-prone derived ids must never be targeted here.
+		for _, bad := range []contract.ShardSetID{
+			contract.ShardSetIDFor(f.bucket.BucketID, key, versionID, 0),
+			contract.ShardSetIDFor(f.bucket.BucketID, key, versionID, 1),
+		} {
+			if seen[bad] {
+				t.Fatalf("endpoint %s targeted derived collision id %s", ep, bad)
+			}
+		}
+	}
+}
+
+// TestGCFallsBackToDerivationForLegacyManifests: manifests written before
+// ChunkRef.ShardSetID existed have an empty field and must still be collectable.
+func TestGCFallsBackToDerivationForLegacyManifests(t *testing.T) {
+	f := newFixture(t)
+	deleter := newFakeDeleter()
+	executor := gc.New(f.m, deleter, gc.Config{Now: func() time.Time { return f.now }, Logger: quietLogger()})
+	ctx := context.Background()
+
+	versionID := f.commitAndDelete(t, "legacy.bin", chunkSize, makeChunks(t, 1))
+	res, err := executor.RunOnce(ctx, f.now.Add(25*time.Hour))
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if res.Completed != 1 {
+		t.Fatalf("result = %+v", res)
+	}
+	want := contract.ShardSetIDFor(f.bucket.BucketID, "legacy.bin", versionID, 0)
+	for _, ep := range endpoints {
+		found := false
+		for _, id := range deleter.snapshot()[ep] {
+			if id == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("endpoint %s did not receive derived legacy id %s", ep, want)
+		}
+	}
+}

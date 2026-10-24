@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -35,27 +36,35 @@ type fakeCoord struct {
 	retention map[string]*contract.Retention
 	lifecycle map[string][]byte
 	uploads   map[contract.UploadID]*fakeUpload
-	nextID    int
+	// partContents is what the fake agent backend "stored" per part; Complete
+	// concatenates it so a handler-level multipart round trip is testable.
+	partContents map[contract.UploadID]map[int][]byte
+	// lastList records the most recent ListObjects request for assertions.
+	lastList contract.ListRequest
+	nextID   int
 }
 
 type fakeUpload struct {
-	bucket    string
-	key       string
-	versionID contract.VersionID
-	parts     map[int]contract.PartInfo
+	bucket     string
+	key        string
+	versionID  contract.VersionID
+	chunkSize  int
+	encryption contract.EncryptionMeta
+	parts      map[int]contract.PartInfo
 }
 
 func newFakeCoord() *fakeCoord {
 	return &fakeCoord{
-		buckets:   make(map[string]contract.BucketConfig),
-		manifests: make(map[string]contract.Manifest),
-		latest:    make(map[string]contract.VersionID),
-		contents:  make(map[string][]byte),
-		acls:      make(map[string]contract.ACL),
-		tags:      make(map[string]map[string]string),
-		retention: make(map[string]*contract.Retention),
-		lifecycle: make(map[string][]byte),
-		uploads:   make(map[contract.UploadID]*fakeUpload),
+		buckets:      make(map[string]contract.BucketConfig),
+		manifests:    make(map[string]contract.Manifest),
+		latest:       make(map[string]contract.VersionID),
+		contents:     make(map[string][]byte),
+		acls:         make(map[string]contract.ACL),
+		tags:         make(map[string]map[string]string),
+		retention:    make(map[string]*contract.Retention),
+		lifecycle:    make(map[string][]byte),
+		uploads:      make(map[contract.UploadID]*fakeUpload),
+		partContents: make(map[contract.UploadID]map[int][]byte),
 	}
 }
 
@@ -253,6 +262,7 @@ func (f *fakeCoord) DeleteObject(ctx context.Context, bucket, key string, versio
 func (f *fakeCoord) ListObjects(ctx context.Context, req contract.ListRequest) (contract.ListResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastList = req
 	prefix := string(req.BucketID) + "\x00"
 	type entry struct {
 		key string
@@ -327,7 +337,11 @@ func (f *fakeCoord) CreateUpload(ctx context.Context, bucket, key string, meta c
 	defer f.mu.Unlock()
 	f.nextID++
 	id := contract.UploadID(fmt.Sprintf("upload-%d", f.nextID))
-	f.uploads[id] = &fakeUpload{bucket: bucket, key: key, versionID: meta.VersionID, parts: make(map[int]contract.PartInfo)}
+	f.uploads[id] = &fakeUpload{
+		bucket: bucket, key: key, versionID: meta.VersionID,
+		chunkSize: meta.ChunkSize, encryption: meta.Encryption,
+		parts: make(map[int]contract.PartInfo),
+	}
 	return id, nil
 }
 
@@ -362,7 +376,7 @@ func (f *fakeCoord) ListUploads(ctx context.Context, bucketID contract.BucketID)
 	defer f.mu.Unlock()
 	var out []contract.UploadInfo
 	for id, u := range f.uploads {
-		out = append(out, contract.UploadInfo{UploadID: id, BucketID: bucketID, Key: u.key, VersionID: u.versionID, Initiated: nowUTC(), StorageClass: "STANDARD"})
+		out = append(out, contract.UploadInfo{UploadID: id, BucketID: bucketID, Key: u.key, VersionID: u.versionID, Encryption: u.encryption, Initiated: nowUTC(), StorageClass: "STANDARD"})
 	}
 	return out, nil
 }
@@ -374,20 +388,61 @@ func (f *fakeCoord) CompleteUpload(ctx context.Context, up contract.UploadID) (c
 	if !ok {
 		return contract.CommitResult{}, contract.ErrNotFound
 	}
+	numbers := make([]int, 0, len(u.parts))
+	for n := range u.parts {
+		numbers = append(numbers, n)
+	}
+	sort.Ints(numbers)
+	var chunks []contract.ChunkRef
+	var content []byte
+	var etags []string
+	partDatas := f.partContents[up]
+	for _, n := range numbers {
+		p := u.parts[n]
+		for _, c := range p.Chunks {
+			c.Index = len(chunks) // renumber globally, like coord/meta.CompleteUpload
+			chunks = append(chunks, c)
+		}
+		content = append(content, partDatas[n]...)
+		etags = append(etags, p.ETag)
+	}
 	version := u.versionID
 	if version == "" {
 		f.nextID++
 		version = contract.VersionID(fmt.Sprintf("v-%d", f.nextID))
 	}
+	chunkSize := u.chunkSize
+	if chunkSize == 0 {
+		chunkSize = 4 << 20
+	}
+	enc := u.encryption
+	if enc.Mode == "" && len(numbers) > 0 {
+		enc = u.parts[numbers[0]].Encryption
+	}
 	b := f.buckets[u.bucket]
 	m := contract.Manifest{
 		TenantID: "t1", ProjectID: "p1", BucketID: b.BucketID, Key: u.key,
-		VersionID: version, Size: 3, ETag: "multipart-etag-2", CreatedAt: nowUTC(),
+		VersionID: version, Size: int64(len(content)), ETag: multipartETag(etags),
+		ChunkSize: chunkSize, Chunks: chunks, Encryption: enc, CreatedAt: nowUTC(),
 	}
 	f.manifests[string(version)] = m
 	f.latest[string(b.BucketID)+"\x00"+u.key] = version
+	f.contents[string(version)] = content
 	delete(f.uploads, up)
+	delete(f.partContents, up)
 	return contract.CommitResult{VersionID: version, ETag: m.ETag}, nil
+}
+
+// multipartETag implements the AWS formula: md5(concat(binary part md5s))-N.
+func multipartETag(hexETags []string) string {
+	h := md5.New()
+	for _, e := range hexETags {
+		raw, err := hex.DecodeString(strings.Trim(e, `"`))
+		if err == nil {
+			h.Write(raw)
+		}
+	}
+	return fmt.Sprintf("%x-%d", h.Sum(nil), len(hexETags))
 }
 
 func (f *fakeCoord) AbortUpload(ctx context.Context, up contract.UploadID) error {
@@ -543,17 +598,45 @@ func (o *fakeOffloader) Write(ctx context.Context, spec offloader.ObjectSpec, bo
 	return res, nil
 }
 
+func (o *fakeOffloader) NewEncryptionMeta(ctx context.Context, tenant contract.TenantID) (contract.EncryptionMeta, error) {
+	return contract.EncryptionMeta{
+		Mode: "single-key", WrapKeyVersion: 1,
+		WrappedFileKey: []byte("fake-wrapped-file-key"),
+		KeyFingerprint: []byte{1, 2, 3, 4, 5, 6, 7, 8},
+		FrameSize:      1 << 20,
+	}, nil
+}
+
 func (o *fakeOffloader) WritePart(ctx context.Context, spec offloader.ObjectSpec, uploadID contract.UploadID, partNumber int, body io.Reader) (offloader.PartRef, error) {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return offloader.PartRef{}, err
 	}
 	sum := md5.Sum(data)
+	enc := spec.Encryption
+	if enc == nil {
+		fake, _ := o.NewEncryptionMeta(ctx, spec.TenantID)
+		enc = &fake
+	}
+	// Model the real offloader's scoped shard-set identity and AAD index so the
+	// handler test can assert parts never collide.
+	ref := contract.ChunkRef{
+		Index:         0,
+		CiphertextLen: len(data) + 28,
+		ShardSetID:    contract.ShardSetIDForScoped(spec.BucketID, spec.Key, spec.VersionID, fmt.Sprintf("part/%d", partNumber), 0),
+		AADChunkIndex: 0,
+	}
+	o.coord.mu.Lock()
+	if o.coord.partContents[uploadID] == nil {
+		o.coord.partContents[uploadID] = make(map[int][]byte)
+	}
+	o.coord.partContents[uploadID][partNumber] = data
+	o.coord.mu.Unlock()
 	return offloader.PartRef{
 		ETag:       fmt.Sprintf("%x", sum[:]),
 		Size:       int64(len(data)),
-		Chunks:     []contract.ChunkRef{{Index: 0}},
-		Encryption: contract.EncryptionMeta{Mode: "single-key"},
+		Chunks:     []contract.ChunkRef{ref},
+		Encryption: *enc,
 	}, nil
 }
 

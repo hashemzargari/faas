@@ -200,20 +200,14 @@ func (s *Server) handleListObjectVersions(w http.ResponseWriter, r *http.Request
 	keyMarker := q.Get("key-marker")
 	versionIDMarker := q.Get("version-id-marker")
 
-	// The contract's continuation token is opaque; encode both version markers
-	// into it so pagination is exactly lossless.
-	token := ""
-	if keyMarker != "" || versionIDMarker != "" {
-		token = keyMarker + "\x00" + versionIDMarker
-	}
-
 	result, err := s.coord.ListObjects(r.Context(), contract.ListRequest{
-		BucketID:          b.BucketID,
-		Prefix:            prefix,
-		Delimiter:         delimiter,
-		MaxKeys:           maxKeys,
-		Versions:          true,
-		ContinuationToken: token,
+		BucketID:        b.BucketID,
+		Prefix:          prefix,
+		Delimiter:       delimiter,
+		MaxKeys:         maxKeys,
+		Versions:        true,
+		KeyMarker:       keyMarker,
+		VersionIDMarker: versionIDMarker,
 	})
 	if err != nil {
 		s.fail(w, r, err)

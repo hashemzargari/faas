@@ -504,3 +504,98 @@ func TestDeferredChecksums(t *testing.T) {
 		t.Fatal("object was committed despite a bad deferred checksum")
 	}
 }
+
+// TestSinglePutStampsGoldenShardSetID pins the single-PUT derivation: the
+// stamped id must stay byte-identical to contract.ShardSetIDFor (no scope), so
+// objects written before the field existed still resolve.
+func TestSinglePutStampsGoldenShardSetID(t *testing.T) {
+	e := newEnv(t)
+	m := e.write(t, randomPayload(t, 1<<20))
+	for _, ch := range m.Chunks {
+		want := contract.ShardSetIDFor(m.BucketID, m.Key, m.VersionID, ch.Index)
+		if ch.ShardSetID != want {
+			t.Fatalf("chunk %d stamped id = %s, want %s", ch.Index, ch.ShardSetID, want)
+		}
+	}
+}
+
+// TestMultipartPartsHaveDisjointShardSets is the regression for the aws-cli
+// failure: two parts with identical payloads must not derive the same shard-set
+// ids (they would collide on immutable shard addresses and fail with 409).
+func TestMultipartPartsHaveDisjointShardSets(t *testing.T) {
+	e := newEnv(t)
+	payload := randomPayload(t, 1<<20)
+
+	part1, err := e.off.WritePart(context.Background(), e.spec, "upload-1", 1, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("part 1: %v", err)
+	}
+	spec2 := e.spec
+	spec2.Encryption = &part1.Encryption // all parts share the object's file key
+	part2, err := e.off.WritePart(context.Background(), spec2, "upload-1", 2, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("part 2: %v", err)
+	}
+
+	seen := make(map[contract.ShardSetID]bool)
+	for _, ch := range append(append([]contract.ChunkRef(nil), part1.Chunks...), part2.Chunks...) {
+		if ch.ShardSetID == "" {
+			t.Fatalf("chunk %d has no stamped shard-set id", ch.Index)
+		}
+		if seen[ch.ShardSetID] {
+			t.Fatalf("shard-set id %s reused across parts/chunks", ch.ShardSetID)
+		}
+		seen[ch.ShardSetID] = true
+	}
+	if part1.Chunks[0].ShardSetID == part2.Chunks[0].ShardSetID {
+		t.Fatal("part 2 chunk 0 reused part 1's shard-set id")
+	}
+	// The scoped derivation is exactly what distinguishes them.
+	if want := contract.ShardSetIDForScoped(e.spec.BucketID, e.spec.Key, e.spec.VersionID, "part/2", 0); part2.Chunks[0].ShardSetID != want {
+		t.Fatalf("part 2 chunk 0 = %s, want %s", part2.Chunks[0].ShardSetID, want)
+	}
+}
+
+// TestMultipartRoundTrip completes a two-part upload the way the coordinator
+// assembles it (chunk indices renumbered globally, one shared encryption meta)
+// and reads the object back. Before the scoping fix this was impossible.
+func TestMultipartRoundTrip(t *testing.T) {
+	e := newEnv(t)
+	part1Payload := randomPayload(t, 1<<20+11)
+	part2Payload := randomPayload(t, 700<<10)
+
+	part1, err := e.off.WritePart(context.Background(), e.spec, "upload-1", 1, bytes.NewReader(part1Payload))
+	if err != nil {
+		t.Fatalf("part 1: %v", err)
+	}
+	spec2 := e.spec
+	spec2.Encryption = &part1.Encryption
+	part2, err := e.off.WritePart(context.Background(), spec2, "upload-1", 2, bytes.NewReader(part2Payload))
+	if err != nil {
+		t.Fatalf("part 2: %v", err)
+	}
+
+	// Simulate coord/meta.CompleteUpload: flat dense chunk table, Index
+	// renumbered globally while AADChunkIndex and ShardSetID travel unchanged,
+	// encryption from the upload (part 1).
+	var chunks []contract.ChunkRef
+	for _, c := range append(append([]contract.ChunkRef(nil), part1.Chunks...), part2.Chunks...) {
+		c.Index = len(chunks)
+		chunks = append(chunks, c)
+	}
+	m := contract.Manifest{
+		TenantID: e.spec.TenantID, ProjectID: e.spec.ProjectID,
+		BucketID: e.spec.BucketID, Key: e.spec.Key, VersionID: e.spec.VersionID,
+		Size: part1.Size + part2.Size, ChunkSize: 4 << 20,
+		Chunks: chunks, Encryption: part1.Encryption,
+	}
+	want := append(append([]byte(nil), part1Payload...), part2Payload...)
+	if got := e.read(t, m, nil); !bytes.Equal(got, want) {
+		t.Fatalf("multipart round trip mismatch: got %d bytes, want %d", len(got), len(want))
+	}
+	// Ranged read across the part boundary also works.
+	rng := &ByteRange{Start: int64(len(part1Payload)) - 100, Length: 200}
+	if got := e.read(t, m, rng); !bytes.Equal(got, want[rng.Start:rng.Start+rng.Length]) {
+		t.Fatalf("ranged multipart read mismatch")
+	}
+}

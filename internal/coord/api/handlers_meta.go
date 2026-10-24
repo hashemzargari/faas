@@ -369,7 +369,10 @@ func (s *Server) handleListObjects(w http.ResponseWriter, r *http.Request) {
 		MaxKeys:           maxKeys,
 		StartAfter:        q.Get("start_after"),
 		ContinuationToken: q.Get("token"),
-		Versions:          boolQuery(r, "versions"),
+		// S3 ListObjectVersions markers: resume within a key, not only after it.
+		KeyMarker:       q.Get("key_marker"),
+		VersionIDMarker: q.Get("version_id_marker"),
+		Versions:        boolQuery(r, "versions"),
 	})
 	if err != nil {
 		writeError(w, r, err)

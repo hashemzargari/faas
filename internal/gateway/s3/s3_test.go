@@ -2,6 +2,7 @@ package s3_test
 
 import (
 	"bytes"
+	"crypto/md5"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/xml"
@@ -430,7 +431,9 @@ func TestMultipartFlow(t *testing.T) {
 		t.Fatalf("complete: %d %s", rec.Code, rec.Body.String())
 	}
 	mustContain(t, rec.Body.String(), "<CompleteMultipartUploadResult")
-	mustContain(t, rec.Body.String(), `<ETag>&#34;multipart-etag-2&#34;</ETag>`)
+	rawPart := md5.Sum(part)
+	expectedETag := fmt.Sprintf("%x-1", md5.Sum(rawPart[:]))
+	mustContain(t, rec.Body.String(), "<ETag>&#34;"+expectedETag+"&#34;</ETag>")
 
 	// After completion the upload is gone.
 	rec = h.do(t, http.MethodDelete, "/bkt/big.bin?uploadId="+initDoc.UploadID, nil, nil)
@@ -558,6 +561,30 @@ func TestVersioningTaggingACLAndObjectLock(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete lifecycle: %d", rec.Code)
 	}
+}
+
+// TestListObjectVersionsMarkers asserts S3's (KeyMarker, VersionIDMarker) pair
+// is forwarded to the coordinator untouched and echoed in the XML. The old code
+// synthesised a non-opaque token that the coordinator rejected.
+func TestListObjectVersionsMarkers(t *testing.T) {
+	h := newHarness(t)
+	h.mustCreateBucket(t, "vbkt")
+	if rec := h.do(t, http.MethodPut, "/vbkt/k", strings.NewReader("v"), nil); rec.Code != http.StatusOK {
+		t.Fatalf("put: %d", rec.Code)
+	}
+	rec := h.do(t, http.MethodGet, "/vbkt?versions&key-marker=k1&version-id-marker=vid-1&max-keys=5", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list versions: %d %s", rec.Code, rec.Body.String())
+	}
+	h.coord.mu.Lock()
+	got := h.coord.lastList
+	h.coord.mu.Unlock()
+	if !got.Versions || got.KeyMarker != "k1" || got.VersionIDMarker != "vid-1" {
+		t.Fatalf("coordinator request = %+v", got)
+	}
+	body := rec.Body.String()
+	mustContain(t, body, "<KeyMarker>k1</KeyMarker>")
+	mustContain(t, body, "<VersionIdMarker>vid-1</VersionIdMarker>")
 }
 
 func TestVirtualHostedAddressing(t *testing.T) {
@@ -784,5 +811,92 @@ func TestPutObjectUnsignedTrailerChecksum(t *testing.T) {
 		if _, err := coord.GetManifest(t.Context(), "trailerbkt", "bad.bin", ""); err == nil {
 			t.Fatal("object with a bad trailer checksum was committed")
 		}
+	}
+}
+
+// TestMultipartTwoPartRoundTrip is the aws-cli regression test through the real
+// handlers: two parts with different payloads must get disjoint shard-set ids,
+// complete into one object, and read back byte-identically (including a range
+// that crosses the part boundary).
+func TestMultipartTwoPartRoundTrip(t *testing.T) {
+	h := newHarness(t)
+	h.mustCreateBucket(t, "mpbkt")
+
+	rec := h.do(t, http.MethodPost, "/mpbkt/two.bin?uploads", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("initiate: %d %s", rec.Code, rec.Body.String())
+	}
+	var initDoc struct {
+		UploadID string `xml:"UploadId"`
+	}
+	if err := xml.Unmarshal(rec.Body.Bytes(), &initDoc); err != nil || initDoc.UploadID == "" {
+		t.Fatalf("initiate xml: %v %s", err, rec.Body.String())
+	}
+
+	part1 := bytes.Repeat([]byte("a"), 5<<20)
+	part2 := bytes.Repeat([]byte("b"), 1<<20)
+	rec = h.do(t, http.MethodPut, "/mpbkt/two.bin?partNumber=1&uploadId="+initDoc.UploadID, bytes.NewReader(part1), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("part 1: %d %s", rec.Code, rec.Body.String())
+	}
+	etag1 := rec.Header().Get("ETag")
+	rec = h.do(t, http.MethodPut, "/mpbkt/two.bin?partNumber=2&uploadId="+initDoc.UploadID, bytes.NewReader(part2), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("part 2 (the aws-cli bug): %d %s", rec.Code, rec.Body.String())
+	}
+	etag2 := rec.Header().Get("ETag")
+
+	// The shard-set ids of the two parts must be disjoint: they restart chunk
+	// indices at 0, so only the part scope keeps them apart.
+	h.coord.mu.Lock()
+	up := h.coord.uploads[contract.UploadID(initDoc.UploadID)]
+	if up == nil {
+		h.coord.mu.Unlock()
+		t.Fatal("upload disappeared before completion")
+	}
+	chunks1 := up.parts[1].Chunks
+	chunks2 := up.parts[2].Chunks
+	h.coord.mu.Unlock()
+	if len(chunks1) == 0 || len(chunks2) == 0 {
+		t.Fatalf("missing part chunks: %d %d", len(chunks1), len(chunks2))
+	}
+	if chunks1[0].ShardSetID == "" || chunks2[0].ShardSetID == "" {
+		t.Fatal("chunks are not stamped with a shard-set id")
+	}
+	if chunks1[0].ShardSetID == chunks2[0].ShardSetID {
+		t.Fatal("part 2 reused part 1's shard-set id (the 409 collision)")
+	}
+
+	complete := `<CompleteMultipartUpload>` +
+		`<Part><PartNumber>1</PartNumber><ETag>` + etag1 + `</ETag></Part>` +
+		`<Part><PartNumber>2</PartNumber><ETag>` + etag2 + `</ETag></Part>` +
+		`</CompleteMultipartUpload>`
+	rec = h.do(t, http.MethodPost, "/mpbkt/two.bin?uploadId="+initDoc.UploadID, strings.NewReader(complete), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("complete: %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = h.do(t, http.MethodGet, "/mpbkt/two.bin", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get: %d %s", rec.Code, rec.Body.String())
+	}
+	want := append(append([]byte(nil), part1...), part2...)
+	if !bytes.Equal(rec.Body.Bytes(), want) {
+		t.Fatalf("round trip mismatch: got %d bytes, want %d", rec.Body.Len(), len(want))
+	}
+	if rec.Header().Get("Content-Length") != fmt.Sprintf("%d", len(want)) {
+		t.Fatalf("Content-Length = %q", rec.Header().Get("Content-Length"))
+	}
+
+	// Range crossing the part boundary.
+	start := len(part1) - 10
+	rec = h.do(t, http.MethodGet, "/mpbkt/two.bin", nil, map[string]string{
+		"Range": fmt.Sprintf("bytes=%d-%d", start, start+19),
+	})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("range: %d %s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Equal(rec.Body.Bytes(), want[start:start+20]) {
+		t.Fatalf("range across part boundary mismatch")
 	}
 }

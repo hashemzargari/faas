@@ -195,7 +195,7 @@ func (e *Executor) process(ctx context.Context, item meta.DeletionItem, now time
 	// appears once per endpoint that owns part of it.
 	perEndpoint := make(map[string][]contract.ShardSetID)
 	for _, chunk := range chunks {
-		setID := e.cfg.SetID(item.BucketID, item.Key, item.VersionID, chunk.Index)
+		setID := e.chunkSetID(item, chunk)
 		for slotIndex, slot := range chunk.Slots {
 			if slot.Endpoint == "" {
 				return false, fmt.Errorf("chunk %d slot %d has no endpoint", chunk.Index, slotIndex)
@@ -243,6 +243,21 @@ func (e *Executor) process(ctx context.Context, item meta.DeletionItem, now time
 		return false, errors.Join(errs...)
 	}
 	return false, nil
+}
+
+// chunkSetID returns the shard-set id for one chunk of a tombstoned object.
+//
+// ChunkRef.ShardSetID is authoritative when present: multipart parts derive
+// scoped ids (contract.ShardSetIDForScoped) because every part restarts its chunk
+// indices at 0, so recomputing from (bucket, key, version, Index) would collide
+// part 2 with part 1 — GC would then either fail to delete part 2's shards or,
+// worse, delete part 1's live ones. Only legacy manifests written before the field
+// existed fall back to the historical derivation.
+func (e *Executor) chunkSetID(item meta.DeletionItem, ref contract.ChunkRef) contract.ShardSetID {
+	if ref.ShardSetID != "" {
+		return ref.ShardSetID
+	}
+	return e.cfg.SetID(item.BucketID, item.Key, item.VersionID, ref.Index)
 }
 
 // Stats returns the GC counters for the /metrics handler.

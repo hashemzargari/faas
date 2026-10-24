@@ -83,6 +83,15 @@ type ObjectSpec struct {
 	Params       ec.Params
 	ChunkSize    int
 	Retention    *contract.Retention
+	// PartScope distinguishes multipart parts in the shard-set derivation. It is
+	// empty for a single PutObject and "part/<n>" for multipart parts, so part 2
+	// cannot collide with part 1's immutable shard addresses (each part restarts
+	// chunk indices at 0).
+	PartScope string
+	// Encryption is the object-level encryption established at
+	// CreateMultipartUpload. Every part must reuse it so the completed object has
+	// one file key; when nil, a fresh file key is minted for this write.
+	Encryption *contract.EncryptionMeta
 	// Conditional write support (deliberate improvement over Cubbit, docs/05 §4).
 	IfMatch     string
 	IfNoneMatch string
@@ -126,4 +135,7 @@ type DataPlane interface {
 	Write(ctx context.Context, spec ObjectSpec, body io.Reader) (contract.CommitResult, error)
 	Read(ctx context.Context, req ReadRequest, w io.Writer) error
 	WritePart(ctx context.Context, spec ObjectSpec, uploadID contract.UploadID, partNumber int, body io.Reader) (PartRef, error)
+	// NewEncryptionMeta mints the object-level encryption metadata for a
+	// multipart upload; every part must be encrypted under it.
+	NewEncryptionMeta(ctx context.Context, tenant contract.TenantID) (contract.EncryptionMeta, error)
 }

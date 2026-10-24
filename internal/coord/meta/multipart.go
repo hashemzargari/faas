@@ -178,10 +178,15 @@ func (s *Service) ListUploads(ctx context.Context, bucketID contract.BucketID) (
 	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
 		return storage.ScanJSON[uploadRecord](tx, spaceUploadIndex, bucketPrefix(bucketID), func(_ []byte, rec uploadRecord) error {
 			out = append(out, contract.UploadInfo{
-				UploadID:     rec.UploadID,
-				BucketID:     rec.BucketID,
-				Key:          rec.Key,
-				VersionID:    rec.Meta.VersionID,
+				UploadID:  rec.UploadID,
+				BucketID:  rec.BucketID,
+				Key:       rec.Key,
+				VersionID: rec.Meta.VersionID,
+				// Encryption is the object-level envelope created at
+				// CreateMultipartUpload. Every part must be encrypted under this
+				// file key; per-part encryption metadata is per-part transport
+				// detail, not the object's key.
+				Encryption:   rec.Meta.Encryption,
 				Initiated:    rec.CreatedAt,
 				StorageClass: rec.Meta.StorageClass,
 			})

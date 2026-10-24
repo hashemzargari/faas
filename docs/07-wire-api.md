@@ -49,7 +49,13 @@ GET  /v1/objects/{bucket}/{key}?version=  → Manifest              (404 NoSuchK
 HEAD same                                  → Manifest headers only
 DEL  /v1/objects/{bucket}/{key}?version=&bypass= → {"version_id":"...","delete_marker":true}
 GET  /v1/objects?bucket=&prefix=&delimiter=&max_keys=&token=&versions=
-                                → ListResult
+     &key_marker=&version_id_marker=            → ListResult
+                                // Version listings resume *within* a key: the pair
+                                // (key_marker, version_id_marker) is the last emitted
+                                // version; the next page starts strictly after it. If
+                                // that version no longer exists, listing resumes at the
+                                // next key (S3 semantics). NextKeyMarker /
+                                // NextVersionIDMarker are returned when truncated.
 ```
 `{key}` is path-escaped (`%2F` for slashes is accepted; raw slashes are also accepted as part of the key).
 

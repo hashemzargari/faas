@@ -257,6 +257,7 @@ func TestListObjectsQuery(t *testing.T) {
 	_, err := c.ListObjects(context.Background(), contract.ListRequest{
 		BucketID: "bucket-1", Prefix: "logs/", Delimiter: "/", MaxKeys: 10,
 		ContinuationToken: "tok", Versions: true,
+		KeyMarker: "k1", VersionIDMarker: "v1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -267,7 +268,8 @@ func TestListObjectsQuery(t *testing.T) {
 	}
 	if q.Get("bucket_id") != "bucket-1" || q.Get("prefix") != "logs/" ||
 		q.Get("delimiter") != "/" || q.Get("max_keys") != "10" ||
-		q.Get("token") != "tok" || q.Get("versions") != "true" {
+		q.Get("token") != "tok" || q.Get("versions") != "true" ||
+		q.Get("key_marker") != "k1" || q.Get("version_id_marker") != "v1" {
 		t.Fatalf("query = %v", q)
 	}
 }

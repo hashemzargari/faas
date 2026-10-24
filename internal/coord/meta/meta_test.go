@@ -2,8 +2,11 @@ package meta_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -39,9 +42,11 @@ func newMeta(t *testing.T) *meta.Service {
 
 func newBucket(t *testing.T, m *meta.Service, versioning string) contract.BucketConfig {
 	t.Helper()
+	sum := sha256.Sum256([]byte(t.Name()))
+	name := fmt.Sprintf("tb-%x", sum[:8]) // deterministic, unique per test, <63 chars
 	cfg := contract.BucketConfig{
 		BucketID:   contract.BucketID(id.New()),
-		Name:       "test-bucket-" + strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-")),
+		Name:       name,
 		TenantID:   tenantID,
 		ProjectID:  projectID,
 		Region:     contract.DefaultRegion,
@@ -563,5 +568,219 @@ func TestManifestBlobsAreContentAddressedAndCompressed(t *testing.T) {
 	raw, err := json.Marshal(m1)
 	if err != nil || len(raw) == 0 {
 		t.Fatalf("manifest not JSON-serialisable: %v", err)
+	}
+}
+
+// commitVersion commits one version of key with a distinct etag and returns it.
+func commitVersion(t *testing.T, m *meta.Service, bucket contract.BucketConfig, key, etag string, chunks []contract.ChunkRef) contract.CommitResult {
+	t.Helper()
+	req := commitReq(bucket, key, int64(len(chunks))*chunkSize, chunks)
+	req.ETag = etag
+	return mustCommit(t, m, req)
+}
+
+// TestListObjectVersionsMarkerPagination covers the S3 contract: pagination must
+// resume *within* a key (KeyMarker + VersionIDMarker identify the last emitted
+// version), not merely after it.
+func TestListObjectVersionsMarkerPagination(t *testing.T) {
+	ctx := context.Background()
+	m := newMeta(t)
+	bucket := newBucket(t, m, "Enabled")
+
+	// Commit oldest → newest so a-v3 is the latest version.
+	v1 := commitVersion(t, m, bucket, "a", "a-v1", makeChunks(t, 1))
+	v2 := commitVersion(t, m, bucket, "a", "a-v2", makeChunks(t, 1))
+	v3 := commitVersion(t, m, bucket, "a", "a-v3", makeChunks(t, 1))
+	b1 := commitVersion(t, m, bucket, "b", "b-v1", makeChunks(t, 1))
+
+	page1, err := m.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID, Versions: true, MaxKeys: 2})
+	if err != nil {
+		t.Fatalf("page 1: %v", err)
+	}
+	if len(page1.Entries) != 2 || page1.Entries[0].VersionID != v3.VersionID || page1.Entries[1].VersionID != v2.VersionID {
+		t.Fatalf("page 1 entries = %+v", page1.Entries)
+	}
+	if !page1.IsTruncated || page1.NextKeyMarker != "a" || page1.NextVersionIDMarker != string(v2.VersionID) {
+		t.Fatalf("page 1 markers = key %q version %q truncated %v", page1.NextKeyMarker, page1.NextVersionIDMarker, page1.IsTruncated)
+	}
+
+	page2, err := m.ListObjects(ctx, contract.ListRequest{
+		BucketID: bucket.BucketID, Versions: true, MaxKeys: 2,
+		KeyMarker: page1.NextKeyMarker, VersionIDMarker: page1.NextVersionIDMarker,
+	})
+	if err != nil {
+		t.Fatalf("page 2: %v", err)
+	}
+	if len(page2.Entries) != 2 || page2.Entries[0].VersionID != v1.VersionID || page2.Entries[1].VersionID != b1.VersionID {
+		t.Fatalf("page 2 entries = %+v", page2.Entries)
+	}
+	if page2.IsTruncated {
+		t.Fatalf("page 2 unexpectedly truncated: %+v", page2)
+	}
+
+	// Walk one entry at a time: no duplicates, no gaps, exact order.
+	var got []contract.VersionID
+	keyMarker, versionMarker := "", ""
+	for i := 0; i < 10; i++ {
+		res, err := m.ListObjects(ctx, contract.ListRequest{
+			BucketID: bucket.BucketID, Versions: true, MaxKeys: 1,
+			KeyMarker: keyMarker, VersionIDMarker: versionMarker,
+		})
+		if err != nil {
+			t.Fatalf("walk page %d: %v", i, err)
+		}
+		if len(res.Entries) != 1 {
+			t.Fatalf("walk page %d returned %d entries", i, len(res.Entries))
+		}
+		got = append(got, res.Entries[0].VersionID)
+		if !res.IsTruncated {
+			break
+		}
+		keyMarker, versionMarker = res.NextKeyMarker, res.NextVersionIDMarker
+	}
+	want := []contract.VersionID{v3.VersionID, v2.VersionID, v1.VersionID, b1.VersionID}
+	if len(got) != len(want) {
+		t.Fatalf("walk returned %d versions, want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("walk order = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestVersionListingMarkerDeletedBetweenPages: if the marker version disappears
+// between pages, S3 resumes at the next key instead of repeating or corrupting the
+// page boundary.
+func TestVersionListingMarkerDeletedBetweenPages(t *testing.T) {
+	ctx := context.Background()
+	m := newMeta(t)
+	bucket := newBucket(t, m, "Enabled")
+	commitVersion(t, m, bucket, "a", "a-v2", makeChunks(t, 1))
+	va3 := commitVersion(t, m, bucket, "a", "a-v3", makeChunks(t, 1))
+	b1 := commitVersion(t, m, bucket, "b", "b-v1", makeChunks(t, 1))
+
+	page1, err := m.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID, Versions: true, MaxKeys: 1})
+	if err != nil {
+		t.Fatalf("page 1: %v", err)
+	}
+	if page1.NextKeyMarker != "a" || page1.NextVersionIDMarker != string(va3.VersionID) {
+		t.Fatalf("page 1 markers = %+v", page1)
+	}
+	// Delete the marker version itself, then resume.
+	if _, _, err := m.DeleteObject(ctx, bucket.Name, "a", va3.VersionID, false); err != nil {
+		t.Fatalf("delete marker version: %v", err)
+	}
+	page2, err := m.ListObjects(ctx, contract.ListRequest{
+		BucketID: bucket.BucketID, Versions: true, MaxKeys: 10,
+		KeyMarker: page1.NextKeyMarker, VersionIDMarker: page1.NextVersionIDMarker,
+	})
+	if err != nil {
+		t.Fatalf("page 2: %v", err)
+	}
+	if len(page2.Entries) != 1 || page2.Entries[0].VersionID != b1.VersionID {
+		t.Fatalf("page 2 = %+v, want only b-v1 (skip the unavailable marker key)", page2.Entries)
+	}
+}
+
+// TestNonVersionedKeyMarkerSkipsKey: for a plain listing a key marker behaves
+// like StartAfter (whole keys only).
+func TestNonVersionedKeyMarkerSkipsKey(t *testing.T) {
+	ctx := context.Background()
+	m := newMeta(t)
+	bucket := newBucket(t, m, "")
+	for _, key := range []string{"a", "b", "c"} {
+		mustCommit(t, m, commitReq(bucket, key, chunkSize, makeChunks(t, 1)))
+	}
+	res, err := m.ListObjects(ctx, contract.ListRequest{
+		BucketID: bucket.BucketID, MaxKeys: 1, KeyMarker: "a", VersionIDMarker: "ignored-in-object-listings",
+	})
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if len(res.Entries) != 1 || res.Entries[0].Key != "b" {
+		t.Fatalf("marker listing = %+v, want key b", res.Entries)
+	}
+}
+
+// TestCompleteUploadPreservesChunkIdentityAndEncryption pins the multipart
+// commit contract: renumbering Index must preserve ShardSetID, AADChunkIndex,
+// checksums and slots, and the manifest must carry the upload-level encryption
+// envelope (not a part's envelope, which is under a different file key).
+func TestCompleteUploadPreservesChunkIdentityAndEncryption(t *testing.T) {
+	ctx := context.Background()
+	m := newMeta(t)
+	bucket := newBucket(t, m, "")
+	versionID := contract.VersionID(id.New())
+	uploadEnc := contract.EncryptionMeta{
+		Mode:           "single-key",
+		WrapKeyVersion: 2,
+		WrappedFileKey: []byte{0x01, 0x02, 0x03, 0x04},
+		KeyFingerprint: []byte{0xaa, 0xbb},
+		FrameSize:      1 << 20,
+	}
+	up, err := m.CreateUpload(ctx, bucket.Name, "multipart/object.bin", contract.CommitRequest{
+		VersionID: versionID, ChunkSize: chunkSize, Encryption: uploadEnc,
+		ContentType: "application/octet-stream",
+	})
+	if err != nil {
+		t.Fatalf("CreateUpload: %v", err)
+	}
+	part1Set := contract.ShardSetIDForScoped(bucket.BucketID, "multipart/object.bin", versionID, "part/1", 0)
+	part2Set := contract.ShardSetIDForScoped(bucket.BucketID, "multipart/object.bin", versionID, "part/2", 0)
+	if part1Set == part2Set {
+		t.Fatalf("part scopes collided")
+	}
+	p1 := makeChunk(t, 0, flatParams)
+	p1.AADChunkIndex = 0
+	p1.ShardSetID = part1Set
+	p2 := makeChunk(t, 0, flatParams)
+	p2.AADChunkIndex = 0
+	p2.ShardSetID = part2Set
+	if err := m.CommitPart(ctx, up, 1, "etag-p1", chunkSize, []contract.ChunkRef{p1}, uploadEnc); err != nil {
+		t.Fatalf("CommitPart 1: %v", err)
+	}
+	if err := m.CommitPart(ctx, up, 2, "etag-p2", chunkSize, []contract.ChunkRef{p2}, uploadEnc); err != nil {
+		t.Fatalf("CommitPart 2: %v", err)
+	}
+
+	uploads, err := m.ListUploads(ctx, bucket.BucketID)
+	if err != nil || len(uploads) != 1 {
+		t.Fatalf("ListUploads = %+v, %v", uploads, err)
+	}
+	if uploads[0].VersionID != versionID {
+		t.Fatalf("UploadInfo.VersionID = %s, want %s", uploads[0].VersionID, versionID)
+	}
+	if !reflect.DeepEqual(uploads[0].Encryption, uploadEnc) {
+		t.Fatalf("UploadInfo.Encryption = %+v, want %+v", uploads[0].Encryption, uploadEnc)
+	}
+
+	if _, err := m.CompleteUpload(ctx, up); err != nil {
+		t.Fatalf("CompleteUpload: %v", err)
+	}
+	manifest, err := m.GetManifest(ctx, bucket.Name, "multipart/object.bin", "")
+	if err != nil {
+		t.Fatalf("GetManifest: %v", err)
+	}
+	if len(manifest.Chunks) != 2 {
+		t.Fatalf("chunks = %d, want 2", len(manifest.Chunks))
+	}
+	if !reflect.DeepEqual(manifest.Encryption, uploadEnc) {
+		t.Fatalf("manifest encryption = %+v, want upload-level %+v", manifest.Encryption, uploadEnc)
+	}
+	wantSets := []contract.ShardSetID{part1Set, part2Set}
+	for i, ch := range manifest.Chunks {
+		if ch.Index != i {
+			t.Fatalf("chunk %d Index = %d, want dense %d", i, ch.Index, i)
+		}
+		if ch.AADChunkIndex != 0 {
+			t.Fatalf("chunk %d AADChunkIndex = %d, want part-local 0 preserved", i, ch.AADChunkIndex)
+		}
+		if ch.ShardSetID != wantSets[i] {
+			t.Fatalf("chunk %d ShardSetID = %s, want %s (renumbering must preserve it)", i, ch.ShardSetID, wantSets[i])
+		}
+		if len(ch.Checksums) != flatParams.TotalShards() || len(ch.Slots) != flatParams.TotalShards() {
+			t.Fatalf("chunk %d lost checksums/slots", i)
+		}
 	}
 }

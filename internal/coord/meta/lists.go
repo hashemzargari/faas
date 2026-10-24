@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"sort"
 	"strings"
 
@@ -63,7 +64,79 @@ func decodeToken(s string) (listToken, error) {
 }
 
 // ListObjects implements both ListObjects(V2) and ListObjectVersions.
+//
+// Version listings also carry S3's (KeyMarker, VersionIDMarker) pair; the public
+// method passes them once the contract exposes them, while listObjects keeps the
+// cursor logic testable independently of the wire struct.
 func (s *Service) ListObjects(ctx context.Context, req contract.ListRequest) (contract.ListResult, error) {
+	return s.listObjects(ctx, req, req.KeyMarker, contract.VersionID(req.VersionIDMarker))
+}
+
+// markerCursor is a resolved version-listing marker: resume strictly after this
+// position in the key-ascending / sequence-descending order. SkipKey means the
+// whole key was already emitted (or its marker version no longer exists).
+type markerCursor struct {
+	Key     string
+	Seq     uint64
+	SkipKey bool
+}
+
+// resolveMarker turns S3's (KeyMarker, VersionIDMarker) into a cursor position.
+// If the marker version is gone (deleted between pages), S3 resumes after the
+// whole key, so that page never repeats a version the client already saw.
+func (s *Service) resolveMarker(ctx context.Context, bucketID contract.BucketID, versions bool, keyMarker string, versionIDMarker contract.VersionID) (*markerCursor, error) {
+	if keyMarker == "" {
+		return nil, nil
+	}
+	cur := &markerCursor{Key: keyMarker, SkipKey: true}
+	if !versions || versionIDMarker == "" {
+		return cur, nil
+	}
+	var seq uint64
+	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+		rec, err := storage.GetJSON[versionRecord](tx, spaceVersionIDs, versionIDKey(bucketID, keyMarker, versionIDMarker))
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if rec.Deleted {
+			// The marker version vanished between pages: resume after the whole
+			// key, as S3 documents for a missing version-id-marker.
+			return nil
+		}
+		seq = rec.Seq
+		cur.SkipKey = false
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	cur.Seq = seq
+	return cur, nil
+}
+
+// atOrBeforeMarker reports whether c is at or before the marker position and must
+// be skipped.
+func atOrBeforeMarker(c candidate, cur markerCursor) bool {
+	switch {
+	case c.sortKey < cur.Key:
+		return true
+	case c.sortKey > cur.Key:
+		return false
+	case cur.SkipKey:
+		return true
+	case c.isPrefix:
+		return true
+	default:
+		// Same key, newest-first order: everything with seq >= the marker was
+		// already returned.
+		return c.seq >= cur.Seq
+	}
+}
+
+func (s *Service) listObjects(ctx context.Context, req contract.ListRequest, keyMarker string, versionIDMarker contract.VersionID) (contract.ListResult, error) {
 	var result contract.ListResult
 	if err := ctx.Err(); err != nil {
 		return result, err
@@ -85,6 +158,17 @@ func (s *Service) ListObjects(ctx context.Context, req contract.ListRequest) (co
 			return result, err
 		}
 		token = &t
+	}
+
+	// Continuation tokens are internal and take precedence; S3 markers are the
+	// external resumption contract (ListObjectVersions).
+	var marker *markerCursor
+	if token == nil && keyMarker != "" {
+		m, merr := s.resolveMarker(ctx, req.BucketID, req.Versions, keyMarker, versionIDMarker)
+		if merr != nil {
+			return result, merr
+		}
+		marker = m
 	}
 
 	cands, err := s.collectCandidates(ctx, req)
@@ -110,6 +194,10 @@ func (s *Service) ListObjects(ctx context.Context, req contract.ListRequest) (co
 	}
 	if token != nil {
 		for start < len(cands) && !candidateAfter(cands[start], *token) {
+			start++
+		}
+	} else if marker != nil {
+		for start < len(cands) && atOrBeforeMarker(cands[start], *marker) {
 			start++
 		}
 	}

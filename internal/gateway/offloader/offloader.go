@@ -162,6 +162,34 @@ func New(d Deps) (*Offloader, error) {
 // Config returns the effective configuration.
 func (o *Offloader) Config() Config { return o.cfg }
 
+// NewEncryptionMeta mints the object-level encryption metadata (a fresh random
+// FileKey wrapped by the tenant KEK) for a multipart upload. Every part must be
+// encrypted under this FileKey: a per-part key would leave all but one part
+// undecryptable from the committed manifest.
+func (o *Offloader) NewEncryptionMeta(ctx context.Context, tenant contract.TenantID) (contract.EncryptionMeta, error) {
+	kr, err := o.keyrings.KeyringFor(ctx, tenant)
+	if err != nil {
+		return contract.EncryptionMeta{}, err
+	}
+	fileKey, err := crypto.NewFileKey()
+	if err != nil {
+		return contract.EncryptionMeta{}, err
+	}
+	defer fileKey.Zero()
+	wrapped, err := kr.WrapKey(fileKey)
+	if err != nil {
+		return contract.EncryptionMeta{}, fmt.Errorf("offloader: wrap file key: %w", err)
+	}
+	fingerprint := kr.Fingerprint()
+	return contract.EncryptionMeta{
+		Mode:           "single-key",
+		WrapKeyVersion: 1,
+		WrappedFileKey: wrapped,
+		KeyFingerprint: fingerprint[:],
+		FrameSize:      o.cfg.FrameSize,
+	}, nil
+}
+
 // writeResult is the outcome of the chunk pipeline before the commit.
 type writeResult struct {
 	chunks     []contract.ChunkRef
@@ -221,6 +249,9 @@ func (o *Offloader) WritePart(ctx context.Context, spec ObjectSpec, uploadID con
 	if partNumber < 1 {
 		return PartRef{}, fmt.Errorf("offloader: invalid part number %d", partNumber)
 	}
+	// Every part restarts chunk indices at 0, so the scope is what keeps part 2's
+	// shard-set ids disjoint from part 1's (see contract.ShardSetIDForScoped).
+	spec.PartScope = fmt.Sprintf("part/%d", partNumber)
 	res, err := o.writeChunks(ctx, spec, body)
 	if err != nil {
 		return PartRef{}, err
@@ -230,6 +261,60 @@ func (o *Offloader) WritePart(ctx context.Context, spec ObjectSpec, uploadID con
 		Size:       res.size,
 		Chunks:     res.chunks,
 		Encryption: res.encryption,
+	}, nil
+}
+
+// encryptorFor returns the chunk encryptor for a write. Multipart parts must
+// reuse the object's file key (established at CreateMultipartUpload); a single
+// PUT mints a fresh one. Either way the encryption metadata recorded in the
+// manifest is the one that unlocks every chunk.
+func (o *Offloader) encryptorFor(ctx context.Context, spec ObjectSpec) (*crypto.ChunkEncryptor, contract.EncryptionMeta, error) {
+	kr, err := o.keyrings.KeyringFor(ctx, spec.TenantID)
+	if err != nil {
+		return nil, contract.EncryptionMeta{}, err
+	}
+	if spec.Encryption != nil && len(spec.Encryption.WrappedFileKey) > 0 {
+		if fp := kr.Fingerprint(); len(spec.Encryption.KeyFingerprint) > 0 &&
+			!bytes.Equal(fp[:], spec.Encryption.KeyFingerprint) {
+			return nil, contract.EncryptionMeta{}, fmt.Errorf("%w: upload fingerprint %x, keyring %x",
+				ErrKeyMismatch, spec.Encryption.KeyFingerprint, fp)
+		}
+		fileKey, err := kr.UnwrapKey(spec.Encryption.WrappedFileKey)
+		if err != nil {
+			return nil, contract.EncryptionMeta{}, fmt.Errorf("offloader: unwrap upload file key: %w", err)
+		}
+		defer fileKey.Zero()
+		frameSize := spec.Encryption.FrameSize
+		if frameSize == 0 {
+			frameSize = o.cfg.FrameSize
+		}
+		enc, err := crypto.NewChunkEncryptor(fileKey, frameSize)
+		if err != nil {
+			return nil, contract.EncryptionMeta{}, err
+		}
+		return enc, *spec.Encryption, nil
+	}
+
+	fileKey, err := crypto.NewFileKey()
+	if err != nil {
+		return nil, contract.EncryptionMeta{}, err
+	}
+	defer fileKey.Zero()
+	wrapped, err := kr.WrapKey(fileKey)
+	if err != nil {
+		return nil, contract.EncryptionMeta{}, fmt.Errorf("offloader: wrap file key: %w", err)
+	}
+	fingerprint := kr.Fingerprint()
+	enc, err := crypto.NewChunkEncryptor(fileKey, o.cfg.FrameSize)
+	if err != nil {
+		return nil, contract.EncryptionMeta{}, err
+	}
+	return enc, contract.EncryptionMeta{
+		Mode:           "single-key",
+		WrapKeyVersion: 1,
+		WrappedFileKey: wrapped,
+		KeyFingerprint: fingerprint[:],
+		FrameSize:      o.cfg.FrameSize,
 	}, nil
 }
 
@@ -258,30 +343,9 @@ func (o *Offloader) writeChunks(ctx context.Context, spec ObjectSpec, body io.Re
 		return nil, fmt.Errorf("offloader: invalid redundancy class: %w", err)
 	}
 
-	kr, err := o.keyrings.KeyringFor(ctx, spec.TenantID)
+	enc, encMeta, err := o.encryptorFor(ctx, spec)
 	if err != nil {
 		return nil, err
-	}
-	fileKey, err := crypto.NewFileKey()
-	if err != nil {
-		return nil, err
-	}
-	defer fileKey.Zero()
-	wrapped, err := kr.WrapKey(fileKey)
-	if err != nil {
-		return nil, fmt.Errorf("offloader: wrap file key: %w", err)
-	}
-	fingerprint := kr.Fingerprint()
-	enc, err := crypto.NewChunkEncryptor(fileKey, o.cfg.FrameSize)
-	if err != nil {
-		return nil, err
-	}
-	encMeta := contract.EncryptionMeta{
-		Mode:           "single-key",
-		WrapKeyVersion: 1,
-		WrappedFileKey: wrapped,
-		KeyFingerprint: fingerprint[:],
-		FrameSize:      o.cfg.FrameSize,
 	}
 
 	maxBytes := spec.MaxBytes
@@ -418,7 +482,7 @@ func (o *Offloader) processChunk(ctx context.Context, spec ObjectSpec, codec *ec
 		return contract.ChunkRef{}, "", fmt.Errorf("%w: chunk %d produced no shards", ErrManifest, job.index)
 	}
 
-	shardSetID := contract.ShardSetIDFor(spec.BucketID, spec.Key, spec.VersionID, job.index)
+	shardSetID := contract.ShardSetIDForScoped(spec.BucketID, spec.Key, spec.VersionID, spec.PartScope, job.index)
 	slots, checksums, ringID, generation, err := o.placeAndWriteShards(ctx, spec, shardSetID, job.index, len(ciphertext), shards)
 	if err != nil {
 		return contract.ChunkRef{}, "", err
@@ -431,6 +495,14 @@ func (o *Offloader) processChunk(ctx context.Context, spec ObjectSpec, codec *ec
 		Slots:         slots,
 		Checksums:     checksums,
 		Generation:    generation,
+		// Authoritative shard-set address for this chunk. Stamping it lets the
+		// coordinator assemble multipart chunk tables (which renumber Index)
+		// without the read path ever re-deriving the wrong address.
+		ShardSetID: shardSetID,
+		// The AAD index is the index used at encryption time: part-local for
+		// multipart, object-wide for a single PUT. It must travel with the ref
+		// because CompleteUpload renumbers Index across parts.
+		AADChunkIndex: job.index,
 	}, ringID, nil
 }
 
