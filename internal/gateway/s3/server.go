@@ -111,7 +111,7 @@ type Deps struct {
 	Coord   contract.Coordinator
 	Authn   Authenticator
 	Authz   Authorizer
-	Off     offloader.Offloader
+	Off     offloader.DataPlane
 	SDP     *sdp.Engine
 	Logger  *slog.Logger
 	Metrics *metrics.Registry
@@ -134,7 +134,7 @@ type Server struct {
 	coord   contract.Coordinator
 	authn   Authenticator
 	authz   Authorizer
-	off     offloader.Offloader
+	off     offloader.DataPlane
 	sdp     *sdp.Engine
 	log     *slog.Logger
 	metrics *metrics.Registry

@@ -63,14 +63,14 @@ type Options struct {
 
 // Executor runs repair jobs.
 type Executor struct {
-	client  *client.Client
-	coord   Coordinator
-	worker  string
-	workers int
+	client    *client.Client
+	coord     Coordinator
+	worker    string
+	workers   int
 	fetchConc int
-	backoff time.Duration
-	log     *slog.Logger
-	now     func() time.Time
+	backoff   time.Duration
+	log       *slog.Logger
+	now       func() time.Time
 }
 
 // New validates options and returns an Executor.
@@ -98,14 +98,14 @@ func New(opts Options) (*Executor, error) {
 		worker = "agent"
 	}
 	return &Executor{
-		client:  opts.Client,
-		coord:   opts.Coordinator,
-		worker:  worker,
-		workers: opts.Workers,
+		client:    opts.Client,
+		coord:     opts.Coordinator,
+		worker:    worker,
+		workers:   opts.Workers,
 		fetchConc: opts.FetchConcurrency,
-		backoff: opts.RetryBackoff,
-		log:     opts.Logger.With("component", "repair", "worker", worker),
-		now:     opts.Now,
+		backoff:   opts.RetryBackoff,
+		log:       opts.Logger.With("component", "repair", "worker", worker),
+		now:       opts.Now,
 	}, nil
 }
 

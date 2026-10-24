@@ -59,6 +59,11 @@ func ParseCRN(s string) (Resource, error) {
 	}
 	r.TenantID = TenantID(strings.TrimPrefix(seg[0], "tenant_"))
 	r.ProjectID = ProjectID(strings.TrimPrefix(seg[1], "project_"))
+	// A CRN with empty identifiers is not addressable; reject it rather than
+	// producing a resource that silently matches nothing (or everything).
+	if r.TenantID == "" || r.ProjectID == "" {
+		return Resource{}, fmt.Errorf("contract: CRN %q has empty tenant/project id", s)
+	}
 	if len(seg) == 3 {
 		rest := seg[2]
 		if i := strings.IndexByte(rest, '/'); i >= 0 {

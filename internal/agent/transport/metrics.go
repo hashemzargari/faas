@@ -40,7 +40,7 @@ func (m *metrics) ctr(name string) *atomic.Int64 {
 	return c
 }
 
-func (m *metrics) inc(name string)             { m.ctr(name).Add(1) }
+func (m *metrics) inc(name string)              { m.ctr(name).Add(1) }
 func (m *metrics) add(name string, delta int64) { m.ctr(name).Add(delta) }
 
 // render writes the Prometheus text format. It never fails on a request path:

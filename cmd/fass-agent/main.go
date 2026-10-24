@@ -439,4 +439,3 @@ func persistAgentState(root string, logger *slog.Logger, state agentState) {
 		logger.Warn("cannot install agent state", "err", err)
 	}
 }
-

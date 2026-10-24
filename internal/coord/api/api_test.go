@@ -445,6 +445,64 @@ func TestCoordinatorEndToEnd(t *testing.T) {
 		t.Fatalf("lifecycle round trip = %q", rawLifecycle)
 	}
 
+	// ---- Multipart over HTTP (§1.5) --------------------------------------
+	multipartVersion := contract.VersionID(id.New())
+	var upload struct {
+		UploadID string `json:"upload_id"`
+	}
+	resp = h.doJSON("POST", "/v1/uploads", map[string]any{
+		"bucket": "e2e-bucket",
+		"key":    "multi.bin",
+		// meta is a contract.CommitRequest, which is the wire type (Go field
+		// names, as used by the gateway).
+		"meta": contract.CommitRequest{
+			VersionID:   multipartVersion,
+			ChunkSize:   chunkSize,
+			ContentType: "application/octet-stream",
+		},
+	}, &upload)
+	h.mustStatus(resp, http.StatusOK)
+	if upload.UploadID == "" {
+		t.Fatalf("no upload id returned")
+	}
+	resp, _ = h.do("PUT", "/v1/uploads/"+upload.UploadID+"/parts/1", map[string]any{
+		"etag":   "etag-part-1",
+		"size":   chunkSize,
+		"chunks": makeChunks(t, 1),
+	})
+	h.mustStatus(resp, http.StatusNoContent)
+	var parts struct {
+		Parts []contract.PartInfo `json:"parts"`
+	}
+	resp = h.doJSON("GET", "/v1/uploads/"+upload.UploadID+"/parts", nil, &parts)
+	h.mustStatus(resp, http.StatusOK)
+	if len(parts.Parts) != 1 || parts.Parts[0].PartNumber != 1 {
+		t.Fatalf("parts = %+v", parts.Parts)
+	}
+	var completed struct {
+		VersionID contract.VersionID `json:"version_id"`
+		ETag      string             `json:"etag"`
+	}
+	resp = h.doJSON("POST", "/v1/uploads/"+upload.UploadID+":complete", nil, &completed)
+	h.mustStatus(resp, http.StatusOK)
+	if completed.VersionID != multipartVersion {
+		t.Fatalf("multipart version = %s, want %s", completed.VersionID, multipartVersion)
+	}
+	var multiManifest contract.Manifest
+	resp = h.doJSON("GET", "/v1/objects/e2e-bucket/multi.bin", nil, &multiManifest)
+	h.mustStatus(resp, http.StatusOK)
+	if len(multiManifest.Chunks) != 1 {
+		t.Fatalf("multipart manifest chunks = %d", len(multiManifest.Chunks))
+	}
+	var uploads struct {
+		Uploads []contract.UploadInfo `json:"uploads"`
+	}
+	resp = h.doJSON("GET", "/v1/uploads?bucket=e2e-bucket", nil, &uploads)
+	h.mustStatus(resp, http.StatusOK)
+	if len(uploads.Uploads) != 0 {
+		t.Fatalf("completed upload still listed: %+v", uploads.Uploads)
+	}
+
 	// ---- Placement on a synthetic 3-Nexus topology -----------------------
 	nexusIDs := h.seedTopology(t)
 	var rc membership.RedundancyClass

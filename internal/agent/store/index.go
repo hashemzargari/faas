@@ -224,7 +224,7 @@ func replayIndex(f *os.File) (map[string]entry, int64, int, error) {
 	}
 }
 
-func (ix *indexFile) appendAdd(e entry) error  { return ix.append(opAdd, e) }
+func (ix *indexFile) appendAdd(e entry) error    { return ix.append(opAdd, e) }
 func (ix *indexFile) appendDelete(e entry) error { return ix.append(opDelete, e) }
 
 func (ix *indexFile) append(op byte, e entry) error {

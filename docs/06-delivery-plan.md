@@ -137,7 +137,15 @@ Chaos (network partitions, clock skew, disk full, slow disk, coordinator failove
 | **B. Coordinator** | `internal/coord/**`, `cmd/fass-coordinator/**` | contract layer, schema |
 | **C. Agent** | `internal/agent/**`, `cmd/fass-agent/**` | contract layer, agent proto |
 | **D. Platform** | `deploy/**`, `test/**`, `cmd/fass-console`, `cmd/fass-cli`, `cmd/fass-operator` | A/B/C interfaces |
-| **Lead** | `internal/{ec,crypto,chunk,topology,storage,policy}`, `api/proto/**`, `docs/**` | — |
+| **Lead** | `internal/{ec,crypto,chunk,contract,policy}`, `api/**`, `docs/**`, `deploy/**`, `Makefile`, `scripts/**` | — |
+
+**Scope note (2026-10-24):** `internal/topology` is deliberately *not* a separate
+package. The topology model (Swarm→Nexus→Node→Agent→Ring) lives in
+`internal/coord/membership`, where it is owned and evolved by the coordinator
+stream; duplicating it in a shared package would have created two sources of
+truth for the same invariants. Likewise there is no shared `config`/`obs`
+package in v1 — each binary parses its own flags with `log/slog` and a small
+Prometheus handler, which is less code than the abstraction.
 
 **Freeze discipline:** the protos and the `ec`/`crypto`/`chunk` signatures are frozen at end of M0. Any change goes through the Lead and a proto version bump (`fass.v1` → additive only). This is what lets three agents work without merge chaos.
 

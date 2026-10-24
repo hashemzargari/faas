@@ -170,8 +170,8 @@ func TestScrubResumesFromCursor(t *testing.T) {
 	}
 
 	cases := []struct {
-		name       string
-		cursor     string
+		name        string
+		cursor      string
 		wantChecked int
 	}{
 		{"from start", "", 6},

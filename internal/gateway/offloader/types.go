@@ -34,6 +34,14 @@ var (
 	ErrManifest       = errors.New("offloader: manifest unusable")
 )
 
+// MultipartModePrefix marks an EncryptionMeta.Mode written by a multipart part.
+//
+// Multipart parts are encrypted before the final object version id exists, so
+// their chunk AAD binds an empty version id rather than the manifest's. The
+// prefix records that decision in the manifest (which is assembled from part 0's
+// encryption metadata) so the read path can reconstruct the same AAD.
+const MultipartModePrefix = "multipart:"
+
 // ChecksumAlgorithm names the payload checksum algorithms the gateway verifies.
 type ChecksumAlgorithm string
 
@@ -110,8 +118,8 @@ type PartRef struct {
 	Encryption contract.EncryptionMeta
 }
 
-// Offloader is the data-plane interface consumed by the S3 frontend.
-type Offloader interface {
+// DataPlane is the data-plane interface consumed by the S3 frontend.
+type DataPlane interface {
 	Write(ctx context.Context, spec ObjectSpec, body io.Reader) (contract.CommitResult, error)
 	Read(ctx context.Context, req ReadRequest, w io.Writer) error
 	WritePart(ctx context.Context, spec ObjectSpec, uploadID contract.UploadID, partNumber int, body io.Reader) (PartRef, error)

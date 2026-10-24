@@ -15,11 +15,9 @@ import (
 	"github.com/fass-storage/fass/internal/gateway/offloader"
 )
 
-// multipartModePrefix marks an encryption descriptor written by a multipart
-// part. Until the contract carries the upload's version id (see the gateway
-// report), multipart chunk AAD cannot bind the final version id; the prefix
-// tells the read path to use an empty AAD version for such manifests.
-const multipartModePrefix = "multipart:"
+// multipartModePrefix re-exports the offloader convention that marks part-level
+// encryption metadata (multipart parts bind an empty AAD version).
+const multipartModePrefix = offloader.MultipartModePrefix
 
 // handleCreateMultipartUpload implements POST /{bucket}/{key}?uploads.
 func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request, t target) {

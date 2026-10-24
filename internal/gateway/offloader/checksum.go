@@ -28,7 +28,6 @@ func Checksum64(b []byte) uint64 {
 type digestSet struct {
 	hashers map[ChecksumAlgorithm]hash.Hash
 	md5     hash.Hash
-	values  map[ChecksumAlgorithm][]byte
 }
 
 // newDigestSet creates a set including MD5 (for the ETag) and every expected
@@ -36,7 +35,6 @@ type digestSet struct {
 func newDigestSet(expected []ExpectedChecksum) *digestSet {
 	d := &digestSet{
 		hashers: make(map[ChecksumAlgorithm]hash.Hash, len(expected)+1),
-		values:  make(map[ChecksumAlgorithm][]byte, len(expected)),
 		md5:     md5.New(),
 	}
 	for _, e := range expected {
@@ -70,13 +68,6 @@ func (d *digestSet) Update(p []byte) {
 			continue
 		}
 		h.Write(p)
-	}
-}
-
-// Add registers deferred expectations (trailers) and folds their digests in.
-func (d *digestSet) Add(expected []ExpectedChecksum) {
-	for _, e := range expected {
-		d.values[e.Algorithm] = e.Value
 	}
 }
 
