@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -545,7 +546,7 @@ func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 					panic(rec)
 				}
 				s.log.Error("panic serving agent request", "method", r.Method,
-					"path", r.URL.Path, "panic", rec)
+					"path", r.URL.Path, "panic", rec, "stack", string(debug.Stack()))
 				s.writeError(w, r, http.StatusInternalServerError, "InternalError", "internal error")
 			}
 		}()

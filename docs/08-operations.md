@@ -58,7 +58,10 @@ distroless, so health probes use the small embedded `fass-dev-healthcheck`).
 What the stack does (`deploy/docker/compose.dev.yml`):
 
 1. `init-volumes` chowns the named volumes to uid 65532 (the image's nonroot
-   user), so no FASS process runs as root.
+   user), so no FASS process runs as root. The coordinator, gateway and agents
+   run with their explicit dev plaintext switches (`FASS_COORDINATOR_DEV`,
+   `FASS_GATEWAY_DEV`, `FASS_AGENT_INSECURE`) because all three now fail closed
+   outside dev; `/healthz` reports `security.insecure=true`.
 2. `coordinator` starts with `--dev-bootstrap`: it creates/reconciles the
    deterministic topology (3 Nexuses, 6 nodes, 12 disks, RC `dev-rc`
    `geo 2+1 / local 3+1`, bucket `dev-bucket`) and writes
@@ -134,13 +137,15 @@ grep -o 'FASS_DEV_BOOTSTRAP .*' .dev/coord.log | cut -d' ' -f2- >.dev/boot.json
 # 2. One agent per disk (12 total: 6 nodes × 2 disks, 2 nodes per Nexus).
 #    --secret is the one-time announce secret from boot.json; --disk-id is the
 #    operator-facing slot label ("disk-a1-1"), not the agent identity.
+#    --insecure is the explicit dev-only plaintext switch: agents fail closed
+#    without TLS material otherwise (docs/08 §4).
 python3 - <<'PY' >.dev/agents.sh
 import json
 d = json.load(open(".dev/boot.json"))
 for i, a in enumerate(d["agents"]):
     print(f'./bin/fass-agent --nexus-id={a["nexus_id"]} --node-id={a["node_id"]} '
           f'--disk=.dev/disks/a{i} --port={7100+i} --coordinator-url=http://127.0.0.1:7000 '
-          f'--secret={a["secret"]} --disk-id={a["disk_id"]} --repair=false --scrub=false &')
+          f'--secret={a["secret"]} --disk-id={a["disk_id"]} --insecure --repair=false --scrub=false &')
 PY
 bash .dev/agents.sh
 
@@ -535,6 +540,7 @@ These are deliberate for the MVP; each is a candidate follow-up task.
 | Agent stuck `pending`, activate fails `409 AgentNotAnnounced` | agent never announced with its one-time secret | check the agent log; re-mint a secret via dev bootstrap only for non-ACTIVE agents |
 | `fass ls`/`fass cp -r` is slow on huge prefixes | sequential listing is bounded by round trips | narrow the prefix or use `aws s3`/`rclone` for bulk migrations |
 | `make dev`: buildx complains it cannot write its state (`read-only file system`, sandboxed/CI HOME) | Docker CLI keeps buildx state under `$HOME/.docker` | point it at a writable dir: `DOCKER_CONFIG=$PWD/.dev/docker-config make dev` |
+| A component exits with `refusing to start ... TLS` / `TLS is required` | the TLS rollout made non-dev startup fail closed; plaintext needs an explicit opt-in | dev: `--dev` (coordinator/gateway) or `--insecure` (agent); production: provide `--tls-cert/--tls-key` (+ CA/mTLS) |
 
 Logs: coordinator/agents/gateway/console log to stderr (`--log-format=json`
 for structured output); the dev smoke script keeps them under `.dev/smoke-*`
@@ -609,6 +615,38 @@ fass-gateway --ca-cert /etc/fass/pki/ca/ca.crt \
 Non-dev gateways refuse to start with `--ca-cert` missing, `--agent-tls=off`
 (without `--insecure`), `--require-mtls` without a client certificate, or a
 plaintext `--coordinator` URL.
+
+**Agent listener flags.** Agents follow the same fail-closed rule: TLS is
+required unless `--insecure` is passed explicitly.
+
+| Agent flag | Env | Meaning |
+|---|---|---|
+| `--tls-cert` / `--tls-key` | `FASS_AGENT_TLS_CERT` / `FASS_AGENT_TLS_KEY` | shard listener certificate/key (required unless `--insecure`) |
+| `--tls-ca` | `FASS_AGENT_TLS_CA` | CA bundle used to verify gateway client certs on the listener **and** peer certificates for repair |
+| `--tls-client-cert` / `--tls-client-key` | `FASS_AGENT_TLS_CLIENT_CERT` / `FASS_AGENT_TLS_CLIENT_KEY` | optional repair-client identity; defaults to `--tls-cert`/`--tls-key`, which must then carry the client-auth EKU (`pki.UsageBoth` or `IssueClient`) |
+| `--require-mtls` | `FASS_AGENT_REQUIRE_MTLS` | require and verify client certificates on the listener (needs `--tls-ca`) |
+| `--insecure` | `FASS_AGENT_INSECURE` | explicit plaintext, dev only; warns on every start |
+
+Agent TLS notes:
+* An agent with TLS enabled is TLS-*only* on the shard listener even without
+  `--require-mtls`: the listener no longer speaks plaintext, and client
+  certificates are verified when presented (mixed-mode rollout). Plaintext
+  agents are the ones started with `--insecure`, and the gateway sees those as
+  plaintext endpoints.
+* `--require-mtls` needs `--tls-ca`; a repair-enabled agent also needs
+  `--tls-ca`, because agent-to-agent shard fetches verify peer certificates
+  instead of silently downgrading to plaintext.
+* `/v1/healthz` reports the agent posture as `{"tls":false,"insecure":true}`
+  (plaintext) or `{"tls":true,"insecure":false,"tls_not_after":"..."}`; the
+  richer `/v1/stats` block is
+  `tls:{enabled,mutual,insecure,not_after,renewal_due,issuer,subject}` and every
+  heartbeat carries `tls_enabled`, `insecure` and `cert_not_after`, so
+  `fass cluster status` can answer "is any agent plaintext?" and "which
+  certificates expire soon?" without polling each agent.
+* Certificate rotation needs no agent restart (see §4.2): the listener reloads
+  `--tls-cert`/`--tls-key` on the next handshake once the served certificate is
+  inside its renewal window, and a half-written key file during rotation keeps
+  the previous certificate serving.
 
 ### 4.2 Rotation without a flag day
 

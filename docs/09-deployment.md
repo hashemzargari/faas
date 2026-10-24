@@ -604,7 +604,7 @@ the entity relations directly, and what that costs.
 | Coordinator on PostgreSQL serving the full S3 surface | `go test -tags=compat ./test/compat/` 21/21 and `scripts/compat.sh` PASS (aws-cli, rclone incl. tree sync, s3cmd) with `FASS_COMPAT_POSTGRES_DSN` set |
 | Lifecycle expiry + object lock on PostgreSQL | included in the compat suite above, including the dev-gated clock restart |
 | Crash-restart of the coordinator | the metadata transaction is the durability boundary; a restart reconnects to PostgreSQL and re-runs no migrations by default |
-| **Ungraceful primary crash + promotion** (`docker kill`, `pg_ctl promote`) | HA drill below: detection 150 ms, RTO 461 ms, RPO 0/20 acknowledged objects, plus the outage behaviour (health 503, retryable writes) |
+| **Ungraceful primary crash + promotion** (`docker kill`, `pg_ctl promote`) | HA drill below: detection 150–170 ms, RTO 456–482 ms, RPO 0/20 acknowledged objects, plus the outage behaviour (health 503, retryable writes) |
 | **pg_dump / pg_restore metadata round trip** | HA drill below: restored database served the same 20 objects byte-identically |
 
 ### Not tested (do not assume these work)

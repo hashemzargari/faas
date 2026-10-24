@@ -359,9 +359,16 @@ func run(parent context.Context, cfg config, logger *slog.Logger) error {
 		}
 	}
 
+	// Avoid a typed-nil interface: when the scrubber is disabled the transport
+	// must see a nil interface, otherwise /v1/stats calls Cursor on a nil
+	// *scrub.Scrubber and panics.
+	var scrubberIface transport.Scrubber
+	if scrubber != nil {
+		scrubberIface = scrubber
+	}
 	srv, err := transport.New(transport.Options{
 		Store:           st,
-		Scrubber:        scrubber,
+		Scrubber:        scrubberIface,
 		TLS:             security.serverTLS,
 		NodeID:          cfg.nodeID,
 		Version:         version,

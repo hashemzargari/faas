@@ -231,6 +231,7 @@ func (c *cluster) boot() error {
 			"--node-id", slot.NodeID,
 			"--coordinator-url", c.coordURL,
 			"--secret", slot.Secret,
+			"--insecure",
 			"--hostname", "127.0.0.1",
 			"--heartbeat-interval", "1s",
 			"--repair=false",
@@ -285,6 +286,9 @@ func (c *cluster) boot() error {
 		"--local-n", "3", "--local-k", "1",
 		"--default-redundancy-class", "dev-rc",
 		"--key-seed", devKeySeed,
+		// Plaintext loopback listener must be requested explicitly (data-plane
+		// TLS is fail-closed outside a gateway's own dev mode).
+		"--insecure",
 		"--log-level", "info",
 		"--log-format", "text",
 	); err != nil {

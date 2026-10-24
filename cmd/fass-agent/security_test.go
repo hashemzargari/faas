@@ -2,10 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
@@ -13,10 +10,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/fass-storage/fass/internal/agent/store"
 	"github.com/fass-storage/fass/internal/agent/transport"
 	"github.com/fass-storage/fass/internal/pki"
 )
@@ -85,12 +84,6 @@ func TestBuildAgentSecurityRules(t *testing.T) {
 	server := issueTestServerCert(t, ca, time.Hour)
 	client := issueTestClientCert(t, ca)
 	both := issueTestBothCert(t, ca)
-
-	base := config{
-		tlsCert: server.CertFile,
-		tlsKey:  server.KeyFile,
-		tlsCA:   caFile,
-	}
 
 	cases := []struct {
 		name    string
@@ -227,11 +220,11 @@ func TestEnvTLSFlagsAndPrecedence(t *testing.T) {
 	server := issueTestServerCert(t, ca, time.Hour)
 
 	cfg, err := parseFlagsWithEnv(nil, mapEnv(map[string]string{
-		"FASS_AGENT_TLS_CERT":  server.CertFile,
-		"FASS_AGENT_TLS_KEY":   server.KeyFile,
-		"FASS_AGENT_TLS_CA":    caFile,
+		"FASS_AGENT_TLS_CERT":     server.CertFile,
+		"FASS_AGENT_TLS_KEY":      server.KeyFile,
+		"FASS_AGENT_TLS_CA":       caFile,
 		"FASS_AGENT_REQUIRE_MTLS": "true",
-		"FASS_AGENT_REPAIR":    "false",
+		"FASS_AGENT_REPAIR":       "false",
 	}))
 	if err != nil {
 		t.Fatalf("parseFlagsWithEnv: %v", err)
@@ -318,7 +311,7 @@ func waitForHTTP(t *testing.T, hc *http.Client, url string) *http.Response {
 func TestRunInsecureHealthzEndToEnd(t *testing.T) {
 	port := freePort(t)
 	env := baseEnv(t, "http://127.0.0.1:1") // no coordinator contact needed
-	env["FASS_AGENT_PORT"] = itoa(port)
+	env["FASS_AGENT_PORT"] = strconv.Itoa(port)
 	cfg, err := parseFlagsWithEnv(nil, mapEnv(env))
 	if err != nil {
 		t.Fatalf("parseFlagsWithEnv: %v", err)
@@ -326,7 +319,7 @@ func TestRunInsecureHealthzEndToEnd(t *testing.T) {
 	stop, logs := startAgentForTest(t, cfg)
 	defer stop()
 
-	resp := waitForHTTP(t, &http.Client{Timeout: 2 * time.Second}, "http://127.0.0.1:"+itoa(port)+"/v1/healthz")
+	resp := waitForHTTP(t, &http.Client{Timeout: 2 * time.Second}, "http://127.0.0.1:"+strconv.Itoa(port)+"/v1/healthz")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("healthz status = %d", resp.StatusCode)
@@ -349,7 +342,7 @@ func TestRunTLSListenerEndToEnd(t *testing.T) {
 	port := freePort(t)
 
 	env := baseEnv(t, "http://127.0.0.1:1")
-	env["FASS_AGENT_PORT"] = itoa(port)
+	env["FASS_AGENT_PORT"] = strconv.Itoa(port)
 	delete(env, "FASS_AGENT_INSECURE") // TLS is the default; no opt-out here
 	env["FASS_AGENT_TLS_CERT"] = server.CertFile
 	env["FASS_AGENT_TLS_KEY"] = server.KeyFile
@@ -371,7 +364,7 @@ func TestRunTLSListenerEndToEnd(t *testing.T) {
 		Transport: &http.Transport{TLSClientConfig: clientCfg},
 		Timeout:   5 * time.Second,
 	}
-	resp := waitForHTTP(t, hc, "https://127.0.0.1:"+itoa(port)+"/v1/healthz")
+	resp := waitForHTTP(t, hc, "https://127.0.0.1:"+strconv.Itoa(port)+"/v1/healthz")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("TLS healthz status = %d", resp.StatusCode)
@@ -387,7 +380,7 @@ func TestRunTLSListenerEndToEnd(t *testing.T) {
 		t.Fatalf("healthz is missing tls_not_after: %v", health)
 	}
 
-	statsResp, err := hc.Get("https://127.0.0.1:" + itoa(port) + "/v1/stats")
+	statsResp, err := hc.Get("https://127.0.0.1:" + strconv.Itoa(port) + "/v1/stats")
 	if err != nil {
 		t.Fatalf("stats over TLS: %v", err)
 	}
@@ -399,7 +392,11 @@ func TestRunTLSListenerEndToEnd(t *testing.T) {
 			NotAfter *string `json:"not_after"`
 		} `json:"tls"`
 	}
-	if err := json.NewDecoder(statsResp.Body).Decode(&stats); err != nil {
+	statsBody, _ := io.ReadAll(statsResp.Body)
+	if statsResp.StatusCode != http.StatusOK {
+		t.Logf("stats status=%d body=%s logs=\n%s", statsResp.StatusCode, statsBody, logs.String())
+	}
+	if err := json.Unmarshal(statsBody, &stats); err != nil {
 		t.Fatal(err)
 	}
 	if !stats.TLS.Enabled || stats.TLS.Insecure || stats.TLS.NotAfter == nil {
@@ -413,7 +410,7 @@ func TestRunTLSListenerEndToEnd(t *testing.T) {
 func TestHeartbeatSecurityFields(t *testing.T) {
 	notAfter := time.Unix(1_800_000_000, 0).UTC()
 	sec := heartbeatSecurity{TLSEnabled: true, CertNotAfter: &notAfter}
-	hb, err := buildHeartbeat("agent-1", "disk-1", "", zeroStats(), 0, "", sec, time.Now().UTC())
+	hb, err := buildHeartbeat("agent-1", "disk-1", "", store.Stats{}, 0, "", sec, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("buildHeartbeat: %v", err)
 	}
@@ -458,19 +455,3 @@ func TestAgentCertificateMustHaveClientAuthEKU(t *testing.T) {
 		t.Fatal("garbage certificate accepted")
 	}
 }
-
-func zeroStats() (stats storeStatsAlias) { return }
-
-func itoa(v int) string {
-	return strconvItoa(v)
-}
-
-// small indirections keep the test file's imports stable.
-type storeStatsAlias = storeStats
-
-func strconvItoa(v int) string { return strconv.Itoa(v) }
-
-var _ = pem.Block{}
-var _ = x509.Certificate{}
-var _ = tls.VersionTLS13
-var _ = io.Discard

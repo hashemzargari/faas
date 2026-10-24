@@ -203,6 +203,9 @@ services:
       FASS_AGENT_DISK_ID: disk-a1-1
       FASS_AGENT_HOSTNAME: agent-a1-1
       FASS_AGENT_SECRET_FILE: /run/fass/disk-a1-1.secret
+      # Dev-only plaintext shard listener: agents fail closed without TLS
+      # material outside --insecure. /v1/healthz reports insecure=true.
+      FASS_AGENT_INSECURE: "true"
       FASS_AGENT_LOG_LEVEL: info
     volumes:
       - agent-a1-1-data:/data
@@ -230,6 +233,7 @@ services:
       FASS_AGENT_DISK_ID: disk-a1-2
       FASS_AGENT_HOSTNAME: agent-a1-2
       FASS_AGENT_SECRET_FILE: /run/fass/disk-a1-2.secret
+      FASS_AGENT_INSECURE: "true"
       FASS_AGENT_LOG_LEVEL: info
     volumes:
       - agent-a1-2-data:/data
@@ -257,6 +261,7 @@ services:
       FASS_AGENT_DISK_ID: disk-a2-1
       FASS_AGENT_HOSTNAME: agent-a2-1
       FASS_AGENT_SECRET_FILE: /run/fass/disk-a2-1.secret
+      FASS_AGENT_INSECURE: "true"
       FASS_AGENT_LOG_LEVEL: info
     volumes:
       - agent-a2-1-data:/data
@@ -284,6 +289,7 @@ services:
       FASS_AGENT_DISK_ID: disk-a2-2
       FASS_AGENT_HOSTNAME: agent-a2-2
       FASS_AGENT_SECRET_FILE: /run/fass/disk-a2-2.secret
+      FASS_AGENT_INSECURE: "true"
       FASS_AGENT_LOG_LEVEL: info
     volumes:
       - agent-a2-2-data:/data
@@ -311,6 +317,7 @@ services:
       FASS_AGENT_DISK_ID: disk-b1-1
       FASS_AGENT_HOSTNAME: agent-b1-1
       FASS_AGENT_SECRET_FILE: /run/fass/disk-b1-1.secret
+      FASS_AGENT_INSECURE: "true"
       FASS_AGENT_LOG_LEVEL: info
     volumes:
       - agent-b1-1-data:/data
@@ -338,6 +345,7 @@ services:
       FASS_AGENT_DISK_ID: disk-b1-2
       FASS_AGENT_HOSTNAME: agent-b1-2
       FASS_AGENT_SECRET_FILE: /run/fass/disk-b1-2.secret
+      FASS_AGENT_INSECURE: "true"
       FASS_AGENT_LOG_LEVEL: info
     volumes:
       - agent-b1-2-data:/data
@@ -365,6 +373,7 @@ services:
       FASS_AGENT_DISK_ID: disk-b2-1
       FASS_AGENT_HOSTNAME: agent-b2-1
       FASS_AGENT_SECRET_FILE: /run/fass/disk-b2-1.secret
+      FASS_AGENT_INSECURE: "true"
       FASS_AGENT_LOG_LEVEL: info
     volumes:
       - agent-b2-1-data:/data
@@ -392,6 +401,7 @@ services:
       FASS_AGENT_DISK_ID: disk-b2-2
       FASS_AGENT_HOSTNAME: agent-b2-2
       FASS_AGENT_SECRET_FILE: /run/fass/disk-b2-2.secret
+      FASS_AGENT_INSECURE: "true"
       FASS_AGENT_LOG_LEVEL: info
     volumes:
       - agent-b2-2-data:/data
@@ -419,6 +429,7 @@ services:
       FASS_AGENT_DISK_ID: disk-c1-1
       FASS_AGENT_HOSTNAME: agent-c1-1
       FASS_AGENT_SECRET_FILE: /run/fass/disk-c1-1.secret
+      FASS_AGENT_INSECURE: "true"
       FASS_AGENT_LOG_LEVEL: info
     volumes:
       - agent-c1-1-data:/data
@@ -446,6 +457,7 @@ services:
       FASS_AGENT_DISK_ID: disk-c1-2
       FASS_AGENT_HOSTNAME: agent-c1-2
       FASS_AGENT_SECRET_FILE: /run/fass/disk-c1-2.secret
+      FASS_AGENT_INSECURE: "true"
       FASS_AGENT_LOG_LEVEL: info
     volumes:
       - agent-c1-2-data:/data
@@ -473,6 +485,7 @@ services:
       FASS_AGENT_DISK_ID: disk-c2-1
       FASS_AGENT_HOSTNAME: agent-c2-1
       FASS_AGENT_SECRET_FILE: /run/fass/disk-c2-1.secret
+      FASS_AGENT_INSECURE: "true"
       FASS_AGENT_LOG_LEVEL: info
     volumes:
       - agent-c2-1-data:/data
@@ -500,6 +513,7 @@ services:
       FASS_AGENT_DISK_ID: disk-c2-2
       FASS_AGENT_HOSTNAME: agent-c2-2
       FASS_AGENT_SECRET_FILE: /run/fass/disk-c2-2.secret
+      FASS_AGENT_INSECURE: "true"
       FASS_AGENT_LOG_LEVEL: info
     volumes:
       - agent-c2-2-data:/data
