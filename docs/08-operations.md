@@ -35,7 +35,66 @@ The CLI's built-in defaults match this dev layout: S3 endpoint
 
 ## 2. Boot a dev cluster
 
-### 2.1 Prerequisites
+Two paths with the same topology (3 Nexuses, 12 per-disk agents):
+
+* **containers**: `make dev` (below) — builds the image, boots the stack, runs
+  the S3 round-trip smoke check and tears everything down;
+* **processes on the host**: `scripts/smoke-cluster.sh` (no Docker), with the
+  step-by-step recipe further down.
+
+### 2.1 Docker compose (containers, fastest)
+
+```bash
+make dev          # build image -> up -> smoke check -> down -v
+make dev-up       # boot and leave it running
+make dev-logs     # follow logs
+make dev-down     # tear down, including volumes
+```
+
+`make dev` requires Docker Engine + Compose v2 and, on the first run, builds
+`deploy/docker/Dockerfile` as `fass:dev` (a few minutes; the image is
+distroless, so health probes use the small embedded `fass-dev-healthcheck`).
+
+What the stack does (`deploy/docker/compose.dev.yml`):
+
+1. `init-volumes` chowns the named volumes to uid 65532 (the image's nonroot
+   user), so no FASS process runs as root.
+2. `coordinator` starts with `--dev-bootstrap`: it creates/reconciles the
+   deterministic topology (3 Nexuses, 6 nodes, 12 disks, RC `dev-rc`
+   `geo 2+1 / local 3+1`, bucket `dev-bucket`) and writes
+   `dev-bootstrap.json` into its data volume. Bootstrap is idempotent.
+3. `bootstrap` (one-shot) reads that JSON and writes one announce-secret file
+   per agent under `/secrets`; the agents wait for it
+   (`service_completed_successfully`) and consume it via
+   `FASS_AGENT_SECRET_FILE`, so **no secret is baked into the compose file or
+   put in argv**.
+4. `gateway` starts with a deterministic dev key seed
+   (`FASS_DEV_KEY_SEED`, overridable) so objects remain readable across
+   restarts — never the ephemeral seed.
+5. `smoke` (run explicitly by `make dev`) waits for the 12 agents to announce,
+   activates them through the coordinator API, and performs a real SigV4
+   `PUT/HEAD/GET/DELETE` of 1 MiB to `s3://dev-bucket/dev/smoke.bin`,
+   comparing bytes. It prints `SMOKE OK: 12 agents ACTIVE…`.
+
+Dev credentials: `dev-access-key` / `dev-secret-key`, region `eu-west-1`;
+the gateway is published on `127.0.0.1:8080`, the coordinator (admin API) on
+`127.0.0.1:7000`. From the host you can use the CLI against it:
+
+```bash
+FASS_ENDPOINT=http://127.0.0.1:8080 FASS_ACCESS_KEY_ID=dev-access-key \
+FASS_SECRET_ACCESS_KEY=dev-secret-key ./bin/fass cluster status
+```
+
+Re-running against a *kept* data volume is refused by design: the coordinator
+only mints announce secrets for non-ACTIVE agents, and an agent needs a fresh
+secret to announce. `make dev` always tears the volumes down; if you use
+`make dev-up`, reset with `make dev-down` before the next boot.
+
+This is a single-host simulation of three sites — convenient, not a production
+topology. For sizing, upgrade and rollback of a real install, see
+[docs/09-deployment.md](09-deployment.md).
+
+### 2.2 Prerequisites
 
 ```bash
 cd /path/to/fass
@@ -45,7 +104,7 @@ make build test                # builds bin/, runs unit tests
 
 The sandbox (and the repo) never needs network: dependencies are vendored.
 
-### 2.2 One command (smoke)
+### 2.3 Processes on the host: one command (smoke)
 
 ```bash
 ./scripts/smoke-cluster.sh              # upload + read
@@ -56,7 +115,7 @@ This boots a real coordinator + 12 agents + gateway, uploads 14 MiB and reads it
 back; `--nexus-loss` SIGKILLs every `nexus-c` agent first and proves the read
 still succeeds through `geo_n = 2`.
 
-### 2.3 Step by step (what the script does, for debugging)
+### 2.4 Processes on the host: step by step (what the script does, for debugging)
 
 ```bash
 source scripts/env.sh
@@ -109,6 +168,55 @@ bucket `dev-bucket`, RC `dev-rc`, ring `dev-ring`.
 Stop everything with `kill` on the PIDs (the smoke script does it in a `trap`).
 The coordinator's SQLite store lives in `--data-dir`; delete it for a clean
 slate.
+
+### 2.5 Agent configuration: environment variables and secret files
+
+`fass-agent` accepts every flag from a `FASS_AGENT_*` environment variable as
+well as from argv. Precedence is always **explicit flag > environment variable >
+default**, so a flag can override a bad environment file while debugging.
+
+The environment variable name is the flag name upper-cased with `-` replaced by
+`_`: `--coordinator-url` → `FASS_AGENT_COORDINATOR_URL`,
+`--max-shard-bytes` → `FASS_AGENT_MAX_SHARD_BYTES`. Every flag except
+`--version` (an action, not configuration) has an environment variable; a new
+flag gets one automatically. `fass-agent --help` documents this.
+
+An agent can therefore be configured with no argv at all:
+
+```bash
+FASS_AGENT_DISK=/var/lib/fass/disk1 \
+FASS_AGENT_PORT=7100 \
+FASS_AGENT_NEXUS_ID=nexus-a \
+FASS_AGENT_NODE_ID=node-a1 \
+FASS_AGENT_DISK_ID=disk-a1 \
+FASS_AGENT_COORDINATOR_URL=https://coordinator.internal:7000 \
+FASS_AGENT_SECRET_FILE=/etc/fass/agents/a1.secret \
+./bin/fass-agent
+```
+
+**The announce secret must not go in argv.** Command-line arguments are visible
+to every local user via `ps`, so production deployments should use
+`--secret-file` / `FASS_AGENT_SECRET_FILE` (or `FASS_AGENT_SECRET` injected from
+a systemd `EnvironmentFile` or a Kubernetes Secret). `--secret` still works for
+local debugging and logs a warning on every start when used.
+
+`--secret-file` reads exactly one line and trims **one** trailing newline
+(CRLF included). An empty or whitespace-only file, and a multi-line file, are configuration
+errors — an empty secret file is never treated as "no secret / dev mode". Setting both `--secret` (or `FASS_AGENT_SECRET`) and
+`--secret-file` (or `FASS_AGENT_SECRET_FILE`) fails closed with an error naming
+both sources, because silently preferring one could join the wrong cluster.
+
+```bash
+# one agent per disk under systemd (see deploy/systemd/fass-agent@.service):
+# /etc/fass/agents/disk-a1.env contains FASS_AGENT_SECRET_FILE=/etc/fass/agents/disk-a1.secret
+install -m 0600 announce.secret /etc/fass/agents/disk-a1.secret
+FASS_AGENT_DISK=/data/disk-a1 FASS_AGENT_SECRET_FILE=/etc/fass/agents/disk-a1.secret \
+  ./bin/fass-agent --nexus-id=nexus-a --node-id=node-a1 --disk-id=disk-a1
+```
+
+The same file-based pattern is used for credentials generally, and will apply
+to the TLS material (`--tls-cert`, `--tls-key`, `--tls-ca`) when transport
+encryption lands: paths, never secret content, on the command line.
 
 ---
 

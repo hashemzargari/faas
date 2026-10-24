@@ -1,4 +1,4 @@
-.PHONY: all build test race vet lint fmt e2e compat chaos bench dev image clean cli console deploy-lint
+.PHONY: all build test race vet lint fmt e2e compat chaos bench dev dev-up dev-down dev-logs image clean cli console deploy-lint
 
 SHELL := /bin/bash
 GOENV := source scripts/env.sh &&
@@ -32,8 +32,28 @@ chaos: build
 bench:
 	$(GOENV) go test -run=^$$ -bench=. -benchmem ./internal/ec/ ./internal/gateway/offloader/
 
-dev: build
-	$(GOENV) go run ./cmd/fass-all --dev
+# Docker dev cluster (deploy/docker/compose.dev.yml): builds the image, boots
+# the coordinator + 12 per-disk agents + gateway, runs the end-to-end smoke
+# check (12 ACTIVE + a real S3 PUT/GET), then tears everything down including
+# volumes. Requires Docker Engine + Compose v2. No-container alternative:
+# ./scripts/smoke-cluster.sh
+COMPOSE_DEV := docker compose -f deploy/docker/compose.dev.yml
+
+dev:
+	@set -euo pipefail; \
+	trap '$(COMPOSE_DEV) down -v --remove-orphans >/dev/null 2>&1 || true' EXIT; \
+	$(COMPOSE_DEV) up -d --build; \
+	$(COMPOSE_DEV) run --rm smoke; \
+	echo "make dev: 12-agent dev cluster smoke check passed"
+
+dev-up:
+	$(COMPOSE_DEV) up -d --build
+
+dev-down:
+	$(COMPOSE_DEV) down -v --remove-orphans
+
+dev-logs:
+	$(COMPOSE_DEV) logs -f --tail=100
 
 # Operator surface. `make build` also produces bin/fass-cli and bin/fass-console
 # (named after their directories); these targets install the operator-facing

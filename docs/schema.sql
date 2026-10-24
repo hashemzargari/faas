@@ -1,17 +1,28 @@
--- FASS coordinator metadata schema
+-- FASS coordinator metadata: logical entity model + PostgreSQL adapter layout
 --
--- NORMATIVE: this is the production system of record (PostgreSQL 16). The
--- embedded engine used by `fass-coordinator --data-dir` implements the same
--- logical model behind the repository interfaces in internal/storage; its
--- physical key layout is documented in the appendix at the bottom and is NOT
--- normative. When the two disagree, this DDL wins.
+-- FRAMING (ADR-3b, docs/02-architecture.md): this file documents the *entity
+-- shape* the coordinator persists and the *physical layout* the PostgreSQL
+-- adapter uses. It is not yet queried directly as a relational domain model: the
+-- v1 adapter stores every record family in the two tables documented in the
+-- appendix (`kv` + `blobs`), behind the storage.Store interface. The entity
+-- tables below are the drift-gated documentation of what those JSON records
+-- encode, and they are the target of the planned promotion path (typed identity
+-- columns beside the JSON payload, queried directly) — do not delete them.
+--
+-- Tables actually created/used by the PostgreSQL adapter today:
+--   schema_migrations   applied migration versions (managed by `fass-coordinator migrate`)
+--   kv                  (space, key) -> jsonb record; B-tree PK, bounded range scans only
+--   blobs               content-addressed compressed manifest pages (immutable)
+-- Everything else in this file is the logical model: it names the record fields,
+-- constraints, and relationships that the `kv` JSON documents satisfy.
 --
 -- Drift guard: internal/coord/schema_drift_test.go parses this file and the
--- embedded engine's record structs, and fails the build if a persisted field has
--- no column here. Intentional divergences (renamed columns, fields normalised
--- into child tables, nested records the relational model flattens) are declared
--- explicitly in that test, so every difference is reviewable rather than
--- accidental. Add a field to a record without a column and the suite goes red.
+-- coordinator's record structs and fails the build if a persisted field has no
+-- documented column/child table here. Intentional divergences (renamed columns,
+-- fields normalised into child tables, nested records the relational model
+-- flattens) are declared explicitly in that test, so every difference is
+-- reviewable rather than accidental. Add a field to a record without documenting
+-- it here and the suite goes red.
 --
 -- Design rules (docs/04-services.md §5.2):
 --   * manifests are content-addressed, compressed blobs; the hot version row is small;
@@ -585,3 +596,54 @@ COMMIT;
 --
 -- Migrations are numbered and applied on boot (internal/storage/migrate.go);
 -- the PostgreSQL column `schema_migrations.version` is the same number.
+
+-- ===========================================================================
+-- APPENDIX: PostgreSQL adapter physical layout (ADR-3b, v1)
+-- ===========================================================================
+--
+-- The adapter (internal/storage/postgres) implements storage.Store with:
+--
+--   CREATE TABLE kv (
+--       space text  NOT NULL,
+--       key   bytea NOT NULL,      -- bytea, not text: coordinator keys are
+--                                  -- NUL-separated (bucket\0key\0seq) and
+--                                  -- PostgreSQL text rejects 0x00. bytea also
+--                                  -- gives memcmp ordering, so ordered scans and
+--                                  -- prefix ranges are identical to the embedded
+--                                  -- engine.
+--       value jsonb NOT NULL,      -- entity record (JSON). The few binary
+--                                  -- records (counters) are stored as
+--                                  -- {"__fass_bytes_base64__":"..."}; the
+--                                  -- wrapper is internal to the adapter.
+--       PRIMARY KEY (space, key)   -- B-tree; every access is a point get or a
+--                                  -- bounded range (key >= prefix AND key < next(prefix))
+--   ) WITH (fillfactor = 90);
+--
+--   CREATE TABLE blobs (
+--       hash bytea PRIMARY KEY,    -- SHA-256 of the canonical manifest JSON
+--       data bytea NOT NULL        -- version byte + uint64 length + flate page
+--   );
+--
+-- Access paths (EXPLAIN-asserted in internal/storage/postgres/parity_test.go):
+--   point get      SELECT value FROM kv WHERE space=$1 AND key=$2 [FOR UPDATE]
+--   version range  ... WHERE space=$1 AND key >= $2 AND key < $3 ORDER BY key
+--   prefix list    ... WHERE space=$1 AND key >= $2 AND key < $3 ORDER BY key
+-- A sequential scan of kv is a test failure, not a performance regression.
+--
+-- Key families (space -> key) and their value record are listed in the embedded
+-- appendix above; both backends encode the same bytes. Maximum composite key
+-- (versions family: 1024-byte object key + UUID bucket id + 19-digit seq) is
+-- asserted < 2048 bytes, well under the B-tree entry limit (~2704 bytes).
+--
+-- Locking: a write transaction takes SELECT ... FOR UPDATE row locks as records
+-- are read, in the order the meta callback reads them. The commit path is
+-- documented and tested to read bucket -> latest -> version-id -> counters in
+-- that order (same order for every writer), so concurrent commits to one key
+-- serialize instead of deadlocking. The adapter retries a transaction at most
+-- three times on PostgreSQL serialization failures/deadlocks and surfaces every
+-- other error to the caller.
+--
+-- Bloat: kv is a high-churn table (version deletes rewrite latest rows and add
+-- tombstones forever). The migration sets aggressive autovacuum
+-- (scale_factor 0.02/0.01, cost_limit 2000); see docs/09-deployment.md for the
+-- operational guidance and the untested HA risks.

@@ -34,9 +34,16 @@ GW=$((BASE + 1))
 GWADMIN=$((BASE + 2))
 AGENT=$((BASE + 50))
 T=.dev/compat-$$
+rm -rf "$T"
 mkdir -p "$T/disks" "$T/out"
 PIDS=()
-cleanup() { for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; }
+PG_COMPAT_DB=""
+cleanup() {
+  for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done; wait 2>/dev/null || true
+  if [[ -n "$PG_COMPAT_DB" ]]; then
+    psql "${PG_ADMIN_DSN:-}" -q -c "DROP DATABASE IF EXISTS $PG_COMPAT_DB WITH (FORCE)" >/dev/null 2>&1 || true
+  fi
+}
 trap cleanup EXIT
 
 wait_http() { local i; for ((i = 0; i < ${2:-40} * 4; i++)); do curl -sf -m 1 "$1" >/dev/null 2>&1 && return 0; sleep 0.25; done; return 1; }
@@ -45,7 +52,28 @@ echo "== build =="
 go build -o bin/ ./cmd/... || { echo "build failed"; exit 1; }
 
 echo "== cluster (coordinator dev-bootstrap + 12 agents + gateway) =="
-./bin/fass-coordinator --listen="127.0.0.1:$COORD" --data-dir="$T/coord" --dev-bootstrap >"$T/coord.log" 2>&1 &
+# Optional PostgreSQL backend: set FASS_COMPAT_POSTGRES_DSN to an administrative
+# DSN (a database the user can create/drop in). The script creates a fresh
+# database per run so stale agents/rings can never leak into the next run.
+COORD_DB_ARGS=()
+if [[ -n "${FASS_COMPAT_POSTGRES_DSN:-}" ]]; then
+  if ! command -v psql >/dev/null; then echo "FASS_COMPAT_POSTGRES_DSN set but psql is not installed"; exit 1; fi
+  read -r PG_ADMIN_DSN PG_COMPAT_DB PG_DSN < <(python3 - "$FASS_COMPAT_POSTGRES_DSN" <<'PYDSN'
+import sys, time
+from urllib.parse import urlsplit, urlunsplit
+u = urlsplit(sys.argv[1])
+name = "fass_compat_%d" % time.time_ns()
+admin = urlunsplit((u.scheme, u.netloc, "/postgres", u.query, u.fragment))
+fresh = urlunsplit((u.scheme, u.netloc, "/" + name, u.query, u.fragment))
+print(admin, name, fresh)
+PYDSN
+)
+  psql "$PG_ADMIN_DSN" -q -c "CREATE DATABASE $PG_COMPAT_DB" || { echo "could not create $PG_COMPAT_DB"; exit 1; }
+  ./bin/fass-coordinator migrate --db-dsn="$PG_DSN" >"$T/migrate.log" 2>&1 || { cat "$T/migrate.log"; exit 1; }
+  COORD_DB_ARGS=(--db-driver=postgres --db-dsn="$PG_DSN")
+  echo "   coordinator backend: PostgreSQL ($PG_COMPAT_DB)"
+fi
+./bin/fass-coordinator --listen="127.0.0.1:$COORD" --data-dir="$T/coord" --dev-bootstrap "${COORD_DB_ARGS[@]}" >"$T/coord.log" 2>&1 &
 PIDS+=($!)
 wait_http "http://127.0.0.1:$COORD/healthz" 40 || { echo "coordinator failed: see $T/coord.log"; exit 1; }
 grep -o 'FASS_DEV_BOOTSTRAP .*' "$T/coord.log" | head -1 | cut -d' ' -f2- >"$T/boot.json"

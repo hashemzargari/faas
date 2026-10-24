@@ -10,6 +10,20 @@ All requests carry `X-Fass-Request-Id`. Errors use `{"error":{"code":"...","mess
 
 ## 1. Coordinator — `:7000`
 
+### 1.0 Transport security
+
+The coordinator listener is TLS in production: `--tls-cert`/`--tls-key` (env
+`FASS_COORDINATOR_TLS_CERT`/`_TLS_KEY`) are required outside `--dev`, and
+`--require-mtls` adds client-certificate verification against `--tls-client-ca`.
+A coordinator with no certificate **refuses to start** with an actionable error
+rather than serving plaintext; `--dev` (or `--dev-bootstrap`) allows a deliberate
+plaintext dev listener and is reported as `insecure: true`. `/healthz`,
+`/readyz` and `/v1/healthz` report the posture:
+
+```json
+{"status":"ok","schema_version":1,"tls":true,"mtls":false,"insecure":false}
+```
+
 ### 1.1 Identity & authorisation
 ```
 POST /v1/auth/keys/{access_key_id}

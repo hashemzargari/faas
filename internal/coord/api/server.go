@@ -46,6 +46,17 @@ type Server struct {
 	// repair is the repair-state authority backing GET /v1/repair/status and the
 	// repair metrics. It is always non-nil so the endpoint works in every build.
 	repair *recovery.Service
+	// transport describes the listener's security state, reported by /healthz and
+	// /readyz so operators never have to guess whether the control plane is
+	// encrypted (same honesty rule as the repair endpoint's nulls).
+	transport transportState
+}
+
+// transportState is the TLS/mTLS posture of the listener.
+type transportState struct {
+	tls      bool
+	mtls     bool
+	insecure bool
 }
 
 // New builds the HTTP server. The returned Handler is safe for concurrent Use.
@@ -60,6 +71,9 @@ func New(svc *coord.Service, logger *slog.Logger) *Server {
 		metrics: newMetrics(),
 		now:     time.Now,
 		repair:  recovery.New(recovery.Config{Now: time.Now, Logger: logger}),
+		// Direct api.New users (unit tests, in-process harnesses) are plaintext
+		// until the process sets the real listener state.
+		transport: transportState{insecure: true},
 	}
 	s.routes()
 	return s
@@ -78,6 +92,12 @@ func (s *Server) SetRepair(r *recovery.Service) {
 
 // Repair exposes the repair-state service.
 func (s *Server) Repair() *recovery.Service { return s.repair }
+
+// SetTransportSecurity records the listener's TLS posture for /healthz, /readyz
+// and /v1/healthz. insecure is true only for a deliberate plaintext dev listener.
+func (s *Server) SetTransportSecurity(tls, mtls, insecure bool) {
+	s.transport = transportState{tls: tls, mtls: mtls, insecure: insecure}
+}
 
 // Handler returns the middleware-wrapped HTTP handler.
 func (s *Server) Handler() http.Handler {
@@ -316,12 +336,20 @@ func boolQuery(r *http.Request, name string) bool {
 	return true
 }
 
-// healthz answers both /healthz (docs/04) and /v1/healthz (docs/07).
+// healthz answers both /healthz (docs/04) and /v1/healthz (docs/07),
+// including the transport security state so "is this control-plane hop
+// encrypted?" is answered by the endpoint instead of by documentation.
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	body, err := s.svc.Health(r.Context())
 	if err != nil {
 		writeError(w, r, err)
 		return
 	}
+	if body == nil {
+		body = map[string]any{}
+	}
+	body["tls"] = s.transport.tls
+	body["mtls"] = s.transport.mtls
+	body["insecure"] = s.transport.insecure
 	writeJSON(w, r, http.StatusOK, body)
 }

@@ -1,123 +1,521 @@
-# FASS dev cluster: ONE host, THREE simulated Nexuses.
+# FASS dev cluster — ONE host, THREE simulated Nexuses, 12 agents.
 #
-# This is the topology the design decisions require for development (docs/06
+# This is the container path for the topology the design requires (docs/06
 # §2.0, decision D-A): the two-tier code path (geo x local) must be exercised
-# from the first end-to-end milestone, so six agents are labelled across
-# nexus-a / nexus-b / nexus-c. Each "agent" is a separate process with its own
-# disk directory and port -- exactly the per-disk agent model (one agent = one
-# disk), just co-located.
+# from the first milestone. Each agent owns exactly one disk/volume.
 #
-#   docker compose -f deploy/docker/compose.dev.yml up --build
-#   aws --endpoint-url http://localhost:8080 s3 ls
+#   make dev          # build, boot, run the PUT/GET smoke check, tear down
+#   make dev-up       # boot and leave it running
+#   make dev-down     # tear down (including volumes)
 #
-# Default Redundancy Class in dev: geo 2+1 over 3 Nexuses, local 4+2 within a
-# Nexus => 6 shards per group, 18 shards per chunk, ratio 2.25x. Small numbers
-# so a chunk is 3 shards wide per disk; it exercises every code path without
-# needing 60 agents on a laptop.
+# No-container path (same topology, processes on the host):
+#   ./scripts/smoke-cluster.sh
+#
+# What happens on `up`:
+#   1. init-volumes chowns the named volumes to uid 65532 (the distroless
+#      nonroot user) so the workloads never run as root.
+#   2. coordinator starts with --dev-bootstrap: it creates/reconciles the
+#      deterministic topology and writes dev-bootstrap.json into the data
+#      volume (idempotent by design).
+#   3. bootstrap (one-shot) reads that JSON and materialises one announce
+#      secret file per agent under /secrets. The secrets are runtime-minted;
+#      they are never baked into this file or into argv (agents use
+#      --secret-file / FASS_AGENT_SECRET_FILE).
+#   4. gateway starts with a *deterministic* dev key seed (FASS_DEV_KEY_SEED,
+#      overridable) so objects stay readable across restarts. Never use this
+#      value outside dev.
+#   5. the 12 agents start; the `smoke` service (run explicitly by `make dev`)
+#      activates them through the coordinator API and performs a real S3
+#      PUT/HEAD/GET/DELETE round trip.
+#
+# Requirements: Docker Engine + Compose v2. The image is built from
+# deploy/docker/Dockerfile by `make dev` (or `docker compose up --build`).
+#
+# Dev credentials (created by --dev-bootstrap, dev only):
+#   access key dev-access-key / secret dev-secret-key, bucket dev-bucket,
+#   region eu-west-1, RC dev-rc (geo 2+1 / local 3+1).
 
 name: fass-dev
 
-x-agent: &agent
+x-fass-image: &fass-image
   image: fass:dev
-  build:
-    context: ../..
-    dockerfile: deploy/docker/Dockerfile
-  entrypoint: ["/usr/local/bin/fass-agent"]
-  restart: unless-stopped
-  depends_on:
-    coordinator:
-      condition: service_started
-  environment:
-    FASS_COORDINATOR_URL: http://coordinator:7000
-    FASS_AGENT_SECRET: dev-shared-secret
-    FASS_DISK_RESERVE_PCT: "5"
+  # Never silently pull a stale half-built image from a registry; `make dev`
+  # builds it from this tree.
+  pull_policy: never
+
+x-fass-security: &fass-security
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+
+x-agent-healthcheck: &agent-healthcheck
+  test: ["CMD", "/usr/local/bin/fass-dev-healthcheck", "http://127.0.0.1:7100/v1/healthz"]
+  interval: 2s
+  timeout: 3s
+  retries: 90
+  start_period: 5s
+
+volumes:
+  coord-data:
+  secrets:
+  agent-a1-1-data:
+  agent-a1-2-data:
+  agent-a2-1-data:
+  agent-a2-2-data:
+  agent-b1-1-data:
+  agent-b1-2-data:
+  agent-b2-1-data:
+  agent-b2-2-data:
+  agent-c1-1-data:
+  agent-c1-2-data:
+  agent-c2-1-data:
+  agent-c2-2-data:
 
 services:
+  # ---------------------------------------------------------------------------
+  # Volume ownership: the FASS image runs as uid 65532 (distroless nonroot) and
+  # named volumes are root-owned by default, so one short one-shot container
+  # fixes ownership before anything else starts.
+  # ---------------------------------------------------------------------------
+  init-volumes:
+    image: alpine:3.20
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - chown -R 65532:65532 /mnt/coord-data /mnt/secrets /mnt/agents/*
+    volumes:
+      - coord-data:/mnt/coord-data
+      - secrets:/mnt/secrets
+      - agent-a1-1-data:/mnt/agents/agent-a1-1
+      - agent-a1-2-data:/mnt/agents/agent-a1-2
+      - agent-a2-1-data:/mnt/agents/agent-a2-1
+      - agent-a2-2-data:/mnt/agents/agent-a2-2
+      - agent-b1-1-data:/mnt/agents/agent-b1-1
+      - agent-b1-2-data:/mnt/agents/agent-b1-2
+      - agent-b2-1-data:/mnt/agents/agent-b2-1
+      - agent-b2-2-data:/mnt/agents/agent-b2-2
+      - agent-c1-1-data:/mnt/agents/agent-c1-1
+      - agent-c1-2-data:/mnt/agents/agent-c1-2
+      - agent-c2-1-data:/mnt/agents/agent-c2-1
+      - agent-c2-2-data:/mnt/agents/agent-c2-2
+
   coordinator:
-    image: fass:dev
+    <<: *fass-image
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     entrypoint: ["/usr/local/bin/fass-coordinator"]
     restart: unless-stopped
-    command:
-      - --listen=:7000
-      - --data-dir=/var/lib/fass
-      - --dev
-      - --dev-topology=nexus-a:2,nexus-b:2,nexus-c:2
-      - --default-rc=geo2+1-local4+2-aag1
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+    environment:
+      FASS_COORDINATOR_LISTEN: ":7000"
+      FASS_COORDINATOR_DATA_DIR: /var/lib/fass
+      FASS_COORDINATOR_DEV_BOOTSTRAP: "true"
+      FASS_COORDINATOR_LOG_LEVEL: info
+      FASS_COORDINATOR_LOG_FORMAT: text
     ports:
       - "127.0.0.1:7000:7000"
-      - "127.0.0.1:7001:7001"
     volumes:
-      - coorddata:/var/lib/fass
+      - coord-data:/var/lib/fass
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/fass-dev-healthcheck", "http://127.0.0.1:7000/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 3s
+
+  # One-shot: materialise the per-agent announce secrets from the coordinator's
+  # dev-bootstrap payload. Agents wait for this to complete successfully.
+  bootstrap:
+    <<: *fass-image
+    entrypoint: ["/usr/local/bin/fass-dev-bootstrap"]
+    command: ["--data-dir", "/coord", "--out-dir", "/secrets"]
+    restart: "no"
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+    volumes:
+      - coord-data:/coord:ro
+      - secrets:/secrets
 
   gateway:
-    image: fass:dev
-    build:
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile
+    <<: *fass-image
     entrypoint: ["/usr/local/bin/fass-gateway"]
     restart: unless-stopped
-    command:
-      - --listen=:8080
-      - --coordinator=http://coordinator:7000
-      - --region=eu-west-1
-      - --chunk-size=4194304
-      - --dev
-    ports:
-      - "127.0.0.1:8080:8080"
     depends_on:
       coordinator:
-        condition: service_started
+        condition: service_healthy
+      init-volumes:
+        condition: service_completed_successfully
+    environment:
+      FASS_GATEWAY_LISTEN: ":8080"
+      FASS_GATEWAY_ADMIN_LISTEN: ":9000"
+      FASS_COORDINATOR_URL: http://coordinator:7000
+      FASS_GATEWAY_REGION: eu-west-1
+      FASS_GATEWAY_CHUNK_SIZE: "6291456"
+      FASS_GATEWAY_GEO_N: "2"
+      FASS_GATEWAY_GEO_K: "1"
+      FASS_GATEWAY_LOCAL_N: "3"
+      FASS_GATEWAY_LOCAL_K: "1"
+      FASS_GATEWAY_DEFAULT_RC: dev-rc
+      FASS_GATEWAY_OFFLOADER_WORKERS: "4"
+      FASS_GATEWAY_SHARD_PARALLEL: "8"
+      FASS_GATEWAY_KEY_SEED: "${FASS_DEV_KEY_SEED:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
+      FASS_LOG_LEVEL: info
+      FASS_LOG_FORMAT: text
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/fass-dev-healthcheck", "http://127.0.0.1:8080/readyz"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 3s
 
-  # nexus-a
-  agent-a1:
-    <<: *agent
+  agent-a1-1:
+    <<: [*fass-image, *fass-security]
+    entrypoint: ["/usr/local/bin/fass-agent"]
+    restart: unless-stopped
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      FASS_AGENT_COORDINATOR_URL: http://coordinator:7000
+      FASS_AGENT_NEXUS_ID: nexus-a
+      FASS_AGENT_NODE_ID: node-a1
+      FASS_AGENT_PORT: "7100"
+      FASS_AGENT_DISK: /data
+      FASS_AGENT_DISK_ID: disk-a1-1
+      FASS_AGENT_HOSTNAME: agent-a1-1
+      FASS_AGENT_SECRET_FILE: /run/fass/disk-a1-1.secret
+      FASS_AGENT_LOG_LEVEL: info
     volumes:
-      - agent-a1-data:/data
-    command: ["--nexus-id=nexus-a", "--node-id=node-a1", "--listen=:7101", "--disk=/data"]
-    ports: ["127.0.0.1:7101:7101"]
-  agent-a2:
-    <<: *agent
-    volumes:
-      - agent-a2-data:/data
-    command: ["--nexus-id=nexus-a", "--node-id=node-a2", "--listen=:7102", "--disk=/data"]
-    ports: ["127.0.0.1:7102:7102"]
+      - agent-a1-1-data:/data
+      - secrets:/run/fass:ro
+    healthcheck:
+      <<: *agent-healthcheck
 
-  # nexus-b
-  agent-b1:
-    <<: *agent
+  agent-a1-2:
+    <<: [*fass-image, *fass-security]
+    entrypoint: ["/usr/local/bin/fass-agent"]
+    restart: unless-stopped
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      FASS_AGENT_COORDINATOR_URL: http://coordinator:7000
+      FASS_AGENT_NEXUS_ID: nexus-a
+      FASS_AGENT_NODE_ID: node-a1
+      FASS_AGENT_PORT: "7100"
+      FASS_AGENT_DISK: /data
+      FASS_AGENT_DISK_ID: disk-a1-2
+      FASS_AGENT_HOSTNAME: agent-a1-2
+      FASS_AGENT_SECRET_FILE: /run/fass/disk-a1-2.secret
+      FASS_AGENT_LOG_LEVEL: info
     volumes:
-      - agent-b1-data:/data
-    command: ["--nexus-id=nexus-b", "--node-id=node-b1", "--listen=:7103", "--disk=/data"]
-    ports: ["127.0.0.1:7103:7103"]
-  agent-b2:
-    <<: *agent
-    volumes:
-      - agent-b2-data:/data
-    command: ["--nexus-id=nexus-b", "--node-id=node-b2", "--listen=:7104", "--disk=/data"]
-    ports: ["127.0.0.1:7104:7104"]
+      - agent-a1-2-data:/data
+      - secrets:/run/fass:ro
+    healthcheck:
+      <<: *agent-healthcheck
 
-  # nexus-c
-  agent-c1:
-    <<: *agent
+  agent-a2-1:
+    <<: [*fass-image, *fass-security]
+    entrypoint: ["/usr/local/bin/fass-agent"]
+    restart: unless-stopped
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      FASS_AGENT_COORDINATOR_URL: http://coordinator:7000
+      FASS_AGENT_NEXUS_ID: nexus-a
+      FASS_AGENT_NODE_ID: node-a2
+      FASS_AGENT_PORT: "7100"
+      FASS_AGENT_DISK: /data
+      FASS_AGENT_DISK_ID: disk-a2-1
+      FASS_AGENT_HOSTNAME: agent-a2-1
+      FASS_AGENT_SECRET_FILE: /run/fass/disk-a2-1.secret
+      FASS_AGENT_LOG_LEVEL: info
     volumes:
-      - agent-c1-data:/data
-    command: ["--nexus-id=nexus-c", "--node-id=node-c1", "--listen=:7105", "--disk=/data"]
-    ports: ["127.0.0.1:7105:7105"]
-  agent-c2:
-    <<: *agent
-    volumes:
-      - agent-c2-data:/data
-    command: ["--nexus-id=nexus-c", "--node-id=node-c2", "--listen=:7106", "--disk=/data"]
-    ports: ["127.0.0.1:7106:7106"]
+      - agent-a2-1-data:/data
+      - secrets:/run/fass:ro
+    healthcheck:
+      <<: *agent-healthcheck
 
-volumes:
-  coorddata:
-  agent-a1-data:
-  agent-a2-data:
-  agent-b1-data:
-  agent-b2-data:
-  agent-c1-data:
-  agent-c2-data:
+  agent-a2-2:
+    <<: [*fass-image, *fass-security]
+    entrypoint: ["/usr/local/bin/fass-agent"]
+    restart: unless-stopped
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      FASS_AGENT_COORDINATOR_URL: http://coordinator:7000
+      FASS_AGENT_NEXUS_ID: nexus-a
+      FASS_AGENT_NODE_ID: node-a2
+      FASS_AGENT_PORT: "7100"
+      FASS_AGENT_DISK: /data
+      FASS_AGENT_DISK_ID: disk-a2-2
+      FASS_AGENT_HOSTNAME: agent-a2-2
+      FASS_AGENT_SECRET_FILE: /run/fass/disk-a2-2.secret
+      FASS_AGENT_LOG_LEVEL: info
+    volumes:
+      - agent-a2-2-data:/data
+      - secrets:/run/fass:ro
+    healthcheck:
+      <<: *agent-healthcheck
+
+  agent-b1-1:
+    <<: [*fass-image, *fass-security]
+    entrypoint: ["/usr/local/bin/fass-agent"]
+    restart: unless-stopped
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      FASS_AGENT_COORDINATOR_URL: http://coordinator:7000
+      FASS_AGENT_NEXUS_ID: nexus-b
+      FASS_AGENT_NODE_ID: node-b1
+      FASS_AGENT_PORT: "7100"
+      FASS_AGENT_DISK: /data
+      FASS_AGENT_DISK_ID: disk-b1-1
+      FASS_AGENT_HOSTNAME: agent-b1-1
+      FASS_AGENT_SECRET_FILE: /run/fass/disk-b1-1.secret
+      FASS_AGENT_LOG_LEVEL: info
+    volumes:
+      - agent-b1-1-data:/data
+      - secrets:/run/fass:ro
+    healthcheck:
+      <<: *agent-healthcheck
+
+  agent-b1-2:
+    <<: [*fass-image, *fass-security]
+    entrypoint: ["/usr/local/bin/fass-agent"]
+    restart: unless-stopped
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      FASS_AGENT_COORDINATOR_URL: http://coordinator:7000
+      FASS_AGENT_NEXUS_ID: nexus-b
+      FASS_AGENT_NODE_ID: node-b1
+      FASS_AGENT_PORT: "7100"
+      FASS_AGENT_DISK: /data
+      FASS_AGENT_DISK_ID: disk-b1-2
+      FASS_AGENT_HOSTNAME: agent-b1-2
+      FASS_AGENT_SECRET_FILE: /run/fass/disk-b1-2.secret
+      FASS_AGENT_LOG_LEVEL: info
+    volumes:
+      - agent-b1-2-data:/data
+      - secrets:/run/fass:ro
+    healthcheck:
+      <<: *agent-healthcheck
+
+  agent-b2-1:
+    <<: [*fass-image, *fass-security]
+    entrypoint: ["/usr/local/bin/fass-agent"]
+    restart: unless-stopped
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      FASS_AGENT_COORDINATOR_URL: http://coordinator:7000
+      FASS_AGENT_NEXUS_ID: nexus-b
+      FASS_AGENT_NODE_ID: node-b2
+      FASS_AGENT_PORT: "7100"
+      FASS_AGENT_DISK: /data
+      FASS_AGENT_DISK_ID: disk-b2-1
+      FASS_AGENT_HOSTNAME: agent-b2-1
+      FASS_AGENT_SECRET_FILE: /run/fass/disk-b2-1.secret
+      FASS_AGENT_LOG_LEVEL: info
+    volumes:
+      - agent-b2-1-data:/data
+      - secrets:/run/fass:ro
+    healthcheck:
+      <<: *agent-healthcheck
+
+  agent-b2-2:
+    <<: [*fass-image, *fass-security]
+    entrypoint: ["/usr/local/bin/fass-agent"]
+    restart: unless-stopped
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      FASS_AGENT_COORDINATOR_URL: http://coordinator:7000
+      FASS_AGENT_NEXUS_ID: nexus-b
+      FASS_AGENT_NODE_ID: node-b2
+      FASS_AGENT_PORT: "7100"
+      FASS_AGENT_DISK: /data
+      FASS_AGENT_DISK_ID: disk-b2-2
+      FASS_AGENT_HOSTNAME: agent-b2-2
+      FASS_AGENT_SECRET_FILE: /run/fass/disk-b2-2.secret
+      FASS_AGENT_LOG_LEVEL: info
+    volumes:
+      - agent-b2-2-data:/data
+      - secrets:/run/fass:ro
+    healthcheck:
+      <<: *agent-healthcheck
+
+  agent-c1-1:
+    <<: [*fass-image, *fass-security]
+    entrypoint: ["/usr/local/bin/fass-agent"]
+    restart: unless-stopped
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      FASS_AGENT_COORDINATOR_URL: http://coordinator:7000
+      FASS_AGENT_NEXUS_ID: nexus-c
+      FASS_AGENT_NODE_ID: node-c1
+      FASS_AGENT_PORT: "7100"
+      FASS_AGENT_DISK: /data
+      FASS_AGENT_DISK_ID: disk-c1-1
+      FASS_AGENT_HOSTNAME: agent-c1-1
+      FASS_AGENT_SECRET_FILE: /run/fass/disk-c1-1.secret
+      FASS_AGENT_LOG_LEVEL: info
+    volumes:
+      - agent-c1-1-data:/data
+      - secrets:/run/fass:ro
+    healthcheck:
+      <<: *agent-healthcheck
+
+  agent-c1-2:
+    <<: [*fass-image, *fass-security]
+    entrypoint: ["/usr/local/bin/fass-agent"]
+    restart: unless-stopped
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      FASS_AGENT_COORDINATOR_URL: http://coordinator:7000
+      FASS_AGENT_NEXUS_ID: nexus-c
+      FASS_AGENT_NODE_ID: node-c1
+      FASS_AGENT_PORT: "7100"
+      FASS_AGENT_DISK: /data
+      FASS_AGENT_DISK_ID: disk-c1-2
+      FASS_AGENT_HOSTNAME: agent-c1-2
+      FASS_AGENT_SECRET_FILE: /run/fass/disk-c1-2.secret
+      FASS_AGENT_LOG_LEVEL: info
+    volumes:
+      - agent-c1-2-data:/data
+      - secrets:/run/fass:ro
+    healthcheck:
+      <<: *agent-healthcheck
+
+  agent-c2-1:
+    <<: [*fass-image, *fass-security]
+    entrypoint: ["/usr/local/bin/fass-agent"]
+    restart: unless-stopped
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      FASS_AGENT_COORDINATOR_URL: http://coordinator:7000
+      FASS_AGENT_NEXUS_ID: nexus-c
+      FASS_AGENT_NODE_ID: node-c2
+      FASS_AGENT_PORT: "7100"
+      FASS_AGENT_DISK: /data
+      FASS_AGENT_DISK_ID: disk-c2-1
+      FASS_AGENT_HOSTNAME: agent-c2-1
+      FASS_AGENT_SECRET_FILE: /run/fass/disk-c2-1.secret
+      FASS_AGENT_LOG_LEVEL: info
+    volumes:
+      - agent-c2-1-data:/data
+      - secrets:/run/fass:ro
+    healthcheck:
+      <<: *agent-healthcheck
+
+  agent-c2-2:
+    <<: [*fass-image, *fass-security]
+    entrypoint: ["/usr/local/bin/fass-agent"]
+    restart: unless-stopped
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      FASS_AGENT_COORDINATOR_URL: http://coordinator:7000
+      FASS_AGENT_NEXUS_ID: nexus-c
+      FASS_AGENT_NODE_ID: node-c2
+      FASS_AGENT_PORT: "7100"
+      FASS_AGENT_DISK: /data
+      FASS_AGENT_DISK_ID: disk-c2-2
+      FASS_AGENT_HOSTNAME: agent-c2-2
+      FASS_AGENT_SECRET_FILE: /run/fass/disk-c2-2.secret
+      FASS_AGENT_LOG_LEVEL: info
+    volumes:
+      - agent-c2-2-data:/data
+      - secrets:/run/fass:ro
+    healthcheck:
+      <<: *agent-healthcheck
+
+  # Acceptance check, run explicitly by `make dev` (profile keeps it out of a
+  # plain `docker compose up`). It activates the pending agents and performs a
+  # real SigV4 PUT/HEAD/GET/DELETE; it is not a "container started" check.
+  smoke:
+    <<: *fass-image
+    entrypoint: ["/usr/local/bin/fass-dev-smoke"]
+    restart: "no"
+    profiles: ["smoke"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      FASS_COORDINATOR_URL: http://coordinator:7000
+      FASS_S3_ENDPOINT: http://gateway:8080
+      FASS_ACCESS_KEY_ID: dev-access-key
+      FASS_SECRET_ACCESS_KEY: dev-secret-key
+      FASS_REGION: eu-west-1

@@ -38,31 +38,36 @@ import (
 const version = "0.1.0-dev"
 
 type config struct {
-	disk        string
-	diskID      string
-	port        int
-	nexusID     string
-	nodeID      string
-	coordURL    string
-	secret      string
-	hostname    string
-	reservePct  float64
-	maxShard    int64
-	scrub       bool
-	scrubPeriod time.Duration
-	scrubRate   int64
-	repair      bool
-	repairWork  int
-	repairFetch int
-	heartbeat   time.Duration
-	shutdown    time.Duration
-	logLevel    string
-	showVersion bool
+	disk         string
+	diskID       string
+	port         int
+	nexusID      string
+	nodeID       string
+	coordURL     string
+	secret       string
+	secretFile   string
+	secretSource string // "flag" | "env" | "file" | "" (dev mode)
+	hostname     string
+	reservePct   float64
+	maxShard     int64
+	scrub        bool
+	scrubPeriod  time.Duration
+	scrubRate    int64
+	repair       bool
+	repairWork   int
+	repairFetch  int
+	heartbeat    time.Duration
+	shutdown     time.Duration
+	logLevel     string
+	showVersion  bool
 }
 
 func main() {
 	cfg, err := parseFlags(os.Args[1:])
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return // -h/--help: the flag package already printed usage
+		}
 		fmt.Fprintln(os.Stderr, "fass-agent:", err)
 		os.Exit(2)
 	}
@@ -77,17 +82,102 @@ func main() {
 	}
 }
 
+// envPrefix namespaces every agent environment variable.
+const envPrefix = "FASS_AGENT_"
+
+// envLookup is os.LookupEnv, injectable so tests never mutate the process
+// environment (and so hidden FASS_AGENT_* vars on a developer machine cannot
+// make a test flaky).
+type envLookup func(string) (string, bool)
+
+// parseFlags parses argv, then fills every flag that was not set explicitly from
+// the FASS_AGENT_<NAME> environment variables. Precedence is always:
+//
+//	explicit flag > environment variable > compiled-in default
+//
+// so an operator can always override a bad environment file from the command
+// line while debugging.
 func parseFlags(args []string) (config, error) {
+	return parseFlagsWithEnv(args, os.LookupEnv)
+}
+
+func parseFlagsWithEnv(args []string, lookup envLookup) (config, error) {
 	cfg := config{}
 	fs := flag.NewFlagSet("fass-agent", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
+	registerFlags(fs, &cfg)
+
+	if err := fs.Parse(args); err != nil {
+		return config{}, err
+	}
+	if fs.NArg() > 0 {
+		return config{}, fmt.Errorf("unexpected arguments: %v", strings.Join(fs.Args(), " "))
+	}
+
+	explicit := make(map[string]bool, 24)
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	envPresent := func(flagName string) bool {
+		_, ok := lookup(envVarName(flagName))
+		return ok
+	}
+	if err := applyEnvironment(fs, explicit, lookup); err != nil {
+		return config{}, err
+	}
+
+	// Ambient credentials must never be ambiguous: two configured secret sources
+	// mean we cannot tell which cluster the operator meant to join, so refuse.
+	secretSet := explicit["secret"] || envPresent("secret")
+	secretFileSet := explicit["secret-file"] || envPresent("secret-file")
+	switch {
+	case secretSet && secretFileSet:
+		return config{}, errors.New("conflicting secret sources: both --secret/FASS_AGENT_SECRET and " +
+			"--secret-file/FASS_AGENT_SECRET_FILE are set; provide exactly one source")
+	case secretFileSet && cfg.secretFile == "":
+		return config{}, errors.New("--secret-file/FASS_AGENT_SECRET_FILE is set but empty; " +
+			"an empty secret file is a configuration error, not dev mode")
+	}
+
+	switch {
+	case cfg.secretFile != "":
+		secret, err := readSecretFile(cfg.secretFile)
+		if err != nil {
+			return config{}, err
+		}
+		cfg.secret = secret
+		cfg.secretSource = "file"
+	case explicit["secret"]:
+		cfg.secretSource = "flag"
+	case envPresent("secret"):
+		cfg.secretSource = "env"
+	}
+
+	if cfg.port < 0 || cfg.port > 65535 {
+		return config{}, fmt.Errorf("invalid port %d", cfg.port)
+	}
+	if cfg.reservePct < 0 || cfg.reservePct >= 100 {
+		return config{}, fmt.Errorf("invalid reserve percentage %v", cfg.reservePct)
+	}
+	if cfg.maxShard <= 0 {
+		return config{}, fmt.Errorf("invalid max shard bytes %d", cfg.maxShard)
+	}
+	if cfg.heartbeat <= 0 {
+		return config{}, fmt.Errorf("invalid heartbeat interval %v", cfg.heartbeat)
+	}
+	return cfg, nil
+}
+
+// registerFlags declares every flag exactly once. Environment support is derived
+// automatically from this table, so a new flag cannot accidentally be
+// flag-only.
+func registerFlags(fs *flag.FlagSet, cfg *config) {
 	fs.StringVar(&cfg.disk, "disk", "./data", "path to the disk this agent owns")
 	fs.StringVar(&cfg.diskID, "disk-id", "", "authoritative disk UUID for this disk (default: generate/persist in <disk>/state.json; a mismatch with the persisted id refuses to start)")
 	fs.IntVar(&cfg.port, "port", 7100, "shard HTTP listen port (0 picks a free port)")
 	fs.StringVar(&cfg.nexusID, "nexus-id", "", "nexus (site/AZ) this agent belongs to")
 	fs.StringVar(&cfg.nodeID, "node-id", "", "node id reported to the coordinator")
 	fs.StringVar(&cfg.coordURL, "coordinator-url", "http://127.0.0.1:7000", "coordinator control-plane URL")
-	fs.StringVar(&cfg.secret, "secret", "", "one-time announce secret issued by the coordinator")
+	fs.StringVar(&cfg.secret, "secret", "", "one-time announce secret issued by the coordinator (visible in the process list; prefer --secret-file or FASS_AGENT_SECRET)")
+	fs.StringVar(&cfg.secretFile, "secret-file", "", "file holding the one-time announce secret (one trailing newline is trimmed; mutually exclusive with --secret)")
 	fs.StringVar(&cfg.hostname, "hostname", hostname(), "hostname reported in the announce request")
 	fs.Float64Var(&cfg.reservePct, "reserve-pct", 5, "percentage of the filesystem kept free (never filled)")
 	fs.Int64Var(&cfg.maxShard, "max-shard-bytes", 32<<20, "maximum single shard payload size")
@@ -101,25 +191,73 @@ func parseFlags(args []string) (config, error) {
 	fs.DurationVar(&cfg.shutdown, "shutdown-timeout", 15*time.Second, "graceful shutdown timeout")
 	fs.StringVar(&cfg.logLevel, "log-level", "info", "log level: debug, info, warn, error")
 	fs.BoolVar(&cfg.showVersion, "version", false, "print version and exit")
-	if err := fs.Parse(args); err != nil {
-		return config{}, err
+	fs.Usage = usageFunc(fs)
+}
+
+// usageFunc documents precedence and the secret-handling rules in --help.
+func usageFunc(fs *flag.FlagSet) func() {
+	return func() {
+		out := fs.Output()
+		fmt.Fprintln(out, "Usage: fass-agent [flags]")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Configuration precedence: explicit flag > FASS_AGENT_<FLAG_NAME> environment variable > default.")
+		fmt.Fprintln(out, "Every flag except --version can be set from the environment, e.g. FASS_AGENT_COORDINATOR_URL,")
+		fmt.Fprintln(out, "FASS_AGENT_SECRET_FILE, FASS_AGENT_DISK_ID.")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Secrets: prefer --secret-file/FASS_AGENT_SECRET_FILE or FASS_AGENT_SECRET over --secret,")
+		fmt.Fprintln(out, "because command-line arguments are visible to local users via ps. Setting both")
+		fmt.Fprintln(out, "--secret and --secret-file is rejected. An empty secret file is an error.")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Flags:")
+		fs.PrintDefaults()
 	}
-	if fs.NArg() > 0 {
-		return config{}, fmt.Errorf("unexpected arguments: %v", strings.Join(fs.Args(), " "))
+}
+
+// envVarName maps a flag name to its FASS_AGENT_ environment variable:
+// coordinator-url -> FASS_AGENT_COORDINATOR_URL.
+func envVarName(flagName string) string {
+	return envPrefix + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
+}
+
+// applyEnvironment sets every flag that was not explicitly given on the command
+// line from its environment variable. --version is deliberately excluded: it is
+// an action, not configuration, and an image tag accidentally exported as
+// FASS_AGENT_VERSION must not turn into a boolean parse failure.
+func applyEnvironment(fs *flag.FlagSet, explicit map[string]bool, lookup envLookup) error {
+	var envErr error
+	fs.VisitAll(func(f *flag.Flag) {
+		if envErr != nil || f.Name == "version" || explicit[f.Name] {
+			return
+		}
+		name := envVarName(f.Name)
+		raw, ok := lookup(name)
+		if !ok {
+			return
+		}
+		if err := fs.Set(f.Name, raw); err != nil {
+			envErr = fmt.Errorf("environment variable %s: %w", name, err)
+		}
+	})
+	return envErr
+}
+
+// readSecretFile reads a one-line secret from disk, trimming exactly one
+// trailing newline (including CRLF). Multi-line files and empty files are
+// configuration errors: an empty file must never silently mean "dev mode".
+func readSecretFile(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read secret file %q: %w", path, err)
 	}
-	if cfg.port < 0 || cfg.port > 65535 {
-		return config{}, fmt.Errorf("invalid --port %d", cfg.port)
+	secret := strings.TrimSuffix(string(raw), "\n")
+	secret = strings.TrimSuffix(secret, "\r")
+	if strings.ContainsAny(secret, "\r\n") {
+		return "", fmt.Errorf("secret file %q must contain exactly one line", path)
 	}
-	if cfg.reservePct < 0 || cfg.reservePct >= 100 {
-		return config{}, fmt.Errorf("invalid --reserve-pct %v", cfg.reservePct)
+	if strings.TrimSpace(secret) == "" {
+		return "", fmt.Errorf("secret file %q is empty or whitespace-only; an empty secret file is a configuration error, not dev mode", path)
 	}
-	if cfg.maxShard <= 0 {
-		return config{}, fmt.Errorf("invalid --max-shard-bytes %d", cfg.maxShard)
-	}
-	if cfg.heartbeat <= 0 {
-		return config{}, fmt.Errorf("invalid --heartbeat-interval %v", cfg.heartbeat)
-	}
-	return cfg, nil
+	return secret, nil
 }
 
 func hostname() string {
@@ -148,6 +286,11 @@ func newLogger(level string) *slog.Logger {
 func run(parent context.Context, cfg config, logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if cfg.secretSource == "flag" {
+		logger.Warn("announce secret supplied via --secret: it is visible to local users in the process list; " +
+			"prefer --secret-file or FASS_AGENT_SECRET")
+	}
 
 	st, err := store.Open(ctx, store.Options{
 		Root:          cfg.disk,
@@ -221,6 +364,7 @@ func run(parent context.Context, cfg config, logger *slog.Logger) error {
 		"nexus_id", cfg.nexusID,
 		"public_key", ident.PublicKeyBase64(),
 		"coordinator", cfg.coordURL,
+		"secret_source", cfg.secretSource,
 	)
 
 	gctx, gcancel := context.WithCancel(ctx)
@@ -246,7 +390,8 @@ func run(parent context.Context, cfg config, logger *slog.Logger) error {
 	agentIDCh := make(chan contract.AgentID, 1)
 	membershipErr := make(chan error, 1)
 	if cfg.secret == "" {
-		logger.Warn("no --secret provided: announcing and heartbeating are disabled (dev mode)")
+		logger.Warn("no announce secret configured (--secret, --secret-file, FASS_AGENT_SECRET or " +
+			"FASS_AGENT_SECRET_FILE): announcing and heartbeating are disabled (dev mode)")
 	} else {
 		wg.Add(1)
 		go func() {

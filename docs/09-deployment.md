@@ -584,3 +584,109 @@ loudly rather than pretending they are supported.
 | Ring stops accepting writes at ~85% | design watermark | create a new Ring for the same RC; do not edit the old one |
 | Console page red banner | coordinator unreachable | expected degraded mode; fix coordinator connectivity |
 | Console repair card red ("unrecoverable") | a shard set lost more than `geo_k` groups | **data loss**: stop deletions, preserve disks/logs, use backups; do not run repair expecting recovery |
+
+---
+
+## PostgreSQL metadata backend
+
+The coordinator ships two persistence backends behind the same `storage.Store`
+interface: the embedded WAL engine (`--db-driver=embedded`, the dev default,
+single process, one data directory) and PostgreSQL (`--db-driver=postgres`).
+ADR-3b in [docs/02-architecture.md](02-architecture.md) records why the v1
+adapter stores records in the documented `kv`/`blobs` layout instead of querying
+the entity relations directly, and what that costs.
+
+### What was actually tested
+
+| Configuration | Evidence |
+|---|---|
+| One coordinator process, one PostgreSQL 16 primary, embedded and PostgreSQL backends | repository parity suite (`internal/coord/meta/parity`) runs the same behaviour tests against both backends, including two concurrent commits to the same key; PostgreSQL runs `EXPLAIN` assertions that point gets, version range scans and prefix listings are index scans |
+| Coordinator on PostgreSQL serving the full S3 surface | `go test -tags=compat ./test/compat/` 21/21 and `scripts/compat.sh` PASS (aws-cli, rclone incl. tree sync, s3cmd) with `FASS_COMPAT_POSTGRES_DSN` set |
+| Lifecycle expiry + object lock on PostgreSQL | included in the compat suite above, including the dev-gated clock restart |
+| Crash-restart of the coordinator | the metadata transaction is the durability boundary; a restart reconnects to PostgreSQL and re-runs no migrations by default |
+
+### Not tested (do not assume these work)
+
+* **No PostgreSQL failover was exercised.** No streaming replication, no
+  promotion, no split-brain scenario. Treat any HA story here as a plan, not a
+  verified property.
+* **No load/latency test of the adapter.** Statement timeouts are set (default
+  5 s, `--db-statement-timeout`) and the pool is bounded (defaults 40 open /
+  10 idle, `--db-max-open-conns/--db-max-idle-conns`); capacity is not measured.
+* **No cross-version migration run** (only the initial migration exists).
+* **No backup/PITR restore drill.**
+
+### Starting the PostgreSQL-backed coordinator
+
+```bash
+# 1. One-time (and per upgrade): apply migrations explicitly. Never on boot in
+#    production; the server defaults to --db-migrate-on-start=false.
+fass-coordinator migrate --db-dsn "postgres://fass@db1:5432/fass?sslmode=verify-full"
+
+# 2. Run the coordinator against it.
+fass-coordinator \
+  --db-driver=postgres \
+  --db-dsn "postgres://fass@db1:5432/fass?sslmode=verify-full" \
+  --db-max-open-conns 40 --db-max-idle-conns 10 \
+  --db-statement-timeout 5s
+```
+
+A bad DSN or a missing schema fails at startup with an actionable error; it never
+surfaces as a 500 on the first write. `--db-migrate-on-start=true` exists only for
+single-node/dev deployments and CI; it is deliberately not the default. The
+embedded backend still migrates its own store on open (there is no separate
+process for it).
+
+### Primary/standby and RPO
+
+For RPO 0 within one region, run PostgreSQL with a synchronous standby:
+
+```
+synchronous_commit = on            # default; a commit is durable on the primary
+synchronous_standby_names = '1 (standby1)'
+```
+
+FASS's commit is the single act that publishes an object; with
+`synchronous_commit=remote_apply` a 204 from the coordinator means the metadata
+is on the standby too, at the cost of commit latency. With the default
+`synchronous_commit=on` RPO is 0 on the primary's disk but a primary loss can
+lose the last asynchronous standbyship transactions, so use a synchronous standby
+if losing the last commits is unacceptable.
+
+### Failover behaviour (plan, untested)
+
+* **Gateways are stateless.** They reconnect to the configured coordinator
+  endpoint on the next request; in-flight requests fail with 503 and S3 clients
+  retry. Keep a floating endpoint (VIP, DNS name, or a load balancer) in front of
+  the coordinator so the gateway configuration does not change.
+* **Coordinators do not elect a new primary themselves.** They are simple clients
+  of one primary; after a failover, restart/repoint the coordinator(s) at the new
+  primary (or move the floating endpoint). Two coordinators writing to different
+  primaries is a split-brain and must be prevented by the database topology.
+* **Agents** retry heartbeats and re-announce if needed; they hold no metadata
+  and are unaffected by a database failover apart from the pause in control-plane
+  responses.
+* **Repair state** (`/v1/repair/status`) is in coordinator memory and resets on
+  restart; the queue itself is database-backed once the orchestrator lands.
+
+### Backups and PITR
+
+Use PostgreSQL's own tooling: continuous WAL archiving (pgBackRest, WAL-G, or
+managed service PITR) plus periodic base backups. FASS metadata is one database;
+there is no separate coordinator-side export. Test the restore procedure on a
+staging cluster before relying on it: restoring a metadata snapshot to a older
+point makes previously visible objects invisible again (shards are immutable and
+still on the agents; re-commit is not automatic). Object data itself lives on the
+agents' disks and has its own availability story (redundancy class), independent
+of the database.
+
+### Autovacuum / bloat
+
+Version deletion, tombstones and overwrites make `kv` write-heavy. The migration
+sets aggressive per-table autovacuum (`autovacuum_vacuum_scale_factor=0.02`,
+`autovacuum_analyze_scale_factor=0.01`, `autovacuum_vacuum_cost_limit=2000`).
+Monitor `pg_stat_user_tables.n_dead_tup` and `pg_stat_activity` for long-lived
+transactions that hold back vacuum; a coordinator with a stuck statement (the
+5 s statement timeout should prevent it) will bloat the table. Tune the settings
+for the table size on the actual cluster; the migration values are a starting
+point, not a universal answer.

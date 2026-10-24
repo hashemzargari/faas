@@ -1,0 +1,33 @@
+# Docker build context for deploy/docker/Dockerfile (used by compose.dev.yml).
+#
+# The repository is large: workspace toolchain caches, dev runtime state, the
+# scraped research corpus and a few build artifacts that were accidentally left
+# at the root are all irrelevant to the image. Excluding them keeps the context
+# small (otherwise BuildKit sends multiple GB before it even starts compiling).
+.git
+.gitignore
+.gopath
+.gocache
+.dev
+bin
+dist
+.research
+cubbit
+*.test
+coverage.out
+.env
+*.local.yaml
+
+# Build artifacts at the repo root (see .gitignore).
+/fass-agent
+/fass-coordinator
+/fass-gateway
+/fass-all
+/fass-cli
+/fass-console
+/fass-bridge
+/fass-operator
+
+# Keep the image build inputs:
+#   go.mod go.sum vendor/ cmd/ internal/ pkg/ deploy/docker/Dockerfile
+#   deploy/docker/devtools/

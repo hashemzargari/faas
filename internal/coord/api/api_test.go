@@ -816,3 +816,31 @@ func TestRepairStatusWireShape(t *testing.T) {
 		t.Fatalf("unrecoverable = %d, want 1 when every agent is unreachable", status.ShardSets.Unrecoverable)
 	}
 }
+
+// TestHealthReportsTransportSecurity: the health endpoints answer "is this
+// control-plane hop encrypted?" instead of leaving operators to guess.
+func TestHealthReportsTransportSecurity(t *testing.T) {
+	h := newHarness(t)
+	read := func(path string) map[string]any {
+		resp, raw := h.do("GET", path, nil)
+		h.mustStatus(resp, http.StatusOK)
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		return body
+	}
+	// Direct api.New harness is plaintext until the process reports otherwise.
+	for _, path := range []string{"/healthz", "/readyz", "/v1/healthz"} {
+		body := read(path)
+		if body["tls"] != false || body["mtls"] != false || body["insecure"] != true {
+			t.Fatalf("%s transport = tls %v mtls %v insecure %v, want false/false/true", path, body["tls"], body["mtls"], body["insecure"])
+		}
+	}
+
+	h.api.SetTransportSecurity(true, true, false)
+	body := read("/healthz")
+	if body["tls"] != true || body["mtls"] != true || body["insecure"] != false {
+		t.Fatalf("TLS transport = tls %v mtls %v insecure %v, want true/true/false", body["tls"], body["mtls"], body["insecure"])
+	}
+}

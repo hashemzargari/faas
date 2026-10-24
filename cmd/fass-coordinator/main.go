@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -31,6 +32,7 @@ import (
 	"github.com/fass-storage/fass/internal/coord/membership"
 	"github.com/fass-storage/fass/internal/coord/placement"
 	"github.com/fass-storage/fass/internal/coord/recovery"
+	"github.com/fass-storage/fass/internal/pki"
 	"github.com/fass-storage/fass/internal/storage"
 	"github.com/fass-storage/fass/internal/storage/postgres"
 )
@@ -142,6 +144,13 @@ type config struct {
 	gcInterval  time.Duration
 	gcBatch     int
 	agentScheme string
+	// dev mode: plaintext listener allowed and dev bootstrap available.
+	dev bool
+	// TLS for the coordinator listener (fail closed outside dev).
+	tlsCert     string
+	tlsKey      string
+	tlsClientCA string
+	requireMTLS bool
 	// dev bootstrap (docs/07 §1.8) and dev-tunable health timings
 	devBootstrap      bool
 	heartbeatInterval time.Duration
@@ -185,6 +194,11 @@ func run(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	tlsCfg, insecure, err := coordinatorTLS(cfg)
+	if err != nil {
+		return err
+	}
 
 	now := time.Now
 	if cfg.devBootstrap && cfg.devClockOffset != 0 {
@@ -235,6 +249,7 @@ func run(args []string) error {
 	// Deletion GC: drain tombstoned versions' shards once their grace period has
 	// elapsed. Agent transport is HTTP in v1 (docs/07 §2).
 	server := api.New(svc, logger)
+	server.SetTransportSecurity(tlsCfg != nil, cfg.requireMTLS, insecure)
 	repairSvc := recovery.New(recovery.Config{
 		PerSiteBudgetMBps: cfg.repairBudgetMBps,
 		Now:               now,
@@ -281,10 +296,16 @@ func run(args []string) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", cfg.listen, err)
 	}
+	if tlsCfg != nil {
+		ln = tls.NewListener(ln, tlsCfg)
+	}
 	logger.Info("coordinator listening",
 		"addr", ln.Addr().String(),
 		"data_dir", displayDataDir(cfg.dataDir),
 		"maintenance", cfg.maintenance,
+		"tls", tlsCfg != nil,
+		"mtls", cfg.requireMTLS,
+		"insecure", insecure,
 		"version", version,
 	)
 
@@ -315,6 +336,28 @@ func run(args []string) error {
 	return nil
 }
 
+// coordinatorTLS decides the listener's transport security. Fail closed: outside
+// dev mode a coordinator without a server certificate refuses to start, so the
+// last unencrypted control-plane hop cannot be enabled by forgetting a flag.
+func coordinatorTLS(cfg config) (tlsCfg *tls.Config, insecure bool, err error) {
+	dev := cfg.dev || cfg.devBootstrap
+	haveCert := cfg.tlsCert != "" || cfg.tlsKey != ""
+	if !haveCert {
+		if dev {
+			return nil, true, nil
+		}
+		return nil, false, fmt.Errorf("refusing to start without TLS: set --tls-cert and --tls-key (optionally --tls-client-ca with --require-mtls), or pass --dev for a plaintext development process")
+	}
+	if cfg.tlsCert == "" || cfg.tlsKey == "" {
+		return nil, false, fmt.Errorf("--tls-cert and --tls-key must be set together")
+	}
+	tlsCfg, err = pki.ServerConfig(cfg.tlsCert, cfg.tlsKey, cfg.tlsClientCA, cfg.requireMTLS)
+	if err != nil {
+		return nil, false, fmt.Errorf("coordinator TLS: %w", err)
+	}
+	return tlsCfg, false, nil
+}
+
 func parseConfig(args []string) (config, error) {
 	fs := flag.NewFlagSet("fass-coordinator", flag.ContinueOnError)
 	cfg := config{}
@@ -327,7 +370,12 @@ func parseConfig(args []string) (config, error) {
 	fs.DurationVar(&cfg.gcInterval, "gc-interval", envDuration("FASS_COORDINATOR_GC_INTERVAL", gc.DefaultInterval), "deletion GC pass interval")
 	fs.IntVar(&cfg.gcBatch, "gc-batch", envInt("FASS_COORDINATOR_GC_BATCH", gc.DefaultBatch), "max deletion entries per GC pass")
 	fs.StringVar(&cfg.agentScheme, "agent-scheme", envOr("FASS_COORDINATOR_AGENT_SCHEME", "http"), "scheme for agent shard endpoints (http in dev, https in prod)")
-	fs.BoolVar(&cfg.devBootstrap, "dev-bootstrap", envBoolDefault("FASS_COORDINATOR_DEV_BOOTSTRAP", false), "create/reconcile the deterministic dev cluster and print FASS_DEV_BOOTSTRAP <json>")
+	fs.BoolVar(&cfg.dev, "dev", envBoolDefault("FASS_COORDINATOR_DEV", false), "dev mode: allow a plaintext listener (no TLS). Never use in production")
+	fs.StringVar(&cfg.tlsCert, "tls-cert", envString("FASS_COORDINATOR_TLS_CERT", ""), "server certificate (PEM) for the coordinator listener; required outside --dev")
+	fs.StringVar(&cfg.tlsKey, "tls-key", envString("FASS_COORDINATOR_TLS_KEY", ""), "server private key (PEM) for the coordinator listener")
+	fs.StringVar(&cfg.tlsClientCA, "tls-client-ca", envString("FASS_COORDINATOR_TLS_CLIENT_CA", ""), "CA bundle (PEM) used to verify client certificates when --require-mtls is set")
+	fs.BoolVar(&cfg.requireMTLS, "require-mtls", envBoolDefault("FASS_COORDINATOR_REQUIRE_MTLS", false), "require and verify client certificates (implies TLS; --tls-client-ca required)")
+	fs.BoolVar(&cfg.devBootstrap, "dev-bootstrap", envBoolDefault("FASS_COORDINATOR_DEV_BOOTSTRAP", false), "create/reconcile the deterministic dev cluster and print FASS_DEV_BOOTSTRAP <json> (implies --dev)")
 	fs.DurationVar(&cfg.heartbeatInterval, "heartbeat-interval", envDuration("FASS_COORDINATOR_HEARTBEAT_INTERVAL", membership.DefaultHeartbeatInterval), "expected agent heartbeat interval")
 	fs.DurationVar(&cfg.suspectAfter, "suspect-after", envDuration("FASS_COORDINATOR_SUSPECT_AFTER", membership.DefaultSuspectAfter), "mark an agent SUSPECT after this much silence")
 	fs.DurationVar(&cfg.offlineAfter, "offline-after", envDuration("FASS_COORDINATOR_OFFLINE_AFTER", membership.DefaultOfflineAfter), "mark an agent OFFLINE after this much silence")
