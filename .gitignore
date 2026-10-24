@@ -20,3 +20,13 @@ coverage.out
 
 # local dev runtime dirs
 .dev/
+
+# build artifacts (never commit binaries)
+/fass-agent
+/fass-coordinator
+/fass-gateway
+/fass-all
+/fass-cli
+/fass-console
+/fass-bridge
+/fass-operator
