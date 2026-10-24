@@ -83,6 +83,11 @@ type CapacityFunc func(root string) (total, free int64, err error)
 type Options struct {
 	// Root is the agent data directory ("/data").
 	Root string
+	// DiskID is the operator-supplied authoritative disk identity (--disk-id).
+	// Empty means "generate a UUID on first boot and reuse the persisted one
+	// afterwards". A non-empty value must match <Root>/state.json if that file
+	// already exists; a mismatch makes Open fail with ErrDiskIDMismatch.
+	DiskID string
 	// ReservePct is the share of the filesystem reserved so the disk never
 	// fills (default 5%).
 	ReservePct float64
@@ -214,7 +219,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		}
 	}
 
-	if s.state, err = loadOrCreateState(s.stateFile); err != nil {
+	if s.state, err = loadOrCreateState(s.stateFile, opts.DiskID); err != nil {
 		return nil, err
 	}
 

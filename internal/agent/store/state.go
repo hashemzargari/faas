@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/fass-storage/fass/internal/agent/uid"
@@ -13,6 +14,17 @@ import (
 
 // stateFormatVersion is bumped when the on-disk layout changes incompatibly.
 const stateFormatVersion = 1
+
+// maxDiskIDLen bounds the operator-supplied disk identity. Disk ids are
+// UUIDv4 strings in the documented deployment, but an operator may use a
+// hardware serial; anything longer is a configuration mistake.
+const maxDiskIDLen = 128
+
+// ErrDiskIDMismatch is returned when the caller supplies an authoritative
+// --disk-id that differs from the id persisted in state.json. Refusing to start
+// is the "same disk mounted to another agent" protection: serving with a
+// mismatched identity would claim shards the agent does not own.
+var ErrDiskIDMismatch = errors.New("store: disk identity mismatch")
 
 // State is the per-disk identity, docs/04-services.md §6.3 state.json.
 //
@@ -26,7 +38,14 @@ type State struct {
 }
 
 // loadOrCreateState reads state.json or creates it on first boot.
-func loadOrCreateState(path string) (State, error) {
+//
+// requested is the operator-supplied identity (--disk-id). On a fresh disk it
+// becomes authoritative and is persisted; on an existing disk it must match the
+// persisted id or the store refuses to open (see ErrDiskIDMismatch).
+func loadOrCreateState(path, requested string) (State, error) {
+	if err := validateDiskID(requested); err != nil {
+		return State{}, err
+	}
 	b, err := os.ReadFile(path)
 	switch {
 	case err == nil:
@@ -41,11 +60,20 @@ func loadOrCreateState(path string) (State, error) {
 		if st.DiskID == "" {
 			return State{}, fmt.Errorf("store: %s has no disk_id", path)
 		}
+		if requested != "" && requested != st.DiskID {
+			return State{}, fmt.Errorf("%w: %s already records disk id %q but --disk-id is %q; "+
+				"refusing to start (this disk may belong to another agent — remove %s only if you intend to re-identify it)",
+				ErrDiskIDMismatch, path, st.DiskID, requested, path)
+		}
 		return st, nil
 	case errors.Is(err, os.ErrNotExist):
+		diskID := requested
+		if diskID == "" {
+			diskID = uid.New()
+		}
 		st := State{
 			FormatVersion: stateFormatVersion,
-			DiskID:        uid.New(),
+			DiskID:        diskID,
 			CreatedAt:     time.Now().UTC(),
 		}
 		if err := writeState(path, st); err != nil {
@@ -55,6 +83,28 @@ func loadOrCreateState(path string) (State, error) {
 	default:
 		return State{}, fmt.Errorf("store: read %s: %w", path, err)
 	}
+}
+
+// validateDiskID checks an operator-supplied disk identity: empty means "no
+// explicit identity" (generate one), otherwise it must be a short, opaque,
+// whitespace-free string. The documented production form is a UUIDv4, but the
+// store does not enforce that so hardware serials remain usable.
+func validateDiskID(id string) error {
+	if id == "" {
+		return nil
+	}
+	if id != strings.TrimSpace(id) {
+		return fmt.Errorf("%w: disk id %q has leading or trailing whitespace", ErrBadRequest, id)
+	}
+	if len(id) > maxDiskIDLen {
+		return fmt.Errorf("%w: disk id is %d bytes, maximum is %d", ErrBadRequest, len(id), maxDiskIDLen)
+	}
+	for _, r := range id {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%w: disk id contains a control character", ErrBadRequest)
+		}
+	}
+	return nil
 }
 
 // writeState atomically writes state.json.

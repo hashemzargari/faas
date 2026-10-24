@@ -94,12 +94,12 @@ func (r *Registry) WritePrometheus(w io.Writer) error {
 	sort.Slice(gauges, func(i, j int) bool { return gauges[i].name < gauges[j].name })
 
 	for _, c := range counters {
-		if _, err := fmt.Fprintf(w, "# TYPE %s counter\n%s%s %d\n", c.name, c.name, c.labels, c.value.Load()); err != nil {
+		if _, err := fmt.Fprintf(w, "# TYPE %s counter\n%s %d\n", c.name, series(c.name, c.labels), c.value.Load()); err != nil {
 			return err
 		}
 	}
 	for _, g := range gauges {
-		if _, err := fmt.Fprintf(w, "# TYPE %s gauge\n%s%s %g\n", g.name, g.name, g.labels, g.value); err != nil {
+		if _, err := fmt.Fprintf(w, "# TYPE %s gauge\n%s %g\n", g.name, series(g.name, g.labels), g.value); err != nil {
 			return err
 		}
 	}
@@ -112,6 +112,14 @@ func (r *Registry) Handler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_ = r.WritePrometheus(w)
 	})
+}
+
+// series renders "name{labels}" (or just the name when unlabelled).
+func series(name, labels string) string {
+	if labels == "" {
+		return name
+	}
+	return name + "{" + labels + "}"
 }
 
 // labelString renders labels deterministically for map keys and exposition.

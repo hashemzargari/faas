@@ -84,7 +84,12 @@ The user approved implementation with three changes to the ordering below. They 
 
 Consequence: milestones are re-sequenced as M0 → M1/M2 (control plane and agent in parallel) → M2.5 (two-tier object path) → M3 (3-site topology, RC/Rings, placement) → M4 (S3 matrix) → M5 (durability) → M6 (ops) → M7 (hardening). The M-numbering below is retained for the exit criteria, but M3's "single-tier" scope is superseded by D-A.
 
-Dev topology: `fass all --dev` boots one coordinator, one gateway, six agents labelled across three simulated Nexuses (`nexus-a`/`-b`/`-c`), default RC `geo 2+1, local 4+2` so the whole two-tier path is exercised on one machine.
+Dev topology (corrected after a feasibility analysis — the first spec was arithmetically impossible):
+
+* 3 simulated Nexuses (`nexus-a`/`-b`/`-c`) × 2 nodes × **2 disks per node = 12 agents**.
+* Dev Redundancy Class `geo 2+1 / local 3+1`, `aag 2`, **chunk 6 MiB** ⇒ 12 shards per chunk, ratio 2.0, 1 MiB per shard exactly.
+* Why these numbers: per-Nexus shard capacity is `min(#agents, #nodes × aag)` because a shard set places at most one shard per Agent, so `local_n + local_k = 4` needs 4 agents in every Nexus. `geo_n · local_n = 6` must divide the chunk size for uniform shards, and **no power-of-two chunk is divisible by 6** — hence 6 MiB, and the RC validator's power-of-two rule was replaced by the real contract (1 MiB alignment, 4–64 MiB, shard ≥ 4 KiB).
+* The resulting test is stronger than a tidy degrade: killing one node leaves 2 of 4 shards (< `local_n = 3`), so that entire Nexus group is unusable and the read must reconstruct through the outer code from the other two Nexuses. Killing `nexus-c` leaves exactly `geo_n = 2` groups.
 
 
 Effort in engineer-days for one experienced Go engineer. Calendar estimates assume 3 parallel workstreams.

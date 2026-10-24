@@ -566,9 +566,16 @@ func (s *Service) EnsureRingAgents(ctx context.Context, ringID contract.RingID, 
 // without knowing the disk identity in advance; explicit node+disk registrations
 // keep their stricter semantics.
 type PendingRegistration struct {
-	AgentID       contract.AgentID
-	NodeID        contract.NodeID
-	DiskID        string
+	AgentID contract.AgentID
+	NodeID  contract.NodeID
+	// DiskID pins an operator-declared disk identity (strict matching). When
+	// empty the registration is node-scoped and identified by Slot instead; the
+	// agent's generated disk UUID is bound on the first successful announce.
+	DiskID string
+	// Slot distinguishes several pending agents on the same node (one per disk).
+	// It is only meaningful for node-scoped registrations and is also the
+	// operator-facing disk label in the dev bootstrap payload.
+	Slot          string
 	ExpectedPort  int
 	CapacityBytes int64
 }
@@ -621,19 +628,15 @@ func (s *Service) registerPendingTx(tx *storage.WriteTx, reg PendingRegistration
 	if err != nil {
 		return "", "", err
 	}
+	nodeScoped := reg.DiskID == ""
 	locKey := agentLocationKey(reg.NodeID, reg.DiskID)
+	if nodeScoped {
+		locKey = nodeSlotKey(reg.NodeID, reg.Slot)
+	}
 	if existing, err := tx.Get(spaceAgentLoc, locKey); err == nil {
 		return "", "", coerr.E(409, coerr.CodeConflict, "agent for node %q disk %q is already registered (%s)", reg.NodeID, reg.DiskID, existing)
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		return "", "", err
-	}
-	if reg.DiskID == "" {
-		// One node-scoped pending registration per node.
-		if existing, err := tx.Get(spaceAgentLoc, agentLocationKey(reg.NodeID, "")); err == nil {
-			return "", "", coerr.E(409, coerr.CodeConflict, "node %q already has a pending registration (%s)", reg.NodeID, existing)
-		} else if !errors.Is(err, storage.ErrNotFound) {
-			return "", "", err
-		}
 	}
 	ag := Agent{
 		ID:            agentID,
@@ -682,11 +685,13 @@ func (s *Service) EnsurePending(ctx context.Context, reg PendingRegistration) (a
 	err = s.db.Update(ctx, func(tx *storage.WriteTx) error {
 		var ag Agent
 		found := false
-		for _, key := range []struct {
-			node contract.NodeID
-			disk string
-		}{{reg.NodeID, reg.DiskID}, {reg.NodeID, ""}} {
-			raw, err := tx.Get(spaceAgentLoc, agentLocationKey(key.node, key.disk))
+		lookupKeys := [][]byte{}
+		if reg.DiskID != "" {
+			lookupKeys = append(lookupKeys, agentLocationKey(reg.NodeID, reg.DiskID))
+		}
+		lookupKeys = append(lookupKeys, nodeSlotKey(reg.NodeID, reg.Slot))
+		for _, key := range lookupKeys {
+			raw, err := tx.Get(spaceAgentLoc, key)
 			if errors.Is(err, storage.ErrNotFound) {
 				continue
 			}
@@ -764,26 +769,50 @@ func (s *Service) Announce(ctx context.Context, req contract.AnnounceRequest) (c
 	now := s.now()
 	var result contract.AnnounceResult
 	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
-		// Prefer an exact node+disk registration; fall back to a node-scoped
-		// pending registration, which binds the agent's generated disk UUID on
-		// this first successful announce.
-		locKey := agentLocationKey(req.NodeID, req.DiskID)
-		agentIDRaw, err := tx.Get(spaceAgentLoc, locKey)
-		nodeScoped := false
-		if errors.Is(err, storage.ErrNotFound) {
-			locKey = agentLocationKey(req.NodeID, "")
-			agentIDRaw, err = tx.Get(spaceAgentLoc, locKey)
-			nodeScoped = err == nil
-		}
-		if errors.Is(err, storage.ErrNotFound) {
-			return coerr.ErrSecretNotFound
-		}
-		if err != nil {
+		pubKey := base64.StdEncoding.EncodeToString(req.PublicKey)
+
+		// Resolution order:
+		//  1. an exact node+disk registration (already bound agent);
+		//  2. the public key is already bound to some agent ⇒ 409 duplicate key.
+		//     This is what stops a disk holding another agent's state from
+		//     hijacking the node ("agent started with another agent's disk").;
+		//  3. a node-scoped pending registration whose one-time secret matches —
+		//     the multi-disk case — binding the agent's generated disk UUID.
+		var (
+			ag         Agent
+			nodeScoped bool
+		)
+		raw, err := tx.Get(spaceAgentLoc, agentLocationKey(req.NodeID, req.DiskID))
+		switch {
+		case err == nil:
+			ag, err = storage.GetJSON[Agent](tx, spaceAgents, raw)
+			if err != nil {
+				return err
+			}
+			if owner, perr := tx.Get(spaceAgentPub, []byte(pubKey)); perr == nil && string(owner) != string(ag.ID) {
+				return coerr.ErrDuplicatePublicKey
+			} else if perr != nil && !errors.Is(perr, storage.ErrNotFound) {
+				return perr
+			}
+		case !errors.Is(err, storage.ErrNotFound):
 			return err
-		}
-		ag, err := storage.GetJSON[Agent](tx, spaceAgents, agentIDRaw)
-		if err != nil {
-			return err
+		default:
+			if owner, perr := tx.Get(spaceAgentPub, []byte(pubKey)); perr == nil {
+				// Same public key, different disk UUID: identity conflict, exactly
+				// the case disk identity exists to catch.
+				_ = owner
+				return coerr.ErrDuplicatePublicKey
+			} else if !errors.Is(perr, storage.ErrNotFound) {
+				return perr
+			}
+			pending, ok, perr := findNodeScopedPending(tx, req.NodeID, req.Secret)
+			if perr != nil {
+				return perr
+			}
+			if !ok {
+				return coerr.ErrSecretNotFound
+			}
+			ag, nodeScoped = pending, true
 		}
 
 		pubKey := base64.StdEncoding.EncodeToString(req.PublicKey)
@@ -1444,10 +1473,15 @@ func (s *Service) Snapshot(ctx context.Context, geoFence map[string][]contract.N
 
 func (s *Service) now() time.Time { return s.cfg.Now().UTC() }
 
-// agentLocationKey indexes agent identity by node and disk. An empty disk means a
-// node-scoped pending registration (the disk UUID is bound on first announce).
+// agentLocationKey indexes agent identity by node and disk. A "#"-prefixed second
+// component is a node-scoped pending slot (see PendingRegistration.Slot); agent
+// disk UUIDs never start with "#".
 func agentLocationKey(node contract.NodeID, disk string) []byte {
 	return storage.JoinKeyN([]string{string(node), disk}, nil)
+}
+
+func nodeSlotKey(node contract.NodeID, slot string) []byte {
+	return agentLocationKey(node, "#"+slot)
 }
 
 func clamp01(v float64) float64 {
