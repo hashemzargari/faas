@@ -148,6 +148,19 @@ func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "# TYPE fass_coordinator_nexuses gauge")
 		fmt.Fprintf(w, "fass_coordinator_nexuses %d\n", len(snap.Nexuses))
 	}
+	if s.repair != nil {
+		repairStats := s.repair.Metrics()
+		names := make([]string, 0, len(repairStats))
+		for name := range repairStats {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			fmt.Fprintf(w, "# HELP fass_coordinator_repair_%s Repair %s (same source as /v1/repair/status).\n", name, strings.ReplaceAll(name, "_", " "))
+			fmt.Fprintf(w, "# TYPE fass_coordinator_repair_%s gauge\n", name)
+			fmt.Fprintf(w, "fass_coordinator_repair_%s %s\n", name, fmtFloat(repairStats[name]))
+		}
+	}
 	if s.gcStats != nil {
 		stats := s.gcStats()
 		names := make([]string, 0, len(stats))

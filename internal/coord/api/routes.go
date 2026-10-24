@@ -60,6 +60,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/agents/shard-status", s.handleShardStatus)
 	s.mux.HandleFunc("POST /v1/repair/claim", s.handleClaimRepairJob)
 	s.mux.HandleFunc("POST /v1/repair/commit", s.handleCommitRepair)
+	s.mux.HandleFunc("GET /v1/repair/status", s.handleRepairStatus)
 	s.mux.HandleFunc("GET /v1/topology", s.handleTopology)
 
 	// Additive admin surface (not part of the frozen §1).

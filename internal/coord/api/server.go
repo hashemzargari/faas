@@ -23,6 +23,7 @@ import (
 	"github.com/fass-storage/fass/internal/coord"
 	"github.com/fass-storage/fass/internal/coord/coerr"
 	"github.com/fass-storage/fass/internal/coord/id"
+	"github.com/fass-storage/fass/internal/coord/recovery"
 )
 
 // MaxJSONBody bounds non-streaming control-plane request bodies. A full-object
@@ -42,6 +43,9 @@ type Server struct {
 	now     func() time.Time
 	// gcStats, when set, exposes the deletion-GC executor counters on /metrics.
 	gcStats func() map[string]int64
+	// repair is the repair-state authority backing GET /v1/repair/status and the
+	// repair metrics. It is always non-nil so the endpoint works in every build.
+	repair *recovery.Service
 }
 
 // New builds the HTTP server. The returned Handler is safe for concurrent Use.
@@ -55,6 +59,7 @@ func New(svc *coord.Service, logger *slog.Logger) *Server {
 		mux:     http.NewServeMux(),
 		metrics: newMetrics(),
 		now:     time.Now,
+		repair:  recovery.New(recovery.Config{Now: time.Now, Logger: logger}),
 	}
 	s.routes()
 	return s
@@ -62,6 +67,17 @@ func New(svc *coord.Service, logger *slog.Logger) *Server {
 
 // SetGCStats registers the deletion-GC counter source exposed on /metrics.
 func (s *Server) SetGCStats(fn func() map[string]int64) { s.gcStats = fn }
+
+// SetRepair replaces the repair-state service (the coordinator configures the
+// per-site budget and starts the background shard-set refresher on it).
+func (s *Server) SetRepair(r *recovery.Service) {
+	if r != nil {
+		s.repair = r
+	}
+}
+
+// Repair exposes the repair-state service.
+func (s *Server) Repair() *recovery.Service { return s.repair }
 
 // Handler returns the middleware-wrapped HTTP handler.
 func (s *Server) Handler() http.Handler {

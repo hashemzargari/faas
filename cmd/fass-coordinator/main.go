@@ -30,6 +30,7 @@ import (
 	"github.com/fass-storage/fass/internal/coord/lifecycle"
 	"github.com/fass-storage/fass/internal/coord/membership"
 	"github.com/fass-storage/fass/internal/coord/placement"
+	"github.com/fass-storage/fass/internal/coord/recovery"
 )
 
 // version is stamped by the build ("-X main.version=...").
@@ -65,6 +66,11 @@ type config struct {
 	// lifecycle sweep (docs/05 §5.6)
 	lifecycleEnabled  bool
 	lifecycleInterval time.Duration
+	// repair status (docs/07 §1.6): budget comes from docs/04 defaults, and the
+	// shard-set inventory is refreshed in the background so the status endpoint
+	// never scans on request.
+	repairBudgetMBps      int
+	repairRefreshInterval time.Duration
 }
 
 func run(args []string) error {
@@ -129,6 +135,16 @@ func run(args []string) error {
 	// Deletion GC: drain tombstoned versions' shards once their grace period has
 	// elapsed. Agent transport is HTTP in v1 (docs/07 §2).
 	server := api.New(svc, logger)
+	repairSvc := recovery.New(recovery.Config{
+		PerSiteBudgetMBps: cfg.repairBudgetMBps,
+		Now:               now,
+		Logger:            logger,
+	})
+	server.SetRepair(repairSvc)
+	go repairSvc.RunRefresher(ctx, recovery.NewMetaSource(svc.Meta), cfg.repairRefreshInterval)
+	logger.Info("repair status enabled",
+		"per_site_budget_mbps", cfg.repairBudgetMBps,
+		"shard_set_refresh", cfg.repairRefreshInterval.String())
 	if cfg.gcEnabled {
 		agentClient := client.New(client.Options{Scheme: cfg.agentScheme, Timeout: 15 * time.Second})
 		executor := gc.New(svc.Meta, agentClient, gc.Config{
@@ -218,6 +234,8 @@ func parseConfig(args []string) (config, error) {
 	fs.BoolVar(&cfg.lifecycleEnabled, "lifecycle", envBoolDefault("FASS_COORDINATOR_LIFECYCLE", true), "run the S3 lifecycle expiry sweep")
 	fs.DurationVar(&cfg.lifecycleInterval, "lifecycle-interval", envDuration("FASS_COORDINATOR_LIFECYCLE_INTERVAL", lifecycle.DefaultInterval), "lifecycle sweep interval")
 	fs.DurationVar(&cfg.devClockOffset, "dev-clock-offset", envDuration("FASS_COORDINATOR_DEV_CLOCK_OFFSET", 0), "DEV ONLY (requires --dev-bootstrap): shift the coordinator clock by this duration; used by the compat suite to test lifecycle without waiting days")
+	fs.IntVar(&cfg.repairBudgetMBps, "repair-per-site-budget-mbps", envInt("FASS_COORDINATOR_REPAIR_BUDGET_MBPS", 200), "inter-site repair bandwidth budget reported by /v1/repair/status (0 = not configured, reported as null)")
+	fs.DurationVar(&cfg.repairRefreshInterval, "repair-refresh-interval", envDuration("FASS_COORDINATOR_REPAIR_REFRESH_INTERVAL", time.Minute), "how often the background refresher rebuilds the shard-set redundancy inventory")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}

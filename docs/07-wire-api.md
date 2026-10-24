@@ -92,10 +92,52 @@ POST /v1/agents/heartbeat  Heartbeat        → 204
 POST /v1/agents/shard-status {"items":[ShardStatus...]} → 204
 POST /v1/repair/claim      {"worker":"agent-7"} → 200 RepairJob | 204 (no work)
 POST /v1/repair/commit     RepairResult     → 204
+GET  /v1/repair/status                      → repair state (see below)
 GET  /v1/topology                           → swarms/nexuses/nodes/agents/rings (console + placement)
 GET  /v1/healthz                            → 200
 GET  /metrics                               → Prometheus
+
+#### 1.6.1 `GET /v1/repair/status`
+
+The authoritative view of repair state for the console and `fass repair status`.
+It is a read of counters maintained by the recovery service plus the current
+membership snapshot — the request never scans manifests or shards.
+
+```json
+{
+  "queue": {"pending": 42, "running": 3, "failed": 1},
+  "oldest_pending_age_seconds": 812,
+  "bytes_repaired_last_24h": 1099511627776,
+  "throttled": false,
+  "per_site_budget_mbps": 200,
+  "last_error": "shard fetch timeout: agent 3f2a…",
+  "generated_at": "2026-10-24T12:00:00Z",
+  "shardsets": {"below_threshold": 17, "below_repair_watermark": 3, "unrecoverable": 0}
+}
 ```
+
+* **Honesty rule:** a counter the coordinator does not track is `null`, never
+  `0` — the UI shows "unknown" rather than "all good". `oldest_pending_age_seconds`
+  is `null` when the queue is empty; `throttled` is `null` until the repair
+  scheduler has reported whether the budget is suppressing jobs;
+  `per_site_budget_mbps` is `null` when no budget is configured; `shardsets` is
+  `null` until the first background inventory refresh has completed.
+* `queue.pending`/`queue.running` are disjoint; `queue.failed` is the number of
+  failed jobs still retained for display (`POST /v1/repair/commit` with
+  `"ok": false` records `last_error`).
+* `bytes_repaired_last_24h` and the Prometheus series
+  `fass_coordinator_repair_mttr_seconds` come from the same counters as the
+  endpoint (no drift).
+* `shardsets` severities are distinct and must not be conflated:
+  * `below_threshold` — usable geo groups `< geo_n + floor(geo_k/2)`; this is the
+    repair trigger and drives the queue.
+  * `below_repair_watermark` — usable geo groups `== geo_n`; one more group loss
+    makes the object unreadable.
+  * `unrecoverable` — usable geo groups `< geo_n`; data loss. Must be `0` outside
+    an incident and should page.
+  A geo group is usable when at least `local_n` of its shards are on reachable
+  agents (SUSPECT counts as reachable; OFFLINE does not).
+* `generated_at` is the coordinator clock, RFC3339 UTC.
 
 ### 1.7 Announce error taxonomy (Cubbit-compatible, keep exact strings)
 | Status | Message |

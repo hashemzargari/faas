@@ -163,7 +163,35 @@ func (s *Server) handleCommitRepair(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	// Keep the repair counters in step with the job lifecycle. Jobs are only
+	// queued by the recovery orchestrator; if the job is not tracked here (an
+	// idempotent replay) the accounting call is a no-op.
+	if res.OK {
+		_ = s.repair.Complete(res.JobID)
+	} else {
+		_ = s.repair.Fail(res.JobID, res.Err)
+	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleRepairStatus is the operator-facing repair state (docs/07 §1.6). It is a
+// read of counters maintained by the recovery service plus one topology snapshot:
+// no manifest or shard scan happens on the request path.
+func (s *Server) handleRepairStatus(w http.ResponseWriter, r *http.Request) {
+	snap, err := s.svc.Topology(r.Context())
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	reachable := func(id contract.AgentID) bool {
+		a, ok := snap.AgentByID(id)
+		if !ok {
+			return false
+		}
+		// A suspicious agent still holds its shards; only OFFLINE means lost.
+		return a.State != membership.StateOffline
+	}
+	writeJSON(w, r, http.StatusOK, s.repair.Status(s.now(), reachable))
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,17 @@
+apiVersion: v2
+name: fass
+description: FASS — geo-distributed, S3-compatible object storage (coordinator, gateways, console, one agent per disk)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/fass-storage/fass
+sources:
+  - https://github.com/fass-storage/fass
+keywords:
+  - s3
+  - object-storage
+  - erasure-coding
+  - geo-distributed
+annotations:
+  category: Storage

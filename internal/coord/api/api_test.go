@@ -20,6 +20,7 @@ import (
 	"github.com/fass-storage/fass/internal/coord/api"
 	"github.com/fass-storage/fass/internal/coord/id"
 	"github.com/fass-storage/fass/internal/coord/membership"
+	"github.com/fass-storage/fass/internal/coord/recovery"
 	"github.com/fass-storage/fass/internal/ec"
 )
 
@@ -28,6 +29,7 @@ import (
 type harness struct {
 	t   *testing.T
 	svc *coord.Service
+	api *api.Server
 	srv *httptest.Server
 }
 
@@ -40,7 +42,8 @@ func newHarness(t *testing.T) *harness {
 	}
 	t.Cleanup(func() { _ = svc.Close() })
 	h := &harness{t: t, svc: svc}
-	h.srv = httptest.NewServer(api.New(svc, logger).Handler())
+	h.api = api.New(svc, logger)
+	h.srv = httptest.NewServer(h.api.Handler())
 	t.Cleanup(h.srv.Close)
 	return h
 }
@@ -742,5 +745,74 @@ func TestCoordinatorEndToEnd(t *testing.T) {
 	}, &announceErr)
 	if resp.StatusCode != http.StatusBadRequest || announceErr.Error.Message != "Port mismatch" {
 		t.Fatalf("announce taxonomy = %d %+v", resp.StatusCode, announceErr)
+	}
+}
+
+// TestRepairStatusWireShape: the endpoint is 200 on an empty queue and reports
+// unknown counters as null (never 0), so the console can distinguish "unknown"
+// from "healthy".
+func TestRepairStatusWireShape(t *testing.T) {
+	h := newHarness(t)
+	var status struct {
+		Queue struct {
+			Pending int `json:"pending"`
+			Running int `json:"running"`
+			Failed  int `json:"failed"`
+		} `json:"queue"`
+		OldestPendingAgeSeconds *int64    `json:"oldest_pending_age_seconds"`
+		BytesRepairedLast24h    *int64    `json:"bytes_repaired_last_24h"`
+		Throttled               *bool     `json:"throttled"`
+		PerSiteBudgetMbps       *int      `json:"per_site_budget_mbps"`
+		LastError               *string   `json:"last_error"`
+		GeneratedAt             time.Time `json:"generated_at"`
+		ShardSets               *struct {
+			BelowThreshold       int `json:"below_threshold"`
+			BelowRepairWatermark int `json:"below_repair_watermark"`
+			Unrecoverable        int `json:"unrecoverable"`
+		} `json:"shardsets"`
+	}
+	resp := h.doJSON("GET", "/v1/repair/status", nil, &status)
+	h.mustStatus(resp, http.StatusOK)
+	if status.Queue.Pending != 0 || status.Queue.Running != 0 || status.Queue.Failed != 0 {
+		t.Fatalf("empty queue = %+v, want zeros", status.Queue)
+	}
+	if status.OldestPendingAgeSeconds != nil {
+		t.Fatalf("oldest_pending_age_seconds = %v, want null on an empty queue", *status.OldestPendingAgeSeconds)
+	}
+	if status.BytesRepairedLast24h == nil || *status.BytesRepairedLast24h != 0 {
+		t.Fatalf("bytes_repaired_last_24h = %v, want a tracked 0", status.BytesRepairedLast24h)
+	}
+	if status.LastError != nil {
+		t.Fatalf("last_error = %v, want null", *status.LastError)
+	}
+	if status.Throttled != nil || status.PerSiteBudgetMbps != nil {
+		t.Fatalf("unconfigured budget = %v/%v, want null/null", status.PerSiteBudgetMbps, status.Throttled)
+	}
+	if status.ShardSets != nil {
+		t.Fatalf("shardsets = %+v, want null before the first inventory refresh", status.ShardSets)
+	}
+	if status.GeneratedAt.IsZero() {
+		t.Fatalf("generated_at is zero")
+	}
+
+	// Once the background inventory has data, the endpoint computes the three
+	// severities from the *topology snapshot*: this harness has no agents, so every
+	// shard is unreachable and the single shard set below geo_n must be reported as
+	// unrecoverable (data loss), not folded into the benign counters.
+	h.api.Repair().UpdateShardSets([]recovery.ShardSetState{{
+		ID:     contract.ShardSetID("ss-wire"),
+		Params: ec.Params{GeoN: 2, GeoK: 1, LocalN: 3, LocalK: 1},
+		Groups: map[int][]contract.AgentID{
+			0: {"a1", "a2", "a3"},
+			1: {"b1", "b2", "b3"},
+		},
+	}})
+	resp = h.doJSON("GET", "/v1/repair/status", nil, &status)
+	h.mustStatus(resp, http.StatusOK)
+	if status.ShardSets == nil {
+		t.Fatalf("shardsets = null after the inventory was loaded")
+	}
+	if status.ShardSets.Unrecoverable != 1 {
+		t.Fatalf("unrecoverable = %d, want 1 when every agent is unreachable", status.ShardSets.Unrecoverable)
 	}
 }

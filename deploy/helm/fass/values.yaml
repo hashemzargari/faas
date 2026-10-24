@@ -1,0 +1,225 @@
+# FASS Helm values — production defaults.
+#
+# The chart can deploy the whole cluster in one release or be split per site
+# (e.g. coordinator only in site A; gateways + agents in B/C). Every workload is
+# individually toggleable — see docs/09-deployment.md §"Deployment shapes".
+#
+# Secrets are NEVER created or inlined by this chart. Create them yourself and
+# reference them here; `helm template` fails with an actionable message when a
+# required Secret reference is missing. Placeholders in the example values files
+# are deliberately obvious.
+
+# -- Container image used by every component. The image built by
+# deploy/docker/Dockerfile contains all binaries under /usr/local/bin.
+image:
+  repository: ghcr.io/example/fass
+  # -- Defaults to .Chart.AppVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# -- Redundancy Class the cluster is sized for. The chart does not create the
+# RC (that is a coordinator API action) but uses these numbers for the gateway's
+# default coding parameters and to refuse infeasible topologies. Keep them in
+# sync with the RC you create — see docs/09-deployment.md §Sizing.
+redundancy:
+  geoN: 2
+  geoK: 1
+  localN: 16
+  localK: 4
+  # -- Maximum shards of one shard-set per Node (the coordinator's placement
+  # invariant). The chart treats it as the per-node disk budget; see
+  # docs/09-deployment.md §"AAG is a per-Node rule".
+  aag: 2
+
+# -- Pod security defaults. FASS images are distroless and run as uid 65532.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+serviceAccount:
+  create: true
+  # -- Defaults to the release fullname.
+  name: ""
+
+coordinator:
+  enabled: true
+  # -- MUST stay 1: the storage backend is an embedded single-writer store.
+  replicas: 1
+  listenPort: 7000
+  dataDir: /var/lib/fass
+  logLevel: info
+  logFormat: json
+  maintenance: false
+  gc: true
+  persistence:
+    enabled: true
+    # -- Use an existing PVC instead of creating one.
+    existingClaim: ""
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 20Gi
+  # -- NOT IMPLEMENTED BY THIS FASS RELEASE. The coordinator has no PostgreSQL
+  # backend or DSN flag yet; enabling this fails the render with an explanation.
+  postgres:
+    enabled: false
+    existingSecret: ""
+    dsnKey: dsn
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podLabels: {}
+
+gateway:
+  enabled: true
+  replicas: 2
+  listenPort: 8080
+  adminPort: 9000
+  # -- Empty = the in-chart coordinator Service. Point at an external
+  # coordinator for a per-site release.
+  coordinatorURL: ""
+  region: eu-west-1
+  # -- Chunk size in bytes. Must be divisible by geo_n*local_n and 1 MiB aligned.
+  chunkSize: 16777216
+  # -- Redundancy Class id used when a bucket/SDP rule does not pick one.
+  defaultRedundancyClass: ""
+  # -- DEV ONLY: let the gateway mint an ephemeral key seed (data written with it
+  # is unreadable after restart). Never enable in production.
+  devMode: false
+  keySeed:
+    # -- REQUIRED unless devMode. Secret key holding the hex tenant key seed.
+    existingSecret: ""
+    secretKey: key-seed
+  tls:
+    # -- Gateway terminates TLS itself when enabled; the Secret must contain a
+    # tls.crt/tls.key pair (or set certKey/keyKey).
+    enabled: true
+    existingSecret: ""
+    certKey: tls.crt
+    keyKey: tls.key
+  # -- Optional Smart Data Placement policy (JSON) in an existing ConfigMap.
+  sdpPolicy:
+    existingConfigMap: ""
+    configMapKey: sdp-policy.json
+  offloaderWorkers: 16
+  shardParallel: 16
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      memory: 8Gi
+  service:
+    # -- ClusterIP behind your L4/L7 load balancer, or LoadBalancer/NodePort.
+    type: ClusterIP
+    annotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+console:
+  enabled: true
+  replicas: 1
+  listenPort: 8081
+  # -- Empty = the in-chart coordinator Service.
+  coordinatorURL: ""
+  # -- Read-only by default: activate/decommission are disabled unless false.
+  readOnly: true
+  auth:
+    # -- REQUIRED. Secret with the HTTP Basic credentials (keys: console-user,
+    # console-password).
+    existingSecret: ""
+    userKey: console-user
+    passwordKey: console-password
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  service:
+    type: ClusterIP
+    annotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+agents:
+  enabled: true
+  # -- Coordinator URL the agents announce to. Empty = the in-chart coordinator
+  # Service (single-cluster install). For a per-site release point this at the
+  # site-A coordinator, e.g. https://coordinator.fass.internal:7000.
+  coordinatorURL: ""
+  basePort: 7100
+  repair: true
+  scrub: true
+  # -- Percentage of each filesystem kept free by the agent.
+  reservePercent: 5
+  heartbeatInterval: 5s
+  # -- Use the host network so the endpoint the agent announces
+  # (status.hostIP:port) is reachable by every gateway. Recommended for
+  # bare-metal-with-local-disks shapes; the alternative (pod network + hostPort)
+  # cannot be automated without knowing the cluster CNI.
+  hostNetwork: true
+  # -- Extra args appended to every agent container (advanced).
+  extraArgs: []
+  #
+  # Agents are one per disk and pinned per node. One pinned Deployment is
+  # rendered per node (not one DaemonSet per Nexus) because each disk has its
+  # own one-time announce Secret, and Kubernetes cannot vary a secretKeyRef per
+  # pod of a DaemonSet. This is a deliberate workaround for a current product
+  # gap: the agent has no --secret-file/env configuration yet (see
+  # docs/09-deployment.md §"Known product gaps"). When that lands the chart can
+  # collapse to one DaemonSet per Nexus.
+  #
+  # nodes:
+  #   - name: node-a1                 # MUST equal the Kubernetes node name; used as --node-id
+  #     nexus: nexus-a
+  #     nodeSelector:                 # optional; defaults to kubernetes.io/hostname: node-a1
+  #       kubernetes.io/hostname: node-a1
+  #     tolerations: []
+  #     disks:
+  #       - name: disk0
+  #         hostPath: /var/lib/fass/disks/disk0
+  #         port: 7100
+  #         diskId: ""                # optional operator-facing slot label
+  #         existingSecret: fass-agent-node-a1-disk0
+  #         secretKey: secret
+  nodes: []
+  # -- Escape hatch: allow more disks on a node than aag. Placement still caps
+  # shards of one shard-set at aag per Node, so the extra disks only serve other
+  # shard sets; see docs/09-deployment.md §"AAG is a per-Node rule".
+  allowAgentsPerNodeExceedingAAG: false
+  # -- Disable the declared-topology feasibility checks (advanced; see docs/09).
+  skipTopologyValidation: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      memory: 3Gi
+  # -- The disk directories are hostPath; they must already exist and be owned
+  # by uid 65532 (see docs/09-deployment.md §"Preparing disks").
+  podAnnotations: {}
+  podLabels: {}
+  tolerations: []
