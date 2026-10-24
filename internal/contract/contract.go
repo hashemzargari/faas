@@ -183,6 +183,10 @@ type BucketConfig struct {
 	Ownership   string    `json:"ownership"` // ObjectWriter | BucketOwnerEnforced
 	DefaultRCID string    `json:"default_rc_id"`
 	QuotaBytes  int64     `json:"quota_bytes"`
+	// CreatedAt is required on the wire: S3 ListBuckets carries <CreationDate>
+	// per bucket, and aws-sdk-go-v2 (hence rclone, Terraform, many SDKs) fails
+	// the entire response when it cannot parse it as RFC3339. Never emit empty.
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // ---------------------------------------------------------------------------
