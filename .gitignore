@@ -1,0 +1,19 @@
+# research scratch (raw scraped Cubbit doc pages) — evidence for docs/01
+.research/
+cubbit/pages/
+cubbit/pg.html
+cubbit/extract.py
+
+# build
+/bin/
+/dist/
+*.test
+coverage.out
+
+# local
+.env
+*.local.yaml
+
+# workspace-local toolchain caches (sandbox)
+.gopath/
+.gocache/

@@ -1,0 +1,9 @@
+# github.com/klauspost/cpuid/v2 v2.3.0
+## explicit; go 1.22
+github.com/klauspost/cpuid/v2
+# github.com/klauspost/reedsolomon v1.14.2
+## explicit; go 1.24
+github.com/klauspost/reedsolomon
+# golang.org/x/sys v0.30.0
+## explicit; go 1.18
+golang.org/x/sys/unix
