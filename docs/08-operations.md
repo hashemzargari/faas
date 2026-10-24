@@ -938,3 +938,31 @@ Behaviour and limits:
   `--multipart-threshold`/`--part-size` control multipart uploads.
 * `DELETE /v1/bridges/{id}` stops tracking and removes the journal; it never
   deletes data on either side.
+
+### 5.1 Proxy endpoint: point clients at the bridge before the copy finishes
+
+Start the bridge with an S3-compatible listener; it is separate from the JSON
+control API and uses the same TLS/mTLS posture rules (`--s3-tls-cert`,
+`--s3-tls-key`, `--s3-tls-ca`, `--s3-require-mtls`; plaintext only with the loud
+`--s3-insecure` and visible in the proxy `/healthz`):
+
+```console
+fass-bridge --listen 127.0.0.1:8082 --data-dir /var/lib/fass/bridge \
+  --s3-listen 0.0.0.0:8083 --s3-tls-cert agent.crt --s3-tls-key agent.key \
+  --s3-tls-ca ca.crt --s3-require-mtls
+# clients then use --endpoint-url https://bridge:8083 (path-style)
+```
+
+The proxy accepts SigV4 signed with the **target** credentials and behaves as
+the product spec requires:
+
+| Operation | Behaviour |
+|---|---|
+| GET / HEAD | Serve the target when its version is at least as new as the source (same `targetIsCurrent` rule the mover uses), otherwise stream the source, including `Range`. If the mover completes the copy between the HEAD decision and the GET, the source GET returns 404 and the proxy **retries the target** instead of returning a phantom 404. HEAD and GET use the same decision, so they agree on size. |
+| PUT / DELETE / multipart | Always the target. A successful DELETE also removes any source copy so the mover cannot resurrect a deleted object. |
+| ListObjectsV2 / ListObjectVersions | While the bucket is in-progress, served from the **source** and marked `x-fass-bridge-listing: source`; the status API reports `listing_source:"source"`. After completion, served from the target. Merged pagination is deliberately deferred; target-only writes may not appear in an in-progress listing. **Check `listing_source` before trusting a list during migration.** |
+| Copy-on-read | A read that falls through to the source enqueues that object for priority copying, so what someone actually opened migrates first. |
+
+Once a bucket reaches `completed` the proxy is a pass-through to the target; it
+is not a permanent caching layer. The control API is the source of truth for
+`completed` and `listing_source`.

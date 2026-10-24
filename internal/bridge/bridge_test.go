@@ -41,6 +41,10 @@ type fakeS3 struct {
 	puts     map[string]int // bucket/key -> successful object PUT count
 	listMax  int
 	uploads  map[string][]fakePart
+	// getHooks run before a GET is served (outside the fake's lock). Returning
+	// false makes the fake answer 404, modelling an object that vanished between
+	// a proxy HEAD and its GET.
+	getHooks map[string]func() bool
 	now      func() time.Time
 	// getDelay slows GETs so resume tests can interrupt mid-migration.
 	getDelay time.Duration
@@ -60,6 +64,7 @@ func newFakeS3(t *testing.T) *fakeS3 {
 		puts:     map[string]int{},
 		listMax:  2, // force pagination in tests
 		uploads:  map[string][]fakePart{},
+		getHooks: map[string]func() bool{},
 		now:      time.Now,
 	}
 }
@@ -115,9 +120,27 @@ func (f *fakeS3) bucketLocked(name string) *fakeBucket {
 	return b
 }
 
+func (f *fakeS3) deleteObject(bucket, key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if b, ok := f.buckets[bucket]; ok {
+		delete(b.objects, key)
+	}
+}
+
 func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if d := f.getDelay; d > 0 && r.Method == http.MethodGet {
 		time.Sleep(d) // set before the migration starts; avoids holding the lock
+	}
+	pathForHook := strings.TrimPrefix(r.URL.Path, "/")
+	if r.Method == http.MethodGet {
+		f.mu.Lock()
+		hook := f.getHooks[pathForHook]
+		f.mu.Unlock()
+		if hook != nil && !hook() {
+			http.Error(w, `<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>`, http.StatusNotFound)
+			return
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -231,10 +254,30 @@ func (f *fakeS3) handleObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			fmt.Fprint(w, `<Error><Code>NoSuchKey</Code><Message>no</Message></Error>`)
 			return
 		}
-		w.Header().Set("Content-Length", fmt.Sprint(len(obj.data)))
+		body := obj.data
+		if rng := r.Header.Get("Range"); strings.HasPrefix(rng, "bytes=") {
+			spec := strings.TrimPrefix(rng, "bytes=")
+			var start, end int
+			if _, err := fmt.Sscanf(spec, "%d-%d", &start, &end); err == nil {
+				if start < 0 {
+					start = 0
+				}
+				if end >= len(body) {
+					end = len(body) - 1
+				}
+				if start <= end && start < len(body) {
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(body)))
+					w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+					w.WriteHeader(http.StatusPartialContent)
+					_, _ = w.Write(body[start : end+1])
+					return
+				}
+			}
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 		w.Header().Set("ETag", `"`+obj.etag+`"`)
 		w.Header().Set("Last-Modified", obj.lastModified.UTC().Format(http.TimeFormat))
-		_, _ = w.Write(obj.data)
+		_, _ = w.Write(body)
 
 	case r.Method == http.MethodPut && len(q["partNumber"]) > 0:
 		id := q["uploadId"][0]

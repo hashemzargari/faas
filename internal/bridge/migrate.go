@@ -148,7 +148,7 @@ func (b *bridge) copyObject(ctx context.Context, src, tgt *s3Client, lim *limite
 	}
 
 	if target, err := tgt.headObject(ctx, bucket.Name, obj.Key); err == nil {
-		if newestTarget(target, obj) {
+		if targetIsCurrent(target, obj) {
 			// Leave the source in place: the target has the authoritative (newer)
 			// version, and deleting the source would discard the only other copy.
 			b.recordOutcome(bucket, obj.Key, objectSkipped, 0, nil)
@@ -200,9 +200,17 @@ func (b *bridge) copyObject(ctx context.Context, src, tgt *s3Client, lim *limite
 	return nil
 }
 
-// newestTarget reports whether the target already holds a version at least as
-// new as the source listing entry.
-func newestTarget(target, source s3Object) bool {
+// targetIsCurrent reports whether the target holds a version at least as new as
+// the source (or the source is gone). The mover uses it to decide "skip copying,
+// never overwrite a newer target"; the proxy uses the same function to decide
+// "serve the target". One helper, two callers, so the two paths cannot drift.
+func targetIsCurrent(target, source s3Object) bool {
+	if target.Key == "" { // target object absent
+		return false
+	}
+	if source.Key == "" { // source gone: target is the only copy
+		return true
+	}
 	if target.LastModified.IsZero() || source.LastModified.IsZero() {
 		return false
 	}

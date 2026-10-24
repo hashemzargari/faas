@@ -17,10 +17,12 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/fass-storage/fass/internal/bridge"
+	"github.com/fass-storage/fass/internal/pki"
 )
 
 var version = "0.1.0-dev"
@@ -41,6 +43,12 @@ func run(args []string) error {
 	maxRPS := fs.Int("max-requests-per-second", envInt("FASS_BRIDGE_MAX_REQUESTS_PER_SECOND", 0), "S3 API call throttle (0 = unlimited)")
 	multipart := fs.Int64("multipart-threshold", envInt64("FASS_BRIDGE_MULTIPART_THRESHOLD", 8<<20), "objects at/above this size use multipart upload")
 	partSize := fs.Int64("part-size", envInt64("FASS_BRIDGE_PART_SIZE", 8<<20), "multipart part size (>= 5 MiB)")
+	s3Listen := fs.String("s3-listen", envOr("FASS_BRIDGE_S3_LISTEN", ""), "S3-compatible proxy listen address (empty disables the proxy; separate from the JSON control API)")
+	s3Cert := fs.String("s3-tls-cert", envOr("FASS_BRIDGE_S3_TLS_CERT", ""), "proxy listener certificate (required unless --s3-insecure)")
+	s3Key := fs.String("s3-tls-key", envOr("FASS_BRIDGE_S3_TLS_KEY", ""), "proxy listener key")
+	s3CA := fs.String("s3-tls-ca", envOr("FASS_BRIDGE_S3_TLS_CA", ""), "CA bundle for verifying proxy client certificates")
+	s3RequireMTLS := fs.Bool("s3-require-mtls", envBool("FASS_BRIDGE_S3_REQUIRE_MTLS", false), "require and verify client certificates on the proxy listener")
+	s3Insecure := fs.Bool("s3-insecure", envBool("FASS_BRIDGE_S3_INSECURE", false), "serve the proxy over plaintext (dev only; loud warning + /healthz)")
 	logLevel := fs.String("log-level", envOr("FASS_BRIDGE_LOG_LEVEL", "info"), "debug|info|warn|error")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	if err := fs.Parse(args); err != nil {
@@ -76,9 +84,10 @@ func run(args []string) error {
 		Handler:           bridge.NewHTTPHandler(mgr),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	servers := []*http.Server{srv}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
 		logger.Info("fass-bridge control API listening", "addr", *listen, "data_dir", *dataDir, "version", version,
 			"concurrency", *concurrency, "max_bytes_per_second", *maxBPS, "max_requests_per_second", *maxRPS)
@@ -86,6 +95,38 @@ func run(args []string) error {
 			errCh <- err
 		}
 	}()
+
+	if *s3Listen != "" {
+		sec := bridge.ProxySecurity{TLS: !*s3Insecure, Insecure: *s3Insecure, RequireMTLS: *s3RequireMTLS}
+		proxySrv := &http.Server{
+			Addr:              *s3Listen,
+			Handler:           bridge.NewS3ProxyHandler(mgr, sec),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		servers = append(servers, proxySrv)
+		if *s3Insecure {
+			logger.Warn("INSECURE MODE (--s3-insecure): the S3 bridge proxy is PLAINTEXT; /healthz reports security.insecure=true. Never use in production.")
+			go func() {
+				logger.Info("fass-bridge S3 proxy listening (plaintext)", "addr", *s3Listen)
+				if err := proxySrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+					errCh <- fmt.Errorf("S3 proxy: %w", err)
+				}
+			}()
+		} else {
+			tlsCfg, err := pki.ServerConfig(*s3Cert, *s3Key, *s3CA, *s3RequireMTLS)
+			if err != nil {
+				return fmt.Errorf("S3 proxy TLS: %w", err)
+			}
+			proxySrv.TLSConfig = tlsCfg
+			go func() {
+				logger.Info("fass-bridge S3 proxy listening (TLS)", "addr", *s3Listen, "require_mtls", *s3RequireMTLS)
+				if err := proxySrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+					errCh <- fmt.Errorf("S3 proxy: %w", err)
+				}
+			}()
+		}
+	}
+
 	select {
 	case err := <-errCh:
 		return err
@@ -93,7 +134,19 @@ func run(args []string) error {
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	var wg sync.WaitGroup
+	var firstErr error
+	for _, s := range servers {
+		wg.Add(1)
+		go func(s *http.Server) {
+			defer wg.Done()
+			if err := s.Shutdown(shutdownCtx); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}(s)
+	}
+	wg.Wait()
+	return firstErr
 }
 
 func envOr(key, def string) string {
@@ -107,6 +160,15 @@ func envInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+func envBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
 		}
 	}
 	return def

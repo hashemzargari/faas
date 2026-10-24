@@ -363,7 +363,9 @@ DELETE /v1/bridges/{id}            → 204           (stops tracking; no data ac
 ```
 Semantics: reads proxy to the source until an object is copied; writes always go to FASS; each object is deleted from the source only after a verified copy; failures do not auto-retry and are counted in `failed`; buckets end `completed` even with failures. Preconditions: no Object Lock on source; permanent credentials (no STS).
 
-**Status: implemented** in `cmd/fass-bridge` + `internal/bridge` (control API as above; the service is a write-through migrator and does not itself serve S3 reads — clients point at the target gateway, and target writes always win over stale source copies). Migration is resumable via a per-bridge JSON journal, bounded by `--concurrency` and optional byte/request rate limits, and verification is size + SHA-256 read-back before the source copy is deleted. See docs/08 §5 for the operator flow.
+**Status: implemented** in `cmd/fass-bridge` + `internal/bridge`:
+* the **mover** (control API above) copies, verifies by size + SHA-256 read-back, then deletes the source copy; it is resumable via a per-bridge JSON journal and bounded by `--concurrency` plus optional byte/request rate limits;
+* the **S3-compatible proxy** (`--s3-listen`) is the adoption path: clients point at it before migration finishes. GET/HEAD serve the target when it is at least as new as the source and fall through to the source otherwise (Range supported, target retried if the copy won the race); PUT/DELETE/multipart always target; listings come from the source while a bucket is in-progress and are marked `listing_source:"source"` in the status API (merged pagination deferred deliberately) and switch to the target on completion; reads that fall through are prioritised for copying. SigV4 is verified against the target credentials and the listener uses the same TLS/mTLS posture as the rest of the cluster. See docs/08 §5.
 
 ---
 

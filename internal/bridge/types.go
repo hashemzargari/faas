@@ -64,13 +64,14 @@ type CreateRequest struct {
 
 // BucketStatus is per-bucket progress.
 type BucketStatus struct {
-	Name         string `json:"name"`
-	ObjectsTotal int64  `json:"objects_total"`
-	Migrated     int64  `json:"migrated"`
-	Failed       int64  `json:"failed"`
-	Skipped      int64  `json:"skipped"`
-	Bytes        int64  `json:"bytes"`
-	Completed    bool   `json:"completed"`
+	Name          string `json:"name"`
+	ObjectsTotal  int64  `json:"objects_total"`
+	Migrated      int64  `json:"migrated"`
+	Failed        int64  `json:"failed"`
+	Skipped       int64  `json:"skipped"`
+	Bytes         int64  `json:"bytes"`
+	Completed     bool   `json:"completed"`
+	ListingSource string `json:"listing_source"`
 }
 
 // Status is the GET /v1/bridges/{id} body.

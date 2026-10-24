@@ -30,6 +30,9 @@ type bridge struct {
 	cancel  context.CancelFunc
 	running bool
 	done    chan struct{} // closed when the current run goroutine exits
+	// copying tracks copy-on-read enqueues so repeated reads of the same
+	// fallthrough object do not stampede the source.
+	copying map[string]bool
 }
 
 // NewManager loads persisted bridges and applies defaults.
@@ -61,7 +64,7 @@ func NewManager(opts Options) (*Manager, error) {
 		return nil, err
 	}
 	for _, st := range states {
-		m.bridges[st.ID] = &bridge{st: st, path: journalPath(opts.DataDir, st.ID), opts: opts}
+		m.bridges[st.ID] = &bridge{st: st, path: journalPath(opts.DataDir, st.ID), opts: opts, copying: map[string]bool{}}
 	}
 	return m, nil
 }
@@ -139,7 +142,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (Status, error)
 	if err := saveJournal(path, st); err != nil {
 		return Status{}, err
 	}
-	b := &bridge{st: st, path: path, opts: m.opts}
+	b := &bridge{st: st, path: path, opts: m.opts, copying: map[string]bool{}}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -243,17 +246,131 @@ func (m *Manager) Delete(id string) error {
 	return nil
 }
 
+// Count returns the number of tracked bridges (proxy /healthz).
+func (m *Manager) Count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.bridges)
+}
+
+// bridgeForBucket returns the bridge tracking bucket, if any. The proxy uses it
+// to decide the target credentials that verify a request.
+func (m *Manager) bridgeForBucket(bucket string) *bridge {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, b := range m.bridges {
+		b.mu.Lock()
+		found := false
+		for _, bs := range b.st.Buckets {
+			if bs.Name == bucket {
+				found = true
+				break
+			}
+		}
+		b.mu.Unlock()
+		if found {
+			return b
+		}
+	}
+	return nil
+}
+
+// clients builds request-path S3 clients (no migration rate limiter).
+func (b *bridge) clients(ctx context.Context) (*s3Client, *s3Client, error) {
+	src, err := newS3Client(b.st.Source, b.opts.HTTPClient, nil, b.opts.Now, b.opts.Log)
+	if err != nil {
+		return nil, nil, err
+	}
+	tgt, err := newS3Client(b.st.Target, b.opts.HTTPClient, nil, b.opts.Now, b.opts.Log)
+	if err != nil {
+		return nil, nil, err
+	}
+	return src, tgt, nil
+}
+
+// listingSource is how list requests are served: source while the bucket is
+// still migrating (the API exposes this as listing_source), target once done.
+func (b *bridge) listingSource(bucket string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, bs := range b.st.Buckets {
+		if bs.Name == bucket && !bs.Completed {
+			return "source"
+		}
+	}
+	return "target"
+}
+
+// enqueueCopy is copy-on-read: an object a client asked for is worth copying
+// now. It is a no-op for completed buckets (the proxy is a pass-through then)
+// and de-duplicates concurrent reads of the same key.
+func (b *bridge) enqueueCopy(bucket, key string) {
+	b.mu.Lock()
+	if b.st.Status != StatusInProgress || b.copying == nil || b.copying[bucket+"/"+key] {
+		b.mu.Unlock()
+		return
+	}
+	// Already classified (copied/failed/skipped)? Then it is not a fallthrough
+	// candidate unless the target lost the object; keep it simple and skip.
+	for _, bs := range b.st.Buckets {
+		if bs.Name == bucket {
+			if _, done := bs.Done[key]; done {
+				b.mu.Unlock()
+				return
+			}
+		}
+	}
+	b.copying[bucket+"/"+key] = true
+	b.mu.Unlock()
+
+	go func() {
+		defer func() {
+			b.mu.Lock()
+			delete(b.copying, bucket+"/"+key)
+			b.mu.Unlock()
+		}()
+		ctx := context.Background()
+		src, tgt, err := b.clients(ctx)
+		if err != nil {
+			return
+		}
+		var bs *journalBucket
+		b.mu.Lock()
+		for _, cand := range b.st.Buckets {
+			if cand.Name == bucket {
+				bs = cand
+			}
+		}
+		b.mu.Unlock()
+		if bs == nil {
+			return
+		}
+		obj, err := src.headObject(ctx, bucket, key)
+		if err != nil {
+			return
+		}
+		if err := b.copyObject(ctx, src, tgt, nil, bs, obj); err != nil {
+			b.recordOutcome(bs, key, objectFailed, 0, err)
+		}
+	}()
+}
+
 func statusOf(st *journalState) Status {
 	out := Status{BridgeID: st.ID, Status: st.Status, CreatedAt: st.CreatedAt, Error: st.Error}
 	for _, b := range st.Buckets {
+		listingSource := "target"
+		if !b.Completed {
+			listingSource = "source"
+		}
 		out.Buckets = append(out.Buckets, BucketStatus{
-			Name:         b.Name,
-			ObjectsTotal: b.objectsTotal(),
-			Migrated:     b.Migrated,
-			Failed:       b.Failed,
-			Skipped:      b.Skipped,
-			Bytes:        b.Bytes,
-			Completed:    b.Completed,
+			Name:          b.Name,
+			ObjectsTotal:  b.objectsTotal(),
+			Migrated:      b.Migrated,
+			Failed:        b.Failed,
+			Skipped:       b.Skipped,
+			Bytes:         b.Bytes,
+			Completed:     b.Completed,
+			ListingSource: listingSource,
 		})
 	}
 	return out

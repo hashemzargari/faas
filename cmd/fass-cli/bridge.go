@@ -35,13 +35,14 @@ type bridgeStatus struct {
 }
 
 type bridgeBucketState struct {
-	Name         string `json:"name"`
-	ObjectsTotal int64  `json:"objects_total"`
-	Migrated     int64  `json:"migrated"`
-	Failed       int64  `json:"failed"`
-	Skipped      int64  `json:"skipped"`
-	Bytes        int64  `json:"bytes"`
-	Completed    bool   `json:"completed"`
+	Name          string `json:"name"`
+	ObjectsTotal  int64  `json:"objects_total"`
+	Migrated      int64  `json:"migrated"`
+	Failed        int64  `json:"failed"`
+	Skipped       int64  `json:"skipped"`
+	Bytes         int64  `json:"bytes"`
+	Completed     bool   `json:"completed"`
+	ListingSource string `json:"listing_source,omitempty"`
 }
 
 func runBridge(ctx context.Context, g *globalOpts, args []string, stdout io.Writer) error {
@@ -234,9 +235,9 @@ func bridgeRunStatus(ctx context.Context, g *globalOpts, args []string, stdout i
 	if st.Error != "" {
 		fmt.Fprintf(stdout, "error: %s\n", st.Error)
 	}
-	fmt.Fprintf(stdout, "%-32s %8s %10s %8s %9s %14s %s\n", "BUCKET", "TOTAL", "MIGRATED", "FAILED", "SKIPPED", "BYTES", "COMPLETED")
+	fmt.Fprintf(stdout, "%-32s %8s %10s %8s %9s %14s %-10s %s\n", "BUCKET", "TOTAL", "MIGRATED", "FAILED", "SKIPPED", "BYTES", "COMPLETED", "LISTING")
 	for _, b := range st.Buckets {
-		fmt.Fprintf(stdout, "%-32s %8d %10d %8d %9d %14d %t\n", b.Name, b.ObjectsTotal, b.Migrated, b.Failed, b.Skipped, b.Bytes, b.Completed)
+		fmt.Fprintf(stdout, "%-32s %8d %10d %8d %9d %14d %-10t %s\n", b.Name, b.ObjectsTotal, b.Migrated, b.Failed, b.Skipped, b.Bytes, b.Completed, b.ListingSource)
 	}
 	return nil
 }
