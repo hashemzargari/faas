@@ -37,57 +37,54 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
-{{/* Image reference: repository:tag, never "latest" by default. */}}
+{{/* Image reference: repository:tag. */}}
 {{- define "fass.image" -}}
 {{- $img := .Values.image -}}
 {{- printf "%s:%s" $img.repository (default .Chart.AppVersion $img.tag) -}}
 {{- end -}}
 
-{{- define "fass.imagePullSecrets" -}}
-{{- with .Values.imagePullSecrets }}
-imagePullSecrets:
-{{- toYaml . | nindent 0 }}
-{{- end }}
-{{- end -}}
-
-{{/* The coordinator URL workloads should dial. Empty means "the in-chart Service". */}}
-{{- define "fass.coordinatorURL" -}}
-{{- if .Values.agents.coordinatorURL -}}
-{{- .Values.agents.coordinatorURL -}}
-{{- else -}}
+{{/* In-chart coordinator Service URL. */}}
+{{- define "fass.coordinatorServiceURL" -}}
 {{- printf "http://%s-coordinator:%v" (include "fass.fullname" .) .Values.coordinator.listenPort -}}
 {{- end -}}
+
+{{/* Effective coordinator URL for a component: explicit value, else the in-chart Service. */}}
+{{- define "fass.effectiveCoordinatorURL" -}}
+{{- if .url -}}
+{{- .url -}}
+{{- else -}}
+{{- include "fass.coordinatorServiceURL" .root -}}
+{{- end -}}
 {{- end -}}
 
+{{/* Per-disk port: explicit disk.port wins, else basePort + index. */}}
 {{- define "fass.agentPort" -}}
-{{- /* Per-disk port: explicit disk.port wins, else basePort + index. */ -}}
-{{- $root := .root -}}
-{{- $index := .index -}}
 {{- if .disk.port -}}
 {{- .disk.port -}}
 {{- else -}}
-{{- add (int $root.Values.agents.basePort) (int $index) -}}
+{{- add (int .root.Values.agents.basePort) (int .index) -}}
 {{- end -}}
 {{- end -}}
 
-{{/* ceil division helper used by the sizing validations. */}}
+{{/* ceil(a/b) for integer validation. */}}
 {{- define "fass.ceilDiv" -}}
 {{- div (add .a .b -1) .b -}}
 {{- end -}}
 
-{{/* Validate the topology the operator declared. The chart cannot see the
+{{/* Validate declared topology and secret references. The chart cannot see the
      scheduler's actual placement, but it can refuse configurations that are
-     guaranteed to be infeasible or that silently break the AAG invariant. */}}
+     guaranteed to be infeasible or that make the AAG invariant incoherent. */}}
 {{- define "fass.validate" -}}
 {{- $rc := .Values.redundancy -}}
 {{- $perGroup := add (int $rc.localN) (int $rc.localK) -}}
+{{- $aag := int $rc.aag -}}
 {{- if lt (int $rc.geoN) 1 -}}
 {{- fail "redundancy.geoN must be >= 1" -}}
 {{- end -}}
 {{- if lt (int $rc.localN) 2 -}}
 {{- fail "redundancy.localN must be >= 2" -}}
 {{- end -}}
-{{- if or (lt (int $rc.aag) 1) (gt (int $rc.aag) $perGroup) -}}
+{{- if or (lt $aag 1) (gt $aag $perGroup) -}}
 {{- fail (printf "redundancy.aag must be in 1..local_n+local_k (%d)" $perGroup) -}}
 {{- end -}}
 {{- if .Values.coordinator.enabled -}}
@@ -111,39 +108,58 @@ imagePullSecrets:
 {{- end -}}
 {{- if .Values.agents.enabled -}}
 {{- $a := .Values.agents -}}
-{{- $aag := int $rc.aag -}}
-{{- range $nx := $a.nexuses -}}
-{{- if not $nx.name -}}
-{{- fail "agents.nexuses[].name is required" -}}
+{{- $nodeNames := dict -}}
+{{- $nodesPerNexus := dict -}}
+{{- $agentsPerNexus := dict -}}
+{{- if not $a.nodes -}}
+{{- fail "agents.nodes is empty: list at least one node per Nexus (see docs/09-deployment.md §Sizing)" -}}
 {{- end -}}
-{{- if not $nx.nodeSelector -}}
-{{- fail (printf "agents.nexuses[%s].nodeSelector is required: an unpinned agent DaemonSet can land agents in the wrong Nexus and silently break geo separation. Label the site's nodes and pin with nodeSelector." $nx.name) -}}
+{{- range $node := $a.nodes -}}
+{{- if not $node.name -}}
+{{- fail "agents.nodes[].name is required (must equal the Kubernetes node name, it becomes --node-id)" -}}
 {{- end -}}
-{{- if not $nx.disks -}}
-{{- fail (printf "agents.nexuses[%s].disks must list at least one disk (one agent per disk)" $nx.name) -}}
+{{- if hasKey $nodeNames $node.name -}}
+{{- fail (printf "agents.nodes: duplicate node name %q" $node.name) -}}
 {{- end -}}
-{{- if gt (len $nx.disks) $aag -}}
-{{- if not $a.allowAgentsPerNodeExceedingAAG -}}
-{{- fail (printf "agents.nexuses[%s] has %d disks per node but redundancy.aag=%d: placement caps shards of one shard-set at aag per Node, so the extra disks would silently go unused (and a migration could mis-size capacity). Raise redundancy.aag (<= local_n+local_k) or set agents.allowAgentsPerNodeExceedingAAG=true after reading docs/09-deployment.md." $nx.name (len $nx.disks) $aag) -}}
+{{- $_ := set $nodeNames $node.name true -}}
+{{- if not $node.nexus -}}
+{{- fail (printf "agents.nodes[%s].nexus is required" $node.name) -}}
+{{- end -}}
+{{- if not $node.disks -}}
+{{- fail (printf "agents.nodes[%s].disks must list at least one disk (one agent per disk)" $node.name) -}}
+{{- end -}}
+{{- if and (gt (len $node.disks) $aag) (not $a.allowAgentsPerNodeExceedingAAG) -}}
+{{- fail (printf "agents.nodes[%s] has %d disks but redundancy.aag=%d. AAG is the coordinator's per-Node cap for a shard set; the chart refuses this by default because capacity sizing then depends on a rule most operators miss. Raise redundancy.aag (<= local_n+local_k) or set agents.allowAgentsPerNodeExceedingAAG=true after reading docs/09-deployment.md 'AAG is a per-Node rule'." $node.name (len $node.disks) $aag) -}}
+{{- end -}}
+{{- $_ := set $nodesPerNexus $node.nexus (add (int (default 0 (get $nodesPerNexus $node.nexus))) 1) -}}
+{{- $_ := set $agentsPerNexus $node.nexus (add (int (default 0 (get $agentsPerNexus $node.nexus))) (len $node.disks)) -}}
+{{- $ports := dict -}}
+{{- range $i, $disk := $node.disks -}}
+{{- if not $disk.name -}}
+{{- fail (printf "agents.nodes[%s].disks[].name is required" $node.name) -}}
+{{- end -}}
+{{- if not $disk.hostPath -}}
+{{- fail (printf "agents.nodes[%s].disks[%s].hostPath is required (the local disk mount path)" $node.name $disk.name) -}}
+{{- end -}}
+{{- if not $disk.existingSecret -}}
+{{- fail (printf "agents.nodes[%s].disks[%s].existingSecret is required: create a pending agent registration (POST /v1/agents/pending) and store its one-time announce secret in a Secret." $node.name $disk.name) -}}
+{{- end -}}
+{{- $port := include "fass.agentPort" (dict "root" $ "disk" $disk "index" $i) -}}
+{{- if hasKey $ports (toString $port) -}}
+{{- fail (printf "agents.nodes[%s]: duplicate agent port %v; one agent per disk needs a unique port per node" $node.name $port) -}}
+{{- end -}}
+{{- $_ := set $ports (toString $port) true -}}
 {{- end -}}
 {{- end -}}
 {{- if not $a.skipTopologyValidation -}}
-{{- $nodes := int (default 0 $nx.nodes) -}}
-{{- if gt $nodes 0 -}}
-{{- if lt (mul $nodes (len $nx.disks)) $perGroup -}}
-{{- fail (printf "agents.nexuses[%s] declares %d nodes x %d disks = %d agents, but local_n+local_k = %d: placement needs at least that many distinct agents in the Nexus." $nx.name $nodes (len $nx.disks) (mul $nodes (len $nx.disks)) $perGroup) -}}
-{{- end -}}
 {{- $minNodes := include "fass.ceilDiv" (dict "a" $perGroup "b" $aag) | int -}}
-{{- if lt $nodes $minNodes -}}
-{{- fail (printf "agents.nexuses[%s] declares %d nodes but aag=%d caps a shard-set at aag shards per Node; local_n+local_k=%d requires at least %s nodes in the Nexus." $nx.name $nodes $aag $perGroup $minNodes) -}}
+{{- range $nexus, $nodes := $nodesPerNexus -}}
+{{- if lt (int $nodes) $minNodes -}}
+{{- fail (printf "Nexus %q declares %d node(s), but aag=%d caps a shard-set at aag shards per Node and local_n+local_k=%d needs at least %d nodes in the Nexus." $nexus (int $nodes) $aag $perGroup $minNodes) -}}
 {{- end -}}
-{{- end -}}
-{{- range $disk := $nx.disks -}}
-{{- if not $disk.name -}}
-{{- fail (printf "agents.nexuses[%s].disks[].name is required" $nx.name) -}}
-{{- end -}}
-{{- if not $disk.existingSecret -}}
-{{- fail (printf "agents.nexuses[%s].disks[%s].existingSecret is required: create a pending agent registration (POST /v1/agents/pending) and store its one-time announce secret in a Secret." $nx.name $disk.name) -}}
+{{- $agents := int (get $agentsPerNexus $nexus) -}}
+{{- if lt $agents $perGroup -}}
+{{- fail (printf "Nexus %q declares %d agent(s), but local_n+local_k=%d shards of every chunk must land on distinct agents in each Nexus." $nexus $agents $perGroup) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

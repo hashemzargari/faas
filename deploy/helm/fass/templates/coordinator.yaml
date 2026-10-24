@@ -1,0 +1,141 @@
+{{- if .Values.coordinator.enabled }}
+{{- $c := .Values.coordinator }}
+{{- $name := printf "%s-coordinator" (include "fass.fullname" .) }}
+{{- $labels := include "fass.labels" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- $labels | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "fass.selectorLabels" (dict "root" . "component" "coordinator") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $c.listenPort }}
+      targetPort: http
+      protocol: TCP
+---
+{{- if and $c.persistence.enabled (not $c.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-data
+  labels:
+    {{- $labels | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  accessModes:
+    {{- toYaml $c.persistence.accessModes | nindent 4 }}
+  {{- with $c.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $c.persistence.size }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- $labels | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  # The coordinator's store is single-writer: never run two pods on one volume.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "fass.selectorLabels" (dict "root" . "component" "coordinator") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "fass.selectorLabels" (dict "root" . "component" "coordinator") | nindent 8 }}
+        {{- with $c.podLabels }}{{ toYaml . | nindent 8 }}{{ end }}
+      {{- with $c.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ default (include "fass.fullname" .) .Values.serviceAccount.name }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with $c.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $c.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $c.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: coordinator
+          image: {{ include "fass.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/fass-coordinator"]
+          env:
+            - name: FASS_COORDINATOR_LISTEN
+              value: ":{{ $c.listenPort }}"
+            - name: FASS_COORDINATOR_DATA_DIR
+              value: {{ $c.dataDir | quote }}
+            - name: FASS_COORDINATOR_LOG_LEVEL
+              value: {{ $c.logLevel | quote }}
+            - name: FASS_COORDINATOR_LOG_FORMAT
+              value: {{ $c.logFormat | quote }}
+            - name: FASS_COORDINATOR_MAINTENANCE
+              value: {{ $c.maintenance | quote }}
+            - name: FASS_COORDINATOR_GC
+              value: {{ $c.gc | quote }}
+          ports:
+            - name: http
+              containerPort: {{ $c.listenPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ $c.dataDir }}
+      volumes:
+        - name: data
+          {{- if $c.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-data" $name) $c.persistence.existingClaim }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- end }}

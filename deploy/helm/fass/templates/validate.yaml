@@ -1,0 +1,6 @@
+{{/*
+  Rendering this template runs the chart-wide validation (see _helpers.tpl).
+  It emits no Kubernetes object; a failure aborts `helm template`/`helm install`
+  with an actionable message instead of installing a topology that cannot work.
+*/}}
+{{- include "fass.validate" . -}}
