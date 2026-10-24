@@ -667,3 +667,21 @@ func TestMultipartUploadsAreScopedPerUpload(t *testing.T) {
 		t.Fatalf("two uploads of version null reused shard-set id %s", p1.Chunks[0].ShardSetID)
 	}
 }
+
+// TestEmptyObjectReadsAsEmptyBody: zero-byte objects are committed without a
+// manifest blob (no chunks), so their manifest has no encryption envelope. Read
+// must return an empty body rather than trying to unwrap a 0-byte file key.
+func TestEmptyObjectReadsAsEmptyBody(t *testing.T) {
+	e := newEnv(t)
+	var buf bytes.Buffer
+	if err := e.off.Read(context.Background(), ReadRequest{
+		Bucket:   e.spec.Bucket,
+		Key:      e.spec.Key,
+		Manifest: contract.Manifest{Size: 0},
+	}, &buf); err != nil {
+		t.Fatalf("zero-byte read: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("zero-byte read wrote %d bytes", buf.Len())
+	}
+}

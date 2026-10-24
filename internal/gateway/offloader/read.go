@@ -27,6 +27,13 @@ func (o *Offloader) Read(ctx context.Context, req ReadRequest, w io.Writer) erro
 	if m.Size < 0 {
 		return fmt.Errorf("%w: negative object size", ErrManifest)
 	}
+	if m.Size == 0 {
+		// A zero-byte object has no chunks and therefore no manifest blob
+		// (the coordinator only stores a blob when the chunk table is non-empty),
+		// so its manifest carries a zero encryption envelope. There is no
+		// ciphertext to unlock and no shard to fetch: the correct body is empty.
+		return nil
+	}
 
 	aadVersion := string(m.VersionID)
 
