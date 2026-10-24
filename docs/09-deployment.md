@@ -770,7 +770,7 @@ the entity relations directly, and what that costs.
 | Configuration | Evidence |
 |---|---|
 | One coordinator process, one PostgreSQL 16 primary, embedded and PostgreSQL backends | repository parity suite (`internal/coord/meta/parity`) runs the same behaviour tests against both backends, including two concurrent commits to the same key; PostgreSQL runs `EXPLAIN` assertions that point gets, version range scans and prefix listings are index scans |
-| Coordinator on PostgreSQL serving the full S3 surface | `go test -tags=compat ./test/compat/` 21/21 and `scripts/compat.sh` PASS (aws-cli, rclone incl. tree sync, s3cmd) with `FASS_COMPAT_POSTGRES_DSN` set |
+| Coordinator on PostgreSQL serving the full S3 surface | `go test -tags=compat ./test/compat/` 22/22 and `scripts/compat.sh` PASS (aws-cli, rclone incl. tree sync, s3cmd) with `FASS_COMPAT_POSTGRES_DSN` set |
 | Lifecycle expiry + object lock on PostgreSQL | included in the compat suite above, including the dev-gated clock restart |
 | Crash-restart of the coordinator | the metadata transaction is the durability boundary; a restart reconnects to PostgreSQL and re-runs no migrations by default |
 | **Ungraceful primary crash + promotion** (`docker kill`, `pg_ctl promote`) | HA drill below: detection 150–170 ms, RTO 456–482 ms, RPO 0/20 acknowledged objects, plus the outage behaviour (health 503, retryable writes) |
