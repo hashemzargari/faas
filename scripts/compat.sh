@@ -103,6 +103,22 @@ if [[ -n "$AWS_BIN" ]]; then
   "${A[@]}" s3 cp s3://compat-aws/dir/big.bin "$T/out/aws.bin" --only-show-errors >/dev/null 2>&1
   if cmp -s "$T/in.bin" "$T/out/aws.bin"; then pass "get byte-identical"; else fail "get byte-identical"; fi
   if "${A[@]}" s3api list-buckets >/dev/null 2>&1; then pass "list buckets (strict SDK parse)"; else fail "list buckets"; fi
+
+  # Tree sync: a directory with a mix of sizes, synced up and back. This is the
+  # shape real backup tools use; it stresses listing, deletes and multipart
+  # together rather than one file at a time.
+  mkdir -p "$T/tree/a" "$T/tree/b"
+  head -c 1024 /dev/urandom >"$T/tree/small.bin"
+  head -c 300000 /dev/urandom >"$T/tree/a/medium.bin"
+  head -c 12000000 /dev/urandom >"$T/tree/b/large.bin"
+  if "${A[@]}" s3 sync "$T/tree" s3://compat-aws/sync/ --only-show-errors >/dev/null 2>"$T/aws-sync.err"; then
+    pass "sync up (tree incl. multipart)"
+  else
+    fail "sync up: $(tail -1 "$T/aws-sync.err")"
+  fi
+  mkdir -p "$T/out/aws-sync"
+  "${A[@]}" s3 sync s3://compat-aws/sync/ "$T/out/aws-sync" --only-show-errors >/dev/null 2>&1
+  if diff -r "$T/tree" "$T/out/aws-sync" >/dev/null 2>&1; then pass "sync down (tree byte-identical)"; else fail "sync down (tree differs)"; fi
 else
   skip "aws-cli not installed"
 fi
@@ -126,6 +142,16 @@ if [[ -n "$RCLONE_BIN" ]]; then
   mkdir -p "$T/out/rclone"
   "$RCLONE_BIN" copy c:compat-aws/rclone/in.bin "$T/out/rclone" -q 2>/dev/null
   if cmp -s "$T/in.bin" "$T/out/rclone/in.bin"; then pass "copy down byte-identical"; else fail "copy down byte-identical"; fi
+  if "$RCLONE_BIN" sync "$T/tree" c:compat-aws/rclone-sync --s3-upload-cutoff 5M --s3-chunk-size 5M -q 2>"$T/rclone-sync.err"; then
+    pass "sync up (tree incl. multipart)"
+  else
+    fail "sync up: $(tail -1 "$T/rclone-sync.err")"
+  fi
+  if "$RCLONE_BIN" check "$T/tree" c:compat-aws/rclone-sync -q 2>"$T/rclone-check.err"; then
+    pass "check (hashes match server-side)"
+  else
+    fail "check: $(tail -1 "$T/rclone-check.err")"
+  fi
 else
   skip "rclone not installed"
 fi
