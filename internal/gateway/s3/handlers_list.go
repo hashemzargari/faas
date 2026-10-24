@@ -329,9 +329,8 @@ func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request, t t
 		case isMarker:
 			d.DeleteMarkerVersionID = string(versionID)
 		default:
-			if versionID != "" {
-				d.VersionID = string(versionID)
-			}
+			// Unversioned delete: AWS returns neither a version id nor a marker.
+			_ = versionID
 		}
 		res.Deleted = append(res.Deleted, d)
 	}

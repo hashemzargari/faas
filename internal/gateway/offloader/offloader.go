@@ -418,7 +418,7 @@ func (o *Offloader) processChunk(ctx context.Context, spec ObjectSpec, codec *ec
 		return contract.ChunkRef{}, "", fmt.Errorf("%w: chunk %d produced no shards", ErrManifest, job.index)
 	}
 
-	shardSetID := ShardSetIDFor(spec.BucketID, spec.Key, spec.VersionID, job.index)
+	shardSetID := contract.ShardSetIDFor(spec.BucketID, spec.Key, spec.VersionID, job.index)
 	slots, checksums, ringID, generation, err := o.placeAndWriteShards(ctx, spec, shardSetID, job.index, len(ciphertext), shards)
 	if err != nil {
 		return contract.ChunkRef{}, "", err

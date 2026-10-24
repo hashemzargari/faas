@@ -75,7 +75,7 @@ func versionFromQuery(r *http.Request) contract.VersionID {
 // newUUID generates a version/shard-set id. Cubbit uses UUIDv4 for version ids
 // and clients must treat them as opaque (docs/05 §5.1); reusing the UUIDv4
 // generator keeps the format consistent.
-func (s *Server) newUUID() string { return authz.RequestID() }
+func (s *Server) newUUID() string { return contract.NewUUID() }
 
 // regionFor returns the region to report for a bucket.
 func (s *Server) regionFor(b contract.BucketConfig) string {
@@ -150,7 +150,7 @@ func (s *Server) validateTags(tags map[string]string) *APIError {
 
 // parseTaggingXML parses a Tagging request body into a tag map.
 func parseTaggingXML(body []byte) (map[string]string, *APIError) {
-	var doc taggingXML
+	var doc taggingRequest
 	if err := xml.Unmarshal(body, &doc); err != nil {
 		return nil, ErrMalformedXML
 	}

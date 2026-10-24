@@ -108,6 +108,28 @@ func mapError(err error) *APIError {
 		return api
 	}
 
+	// Preserve HTTP status semantics from lower layers (e.g. the coordinator
+	// returns 405 for a GET of an explicit delete-marker version).
+	var statuser interface{ HTTPStatus() int }
+	if errors.As(err, &statuser) {
+		switch statuser.HTTPStatus() {
+		case http.StatusMethodNotAllowed:
+			return ErrMethodNotAllowed
+		case http.StatusPreconditionFailed:
+			return ErrPreconditionFailed
+		case http.StatusForbidden:
+			return ErrAccessDenied
+		case http.StatusNotFound:
+			return ErrNoSuchKey
+		case http.StatusConflict:
+			return ErrInvalidBucketState
+		case http.StatusNotImplemented:
+			return ErrNotImplemented
+		case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout:
+			return ErrServiceUnavailable
+		}
+	}
+
 	// Contract layer.
 	switch {
 	case errors.Is(err, contract.ErrNotFound):

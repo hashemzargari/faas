@@ -170,3 +170,58 @@ func TestResourceMatches(t *testing.T) {
 		}
 	}
 }
+
+// TestShardSetIDForGoldenValue pins the derivation algorithm with a value
+// computed independently (Python hashlib), so a refactor cannot silently
+// change ids that the gateway, GC and repair all depend on.
+func TestShardSetIDForGoldenValue(t *testing.T) {
+	got := ShardSetIDFor(
+		BucketID("bkt-123"),
+		"path/to/object.bin",
+		VersionID("11111111-2222-3333-4444-555555555555"),
+		7,
+	)
+	const want = ShardSetID("a80cb7b1-e700-44c6-ac8d-1030564a1bdb")
+	if got != want {
+		t.Fatalf("ShardSetIDFor = %q, want %q", got, want)
+	}
+}
+
+func TestShardSetIDForIsStableAndInputSensitive(t *testing.T) {
+	base := ShardSetIDFor("b", "k", "v", 0)
+	if again := ShardSetIDFor("b", "k", "v", 0); again != base {
+		t.Fatal("derivation must be deterministic")
+	}
+	variants := []ShardSetID{
+		ShardSetIDFor("b2", "k", "v", 0),
+		ShardSetIDFor("b", "k2", "v", 0),
+		ShardSetIDFor("b", "k", "v2", 0),
+		ShardSetIDFor("b", "k", "v", 1),
+	}
+	seen := map[ShardSetID]bool{base: true}
+	for _, v := range variants {
+		if seen[v] {
+			t.Fatalf("input change did not change the id: %q", v)
+		}
+		seen[v] = true
+	}
+	// Must be a canonical UUIDv4 string.
+	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(string(base)) {
+		t.Fatalf("not a UUIDv4: %q", base)
+	}
+}
+
+func TestNewUUIDIsVersion4AndUnique(t *testing.T) {
+	seen := make(map[string]bool, 1000)
+	re := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	for i := 0; i < 1000; i++ {
+		u := NewUUID()
+		if !re.MatchString(u) {
+			t.Fatalf("not UUIDv4: %q", u)
+		}
+		if seen[u] {
+			t.Fatalf("duplicate uuid %q", u)
+		}
+		seen[u] = true
+	}
+}

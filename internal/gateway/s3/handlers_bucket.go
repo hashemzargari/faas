@@ -202,7 +202,7 @@ func (s *Server) handlePutBucketVersioning(w http.ResponseWriter, r *http.Reques
 		s.fail(w, r, err)
 		return
 	}
-	var req versioningConfigurationXML
+	var req versioningConfigRequest
 	if apiErr := decodeXMLBody(r, 64<<10, &req); apiErr != nil {
 		s.fail(w, r, apiErr)
 		return
@@ -325,7 +325,7 @@ func (s *Server) handlePutOwnershipControls(w http.ResponseWriter, r *http.Reque
 		s.fail(w, r, err)
 		return
 	}
-	var req ownershipControlsXML
+	var req ownershipControlsRequest
 	if apiErr := decodeXMLBody(r, 64<<10, &req); apiErr != nil {
 		s.fail(w, r, apiErr)
 		return
@@ -404,7 +404,7 @@ func (s *Server) handlePutObjectLockConfig(w http.ResponseWriter, r *http.Reques
 		s.fail(w, r, err)
 		return
 	}
-	var req objectLockConfigurationXML
+	var req objectLockConfigRequest
 	if apiErr := decodeXMLBody(r, 64<<10, &req); apiErr != nil {
 		s.fail(w, r, apiErr)
 		return

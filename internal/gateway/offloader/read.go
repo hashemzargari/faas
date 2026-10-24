@@ -133,7 +133,7 @@ func (o *Offloader) readChunk(ctx context.Context, tenant contract.TenantID, buc
 
 	// Shard set ids are derived from the object version; multipart parts used an
 	// empty version at write time, which aadVersion reflects.
-	shardSetID := ShardSetIDFor(bucketID, key, contract.VersionID(aadVersion), ref.Index)
+	shardSetID := contract.ShardSetIDFor(bucketID, key, contract.VersionID(aadVersion), ref.Index)
 	shards := make([][]byte, geom.TotalShards)
 	params := ref.Params
 	groupSize := params.ShardsPerGroup()
@@ -266,8 +266,14 @@ func (o *Offloader) fetchGroup(ctx context.Context, slots []contract.Slot, check
 	for i := localN; i < len(slots); i++ {
 		launch(&parityWG, i)
 	}
+	parityFinished := make(chan struct{})
+	go func() {
+		parityWG.Wait()
+		close(parityFinished)
+	}()
 	select {
 	case <-quorum:
+	case <-parityFinished:
 	case <-gctx.Done():
 	}
 	cancel()

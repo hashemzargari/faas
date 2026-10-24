@@ -492,3 +492,48 @@ func splitTags(raw string) (map[string]string, error) {
 	}
 	return tags, nil
 }
+
+// ---------------------------------------------------------------------------
+// Request bodies
+//
+// Response documents carry the S3 namespace; request documents from clients may
+// or may not include it, so their XMLName fields are deliberately unqualified
+// (a local-only XMLName matches any namespace).
+// ---------------------------------------------------------------------------
+
+type versioningConfigRequest struct {
+	Status    string `xml:"Status"`
+	MFADelete string `xml:"MfaDelete"`
+}
+
+type ownershipControlsRequest struct {
+	Rules []ownershipRule `xml:"Rule"`
+}
+
+type objectLockConfigRequest struct {
+	ObjectLockEnabled string          `xml:"ObjectLockEnabled"`
+	Rule              *objectLockRule `xml:"Rule"`
+}
+
+type taggingRequest struct {
+	TagSet tagSetXML `xml:"TagSet"`
+}
+
+type retentionRequest struct {
+	Mode            string `xml:"Mode"`
+	RetainUntilDate string `xml:"RetainUntilDate"`
+}
+
+type legalHoldRequest struct {
+	Status string `xml:"Status"`
+}
+
+type accessControlPolicyRequest struct {
+	Owner struct {
+		ID          string `xml:"ID"`
+		DisplayName string `xml:"DisplayName"`
+	} `xml:"Owner"`
+	ACL struct {
+		Grants []grantXML `xml:"Grant"`
+	} `xml:"AccessControlList"`
+}

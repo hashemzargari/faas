@@ -387,12 +387,184 @@ func (s *Service) SetNexusWriteDegraded(ctx context.Context, nexus contract.Nexu
 }
 
 // ---------------------------------------------------------------------------
+// Idempotent topology bootstrap (used by --dev-bootstrap and the console)
+// ---------------------------------------------------------------------------
+
+// EnsureSwarm returns the swarm with the given id, creating it when absent.
+func (s *Service) EnsureSwarm(ctx context.Context, sw Swarm) (Swarm, error) {
+	if sw.Name == "" {
+		return Swarm{}, coerr.Invalidf("swarm name is required")
+	}
+	if sw.ID == "" {
+		sw.ID = id.New()
+	}
+	now := s.now()
+	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+		existing, err := storage.GetJSON[Swarm](tx, spaceSwarms, []byte(sw.ID))
+		if err == nil {
+			if existing.Name != sw.Name {
+				return coerr.E(409, coerr.CodeConflict, "swarm %q exists with a different name (%q)", sw.ID, existing.Name)
+			}
+			sw = existing
+			return nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return err
+		}
+		sw.CreatedAt = now
+		return storage.PutJSON(tx, spaceSwarms, []byte(sw.ID), sw)
+	})
+	return sw, err
+}
+
+// EnsureNexus returns the nexus with the given id, creating it when absent.
+func (s *Service) EnsureNexus(ctx context.Context, n Nexus) (Nexus, error) {
+	if n.ID == "" {
+		return Nexus{}, coerr.Invalidf("nexus_id is required")
+	}
+	if n.SwarmID == "" || n.Name == "" {
+		return Nexus{}, coerr.Invalidf("swarm_id and name are required")
+	}
+	now := s.now()
+	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+		existing, err := storage.GetJSON[Nexus](tx, spaceNexuses, []byte(n.ID))
+		if err == nil {
+			if existing.SwarmID != n.SwarmID {
+				return coerr.E(409, coerr.CodeConflict, "nexus %q exists in swarm %q", n.ID, existing.SwarmID)
+			}
+			n = existing
+			return nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return err
+		}
+		if !tx.Has(spaceSwarms, []byte(n.SwarmID)) {
+			return coerr.E(404, "NoSuchSwarm", "swarm %q does not exist", n.SwarmID)
+		}
+		n.CreatedAt = now
+		return storage.PutJSON(tx, spaceNexuses, []byte(n.ID), n)
+	})
+	return n, err
+}
+
+// EnsureNode returns the node with the given id, creating it when absent.
+func (s *Service) EnsureNode(ctx context.Context, n Node) (Node, error) {
+	if n.ID == "" {
+		return Node{}, coerr.Invalidf("node_id is required")
+	}
+	if n.NexusID == "" || n.Hostname == "" {
+		return Node{}, coerr.Invalidf("nexus_id and hostname are required")
+	}
+	now := s.now()
+	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+		existing, err := storage.GetJSON[Node](tx, spaceNodes, []byte(n.ID))
+		if err == nil {
+			if existing.NexusID != n.NexusID {
+				return coerr.E(409, coerr.CodeConflict, "node %q exists in nexus %q", n.ID, existing.NexusID)
+			}
+			n = existing
+			return nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return err
+		}
+		if !tx.Has(spaceNexuses, []byte(n.NexusID)) {
+			return coerr.E(404, "NoSuchNexus", "nexus %q does not exist", n.NexusID)
+		}
+		n.CreatedAt = now
+		return storage.PutJSON(tx, spaceNodes, []byte(n.ID), n)
+	})
+	return n, err
+}
+
+// EnsureRingAgents adds any missing agents to an existing ring (idempotent) and
+// re-validates the ring's per-Nexus feasibility. It is used by the dev bootstrap
+// so a restart reconciles the ring instead of failing.
+func (s *Service) EnsureRingAgents(ctx context.Context, ringID contract.RingID, agentIDs []contract.AgentID) (Ring, error) {
+	var out Ring
+	now := s.now()
+	_ = now
+	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+		ring, err := storage.GetJSON[Ring](tx, spaceRings, []byte(ringID))
+		if errors.Is(err, storage.ErrNotFound) {
+			return coerr.E(404, "NoSuchRing", "ring %q does not exist", ringID)
+		}
+		if err != nil {
+			return err
+		}
+		rc, err := storage.GetJSON[RedundancyClass](tx, spaceRCs, []byte(ring.RCID))
+		if err != nil {
+			return err
+		}
+		perNexus := make(map[contract.NexusID]int, len(ring.NexusIDs))
+		for _, aid := range ring.AgentIDs {
+			ag, err := storage.GetJSON[Agent](tx, spaceAgents, []byte(aid))
+			if err == nil {
+				perNexus[ag.NexusID]++
+			}
+		}
+		changed := false
+		for _, aid := range agentIDs {
+			if containsAgent(ring.AgentIDs, aid) {
+				continue
+			}
+			ag, err := storage.GetJSON[Agent](tx, spaceAgents, []byte(aid))
+			if errors.Is(err, storage.ErrNotFound) {
+				return coerr.Invalidf("agent %q does not exist", aid)
+			}
+			if err != nil {
+				return err
+			}
+			if !containsNexus(ring.NexusIDs, ag.NexusID) {
+				return coerr.Invalidf("agent %q is not in one of the ring's nexuses", aid)
+			}
+			ring.AgentIDs = append(ring.AgentIDs, aid)
+			ring.Capacity += ag.CapacityBytes
+			perNexus[ag.NexusID]++
+			changed = true
+		}
+		for _, nx := range ring.NexusIDs {
+			if perNexus[nx] < rc.Params.ShardsPerGroup() {
+				return coerr.Invalidf("nexus %q has %d agents, need local_n+local_k = %d", nx, perNexus[nx], rc.Params.ShardsPerGroup())
+			}
+		}
+		if changed {
+			ring.Epoch++
+		}
+		if err := storage.PutJSON(tx, spaceRings, []byte(ring.ID), ring); err != nil {
+			return err
+		}
+		for _, aid := range agentIDs {
+			ag, err := storage.GetJSON[Agent](tx, spaceAgents, []byte(aid))
+			if err != nil {
+				return err
+			}
+			if !containsRing(ag.RingIDs, ring.ID) {
+				ag.RingIDs = append(ag.RingIDs, ring.ID)
+				if err := storage.PutJSON(tx, spaceAgents, []byte(ag.ID), ag); err != nil {
+					return err
+				}
+			}
+		}
+		out = ring
+		return nil
+	})
+	return out, err
+}
+
+// ---------------------------------------------------------------------------
 // Announce
 // ---------------------------------------------------------------------------
 
 // PendingRegistration is what the console/operator creates before a disk's
 // agent boots: an expected node+disk identity, optionally with a fixed port,
 // plus a one-time announce secret.
+//
+// DiskID may be empty for a node-scoped registration: the agent generates its
+// own disk UUID from the disk's state.json and the coordinator binds it on the
+// first successful announce. This is how a dev bootstrap can pre-issue secrets
+// without knowing the disk identity in advance; explicit node+disk registrations
+// keep their stricter semantics.
 type PendingRegistration struct {
 	AgentID       contract.AgentID
 	NodeID        contract.NodeID
@@ -403,10 +575,29 @@ type PendingRegistration struct {
 
 // RegisterPending creates a pending agent record and returns its one-time
 // secret. The secret is stored only as a SHA-256 digest and is consumed by a
-// successful announce.
+// successful announce. An empty DiskID creates a node-scoped registration.
 func (s *Service) RegisterPending(ctx context.Context, reg PendingRegistration) (contract.AgentID, string, error) {
-	if reg.NodeID == "" || reg.DiskID == "" {
-		return "", "", coerr.Invalidf("node_id and disk_id are required")
+	var (
+		agentID contract.AgentID
+		secret  string
+	)
+	now := s.now()
+	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+		var err error
+		agentID, secret, err = s.registerPendingTx(tx, reg, now)
+		return err
+	})
+	if err != nil {
+		return "", "", err
+	}
+	return agentID, secret, nil
+}
+
+// registerPendingTx is RegisterPending inside an existing transaction (used by
+// idempotent bootstrap reconciliation and by RegisterPending itself).
+func (s *Service) registerPendingTx(tx *storage.WriteTx, reg PendingRegistration, now time.Time) (contract.AgentID, string, error) {
+	if reg.NodeID == "" {
+		return "", "", coerr.Invalidf("node_id is required")
 	}
 	if reg.ExpectedPort < 0 || reg.ExpectedPort > 65535 {
 		return "", "", coerr.Invalidf("expected_port must be in 0..65535")
@@ -419,57 +610,130 @@ func (s *Service) RegisterPending(ctx context.Context, reg PendingRegistration) 
 		return "", "", coerr.Wrap(err, 500, coerr.CodeInternal, coerr.ErrInternal.Message)
 	}
 	sum := sha256.Sum256([]byte(secret))
-	now := s.now()
 	agentID := reg.AgentID
 	if agentID == "" {
 		agentID = contract.AgentID(id.New())
 	}
-	err = s.db.Update(ctx, func(tx *storage.WriteTx) error {
-		node, err := storage.GetJSON[Node](tx, spaceNodes, []byte(reg.NodeID))
-		if errors.Is(err, storage.ErrNotFound) {
-			return coerr.E(404, "NoSuchNode", "node %q does not exist", reg.NodeID)
-		}
-		if err != nil {
-			return err
-		}
-		locKey := storage.JoinKey(string(reg.NodeID), reg.DiskID)
-		if existing, err := tx.Get(spaceAgentLoc, locKey); err == nil {
-			return coerr.E(409, coerr.CodeConflict, "agent for node %q disk %q is already registered (%s)", reg.NodeID, reg.DiskID, existing)
+	node, err := storage.GetJSON[Node](tx, spaceNodes, []byte(reg.NodeID))
+	if errors.Is(err, storage.ErrNotFound) {
+		return "", "", coerr.E(404, "NoSuchNode", "node %q does not exist", reg.NodeID)
+	}
+	if err != nil {
+		return "", "", err
+	}
+	locKey := agentLocationKey(reg.NodeID, reg.DiskID)
+	if existing, err := tx.Get(spaceAgentLoc, locKey); err == nil {
+		return "", "", coerr.E(409, coerr.CodeConflict, "agent for node %q disk %q is already registered (%s)", reg.NodeID, reg.DiskID, existing)
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return "", "", err
+	}
+	if reg.DiskID == "" {
+		// One node-scoped pending registration per node.
+		if existing, err := tx.Get(spaceAgentLoc, agentLocationKey(reg.NodeID, "")); err == nil {
+			return "", "", coerr.E(409, coerr.CodeConflict, "node %q already has a pending registration (%s)", reg.NodeID, existing)
 		} else if !errors.Is(err, storage.ErrNotFound) {
-			return err
+			return "", "", err
 		}
-		ag := Agent{
-			ID:            agentID,
-			NodeID:        reg.NodeID,
-			NexusID:       node.NexusID,
-			DiskID:        reg.DiskID,
-			ExpectedPort:  reg.ExpectedPort,
-			CapacityBytes: reg.CapacityBytes,
-			FreeBytes:     reg.CapacityBytes,
-			SecretHash:    sum[:],
-			SecretExpires: now.Add(s.cfg.SecretTTL),
-			State:         StatePending,
-			StateChanged:  now,
-			RegisteredAt:  now,
-			// Neutral priors: a brand-new disk is treated as fully available with
-			// average reputation until telemetry arrives.
-			UptimeScore: 1.0,
-			Reputation:  1.0,
-			BWHeadroom:  1.0,
-			RTTScore:    0.5,
+	}
+	ag := Agent{
+		ID:            agentID,
+		NodeID:        reg.NodeID,
+		NexusID:       node.NexusID,
+		DiskID:        reg.DiskID,
+		ExpectedPort:  reg.ExpectedPort,
+		CapacityBytes: reg.CapacityBytes,
+		FreeBytes:     reg.CapacityBytes,
+		SecretHash:    sum[:],
+		SecretExpires: now.Add(s.cfg.SecretTTL),
+		State:         StatePending,
+		StateChanged:  now,
+		RegisteredAt:  now,
+		// Neutral priors: a brand-new disk is treated as fully available with
+		// average reputation until telemetry arrives.
+		UptimeScore: 1.0,
+		Reputation:  1.0,
+		BWHeadroom:  1.0,
+		RTTScore:    0.5,
+	}
+	if err := storage.PutJSON(tx, spaceAgents, []byte(ag.ID), ag); err != nil {
+		return "", "", err
+	}
+	if err := tx.Put(spaceAgentLoc, locKey, []byte(ag.ID)); err != nil {
+		return "", "", err
+	}
+	return agentID, secret, nil
+}
+
+// EnsurePending is the idempotent bootstrap variant of RegisterPending.
+//
+//   - no registration for the node (and disk, when given) ⇒ create one and mint
+//     a secret;
+//   - registration exists and is still PENDING ⇒ mint a fresh one-time secret
+//     (the previous one was never consumed or is being rotated before first
+//     announce);
+//   - registration is already ACTIVE/SUSPECT/OFFLINE/DECOMMISSIONING ⇒ leave it
+//     completely untouched and return an empty secret. Re-running a bootstrap
+//     must never invalidate a live agent's registration.
+func (s *Service) EnsurePending(ctx context.Context, reg PendingRegistration) (agentID contract.AgentID, secret string, minted bool, err error) {
+	if reg.NodeID == "" {
+		return "", "", false, coerr.Invalidf("node_id is required")
+	}
+	now := s.now()
+	err = s.db.Update(ctx, func(tx *storage.WriteTx) error {
+		var ag Agent
+		found := false
+		for _, key := range []struct {
+			node contract.NodeID
+			disk string
+		}{{reg.NodeID, reg.DiskID}, {reg.NodeID, ""}} {
+			raw, err := tx.Get(spaceAgentLoc, agentLocationKey(key.node, key.disk))
+			if errors.Is(err, storage.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			rec, err := storage.GetJSON[Agent](tx, spaceAgents, raw)
+			if err != nil {
+				return err
+			}
+			ag, found = rec, true
+			break
+		}
+		if !found {
+			var regErr error
+			agentID, secret, regErr = s.registerPendingTx(tx, reg, now)
+			minted = regErr == nil
+			return regErr
+		}
+		agentID = ag.ID
+		if ag.State != StatePending {
+			// ACTIVE (or draining/offline) registrations are never rewritten.
+			return nil
+		}
+		fresh, err := id.NewSecret(32)
+		if err != nil {
+			return coerr.Wrap(err, 500, coerr.CodeInternal, coerr.ErrInternal.Message)
+		}
+		sum := sha256.Sum256([]byte(fresh))
+		ag.SecretHash = sum[:]
+		ag.SecretExpires = now.Add(s.cfg.SecretTTL)
+		if reg.ExpectedPort != 0 {
+			ag.ExpectedPort = reg.ExpectedPort
+		}
+		if reg.CapacityBytes > 0 {
+			ag.CapacityBytes = reg.CapacityBytes
+			if ag.FreeBytes == 0 {
+				ag.FreeBytes = reg.CapacityBytes
+			}
 		}
 		if err := storage.PutJSON(tx, spaceAgents, []byte(ag.ID), ag); err != nil {
 			return err
 		}
-		if err := tx.Put(spaceAgentLoc, locKey, []byte(ag.ID)); err != nil {
-			return err
-		}
+		secret, minted = fresh, true
 		return nil
 	})
-	if err != nil {
-		return "", "", err
-	}
-	return agentID, secret, nil
+	return agentID, secret, minted, err
 }
 
 // Announce implements the documented agent join protocol with Cubbit's exact
@@ -500,8 +764,17 @@ func (s *Service) Announce(ctx context.Context, req contract.AnnounceRequest) (c
 	now := s.now()
 	var result contract.AnnounceResult
 	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
-		locKey := storage.JoinKey(string(req.NodeID), req.DiskID)
+		// Prefer an exact node+disk registration; fall back to a node-scoped
+		// pending registration, which binds the agent's generated disk UUID on
+		// this first successful announce.
+		locKey := agentLocationKey(req.NodeID, req.DiskID)
 		agentIDRaw, err := tx.Get(spaceAgentLoc, locKey)
+		nodeScoped := false
+		if errors.Is(err, storage.ErrNotFound) {
+			locKey = agentLocationKey(req.NodeID, "")
+			agentIDRaw, err = tx.Get(spaceAgentLoc, locKey)
+			nodeScoped = err == nil
+		}
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrSecretNotFound
 		}
@@ -553,6 +826,24 @@ func (s *Service) Announce(ctx context.Context, req contract.AnnounceRequest) (c
 		ag.SecretExpires = time.Time{}
 		ag.LastSeen = now
 		ag.StateChanged = now
+		if nodeScoped {
+			// Bind the agent-generated disk identity to the pending registration.
+			target := agentLocationKey(req.NodeID, req.DiskID)
+			if owner, err := tx.Get(spaceAgentLoc, target); err == nil && string(owner) != string(ag.ID) {
+				return coerr.E(409, coerr.CodeConflict, "disk %q is already bound to another agent", req.DiskID)
+			} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+				return err
+			}
+			// Keep the node-scoped mapping alongside the exact one: it is how a
+			// bootstrap/console finds the agent that now owns this node, and it
+			// makes a second disk claiming the same node resolve to the existing
+			// agent (which then fails the pending check) instead of minting a
+			// silent duplicate registration.
+			if err := tx.Put(spaceAgentLoc, target, []byte(ag.ID)); err != nil {
+				return err
+			}
+			ag.DiskID = req.DiskID
+		}
 		if err := storage.PutJSON(tx, spaceAgents, []byte(ag.ID), ag); err != nil {
 			return err
 		}
@@ -1152,6 +1443,12 @@ func (s *Service) Snapshot(ctx context.Context, geoFence map[string][]contract.N
 // ---------------------------------------------------------------------------
 
 func (s *Service) now() time.Time { return s.cfg.Now().UTC() }
+
+// agentLocationKey indexes agent identity by node and disk. An empty disk means a
+// node-scoped pending registration (the disk UUID is bound on first announce).
+func agentLocationKey(node contract.NodeID, disk string) []byte {
+	return storage.JoinKeyN([]string{string(node), disk}, nil)
+}
 
 func clamp01(v float64) float64 {
 	switch {

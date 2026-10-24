@@ -40,6 +40,8 @@ type Server struct {
 	mux     *http.ServeMux
 	metrics *metrics
 	now     func() time.Time
+	// gcStats, when set, exposes the deletion-GC executor counters on /metrics.
+	gcStats func() map[string]int64
 }
 
 // New builds the HTTP server. The returned Handler is safe for concurrent Use.
@@ -57,6 +59,9 @@ func New(svc *coord.Service, logger *slog.Logger) *Server {
 	s.routes()
 	return s
 }
+
+// SetGCStats registers the deletion-GC counter source exposed on /metrics.
+func (s *Server) SetGCStats(fn func() map[string]int64) { s.gcStats = fn }
 
 // Handler returns the middleware-wrapped HTTP handler.
 func (s *Server) Handler() http.Handler {

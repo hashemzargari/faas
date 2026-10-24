@@ -238,7 +238,7 @@ func run(parent context.Context, cfg config, logger *slog.Logger) error {
 		}()
 	}
 
-	agentIDCh := make(chan contractAgentID, 1)
+	agentIDCh := make(chan contract.AgentID, 1)
 	membershipErr := make(chan error, 1)
 	if cfg.secret == "" {
 		logger.Warn("no --secret provided: announcing and heartbeating are disabled (dev mode)")
@@ -308,8 +308,6 @@ func run(parent context.Context, cfg config, logger *slog.Logger) error {
 	return runErr
 }
 
-type contractAgentID = contract.AgentID
-
 // runMembership announces this agent (with retries), then heartbeats until the
 // context is cancelled.
 func runMembership(
@@ -322,7 +320,7 @@ func runMembership(
 	srv *transport.Server,
 	port int,
 	cursorFn func() string,
-	agentIDCh chan<- contractAgentID,
+	agentIDCh chan<- contract.AgentID,
 ) error {
 	stats := st.Stats()
 	req := contract.AnnounceRequest{

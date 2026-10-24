@@ -598,10 +598,8 @@ func (s *Store) Put(ctx context.Context, req PutRequest, body io.Reader) (PutRes
 			ErrChecksumMismatch, req.Checksum, binaryBigEndianUint64(sum[:8]))
 	}
 
-	// The checksum is verified above; now re-read the (small) temp file to hash
-	// the actual bytes written. io.Copy above hashed through the same reader,
-	// so the payload digest is already known — but a short write would have
-	// already errored. No second pass is needed.
+	// The payload digest was accumulated while streaming the body into the temp
+	// file, so the header can be patched in place without a second pass.
 	hdr := Header{
 		Version:    shardVersion,
 		Params:     req.Params,

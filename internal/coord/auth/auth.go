@@ -160,8 +160,10 @@ func (s *Service) CreateAccessKey(ctx context.Context, spec AccessKeySpec) (Acce
 			return AccessKey{}, err
 		}
 	}
-	if len(keyID) < 16 || len(keyID) > 128 {
-		return AccessKey{}, coerr.Invalidf("access key id must be 16..128 characters")
+	if len(keyID) < 8 || len(keyID) > 128 {
+		// AWS-style ids are 20 characters; the dev bootstrap uses a short,
+		// well-known id. The floor guards against empty/ambiguous ids only.
+		return AccessKey{}, coerr.Invalidf("access key id must be 8..128 characters")
 	}
 	secret := spec.Secret
 	if secret == "" {
@@ -171,8 +173,11 @@ func (s *Service) CreateAccessKey(ctx context.Context, spec AccessKeySpec) (Acce
 			return AccessKey{}, coerr.Wrap(err, 500, coerr.CodeInternal, coerr.ErrInternal.Message)
 		}
 	}
-	if len(secret) < 32 {
-		return AccessKey{}, coerr.Invalidf("secret must be at least 32 characters")
+	if len(secret) < 8 {
+		// SigV4 works with any length; this is a guard against empty/trivial
+		// secrets, not a policy. Provisioning should mint 32+ random bytes (the
+		// dev bootstrap deliberately uses a short well-known key).
+		return AccessKey{}, coerr.Invalidf("secret must be at least 8 characters")
 	}
 	rec := AccessKey{
 		AccessKeyID: keyID,

@@ -6,6 +6,13 @@
 -- physical key layout is documented in the appendix at the bottom and is NOT
 -- normative. When the two disagree, this DDL wins.
 --
+-- Drift guard: internal/coord/schema_drift_test.go parses this file and the
+-- embedded engine's record structs, and fails the build if a persisted field has
+-- no column here. Intentional divergences (renamed columns, fields normalised
+-- into child tables, nested records the relational model flattens) are declared
+-- explicitly in that test, so every difference is reviewable rather than
+-- accidental. Add a field to a record without a column and the suite goes red.
+--
 -- Design rules (docs/04-services.md §5.2):
 --   * manifests are content-addressed, compressed blobs; the hot version row is small;
 --   * object listing is an ordered index range scan on (bucket_id, key);
@@ -150,8 +157,9 @@ CREATE TABLE agents (
     agent_id            uuid         PRIMARY KEY,
     node_id             uuid         NOT NULL REFERENCES nodes (node_id) ON DELETE CASCADE,
     nexus_id            uuid         NOT NULL REFERENCES nexuses (nexus_id),
-    disk_id             uuid         REFERENCES disks (disk_id),
-    disk_uuid           text         NOT NULL,     -- agent-reported identity
+    -- Agent-reported disk identity (the engine's identity unit is one agent per
+    -- disk; the disks table is inventory metadata, not a foreign key here).
+    disk_id             text         NOT NULL,
     hostname            text         NOT NULL DEFAULT '',
     endpoint            text         NOT NULL DEFAULT '',
     port                integer      CHECK (port IS NULL OR port BETWEEN 1 AND 65535),
@@ -177,7 +185,8 @@ CREATE TABLE agents (
     bw_headroom         double precision NOT NULL DEFAULT 1.0 CHECK (bw_headroom BETWEEN 0 AND 1),
     rtt_score           double precision NOT NULL DEFAULT 0.5 CHECK (rtt_score BETWEEN 0 AND 1),
     scrub_cursor        text         NOT NULL DEFAULT '',
-    inventory_digest    text         NOT NULL DEFAULT ''
+    inventory_digest    text         NOT NULL DEFAULT '',
+    bandwidth_bps       bigint       NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX agents_public_key_uniq ON agents (public_key) WHERE public_key IS NOT NULL;
 CREATE UNIQUE INDEX agents_node_disk_uniq ON agents (node_id, disk_uuid);
@@ -406,6 +415,7 @@ CREATE TABLE uploads (
     ring_id        uuid         REFERENCES rings (ring_id),
     storage_class  text         NOT NULL DEFAULT 'STANDARD',
     encryption     jsonb        NOT NULL DEFAULT '{}',
+    retention      jsonb,                          -- object lock requested at initiate
     initiated_at   timestamptz  NOT NULL DEFAULT now(),
     expires_at     timestamptz  NOT NULL DEFAULT now() + interval '7 days'
 );
@@ -437,7 +447,12 @@ CREATE TABLE deletion_queue (
     manifest_hash bytea,
     reason        text         NOT NULL,
     created_at    timestamptz  NOT NULL DEFAULT now(),
-    due_at        timestamptz  NOT NULL DEFAULT now() + interval '24 hours'
+    due_at        timestamptz  NOT NULL DEFAULT now() + interval '24 hours',
+    -- GC progress: set when a collector starts, plus one entry per agent
+    -- endpoint that has acknowledged deletion. Makes a crash-retry cheap
+    -- (acknowledged endpoints are skipped, never re-deleted).
+    started_at      timestamptz,
+    acked_endpoints text[]       NOT NULL DEFAULT '{}'
 );
 CREATE INDEX deletion_queue_due_idx ON deletion_queue (due_at);
 
@@ -548,6 +563,25 @@ COMMIT;
 -- redundancy_classes        rc_id                                  RedundancyClass
 -- shard_status              agent_id\0shard_set_id\0slot(4B BE)    shardStatusRecord
 -- meta                      schema_version                         decimal ASCII
+--
+-- Field mapping notes (why a JSON field is not always a column of the same name):
+--   * Bucket.acl                  -> bucket_acls (one row per bucket)
+--   * versionRecord.tags          -> object_tags (one row per tag)
+--   * versionRecord.acl           -> object_acls (one row per version)
+--   * versionRecord.retention     -> object_versions.retention_mode/retain_until/legal_hold
+--   * uploadRecord.meta           -> flattened into uploads.* (version_id, chunk_size, ...)
+--   * RedundancyClass.params      -> redundancy_classes.geo_n/geo_k/local_n/local_k
+--   * Agent.ring_ids              -> ring_agents (agents may belong to several rings)
+--   * Tenant.key_seed             -> tenants.key_seed_wrapped (ciphertext at rest)
+--   * AccessKey.secret            -> access_keys.secret_wrapped (ciphertext at rest)
+--   * Bucket.lifecycle            -> buckets.lifecycle_xml
+--   * latestRecord.version_id     -> objects.latest_version_id
+--   * latestRecord.delete_marker  -> objects.is_delete_marker
+--   * uploadRecord.created_at     -> uploads.initiated_at
+--   * Ring.capacity               -> rings.capacity_bytes
+--   * Agent.last_seen             -> agents.last_seen_at
+--   * Agent.state_changed         -> agents.state_changed_at
+--   * Agent.secret_expires        -> agents.secret_expires_at
 --
 -- Migrations are numbered and applied on boot (internal/storage/migrate.go);
 -- the PostgreSQL column `schema_migrations.version` is the same number.

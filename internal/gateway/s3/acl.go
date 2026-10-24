@@ -101,7 +101,7 @@ func aclFromRequest(r *http.Request, owner, bucketOwner string) (contract.ACL, *
 		// PUT without a body and without a canned header is an S3 error.
 		return contract.ACL{}, ErrMalformedXML
 	}
-	var doc accessControlPolicyXML
+	var doc accessControlPolicyRequest
 	if err := xml.Unmarshal(body, &doc); err != nil {
 		return contract.ACL{}, ErrMalformedXML
 	}

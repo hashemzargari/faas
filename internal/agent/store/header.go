@@ -47,8 +47,6 @@ const (
 
 	flagSetID16UUID = 1 << 0
 	flagSetIDText   = 1 << 1
-
-	createdAtOffset = 88
 )
 
 var (

@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -146,6 +147,19 @@ func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "# HELP fass_coordinator_nexuses Number of nexuses.")
 		fmt.Fprintln(w, "# TYPE fass_coordinator_nexuses gauge")
 		fmt.Fprintf(w, "fass_coordinator_nexuses %d\n", len(snap.Nexuses))
+	}
+	if s.gcStats != nil {
+		stats := s.gcStats()
+		names := make([]string, 0, len(stats))
+		for name := range stats {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			fmt.Fprintf(w, "# HELP fass_coordinator_gc_%s Deletion GC %s.\n", name, strings.ReplaceAll(name, "_", " "))
+			fmt.Fprintf(w, "# TYPE fass_coordinator_gc_%s gauge\n", name)
+			fmt.Fprintf(w, "fass_coordinator_gc_%s %d\n", name, stats[name])
+		}
 	}
 	if backlog, err := s.svc.Meta.DeletionBacklog(r.Context()); err == nil {
 		fmt.Fprintln(w, "# HELP fass_coordinator_deletion_queue_depth Pending shard-GC entries.")

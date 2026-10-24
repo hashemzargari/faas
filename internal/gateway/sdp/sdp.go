@@ -278,7 +278,7 @@ func compileCondition(c *Condition, ruleID string) (*compiledCondition, error) {
 	switch op {
 	case "and", "or":
 		if len(c.Conditions) == 0 {
-			return nil, fmt.Errorf("%w: rule %q has an empty %s group", ErrInvalidPolicy, ruleID, op)
+			return nil, fmt.Errorf("%w: rule %q has an empty %s group", ErrInvalidPolicy, ruleID, strings.ToUpper(op))
 		}
 		node := &compiledCondition{group: true, all: op == "and"}
 		for _, child := range c.Conditions {
@@ -323,6 +323,9 @@ func compileCondition(c *Condition, ruleID string) (*compiledCondition, error) {
 		}
 		leaf.value = value{isList: true, list: list, listNums: nums, isNum: isNum}
 	case OpGreaterThan, OpLessThan, OpGreaterEqual, OpLessEqual:
+		if field != FieldSize {
+			return nil, fmt.Errorf("%w: rule %q operator %s is only valid on object.size", ErrInvalidPolicy, ruleID, op)
+		}
 		num, ok := asNumber(c.Value)
 		if !ok {
 			return nil, fmt.Errorf("%w: rule %q operator %s needs a numeric value", ErrInvalidPolicy, ruleID, op)

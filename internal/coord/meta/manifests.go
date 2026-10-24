@@ -3,6 +3,7 @@ package meta
 import (
 	"bytes"
 	"compress/flate"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -188,4 +189,33 @@ func validateChunkTable(chunks []contract.ChunkRef) error {
 		}
 	}
 	return nil
+}
+
+// ChunkTable returns the chunk table stored under a manifest hash. The deletion
+// queue and the repair orchestrator use it to recover shard addresses from a
+// tombstoned version without loading the whole manifest.
+func (s *Service) ChunkTable(ctx context.Context, manifestHash string) ([]contract.ChunkRef, error) {
+	if manifestHash == "" {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var chunks []contract.ChunkRef
+	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+		blob, err := tx.Get(spaceManifests, []byte(manifestHash))
+		if errors.Is(err, storage.ErrNotFound) {
+			return coerr.E(404, "NoSuchManifest", "manifest blob %s does not exist", manifestHash)
+		}
+		if err != nil {
+			return err
+		}
+		m, err := decodeManifestBlob(blob)
+		if err != nil {
+			return err
+		}
+		chunks = m.Chunks
+		return nil
+	})
+	return chunks, err
 }

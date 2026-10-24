@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,12 +17,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/fass-storage/fass/internal/agent/client"
 	"github.com/fass-storage/fass/internal/coord"
 	"github.com/fass-storage/fass/internal/coord/api"
+	"github.com/fass-storage/fass/internal/coord/bootstrap"
+	"github.com/fass-storage/fass/internal/coord/gc"
 	"github.com/fass-storage/fass/internal/coord/membership"
 	"github.com/fass-storage/fass/internal/coord/placement"
 )
@@ -42,6 +47,16 @@ type config struct {
 	maintenance bool
 	logLevel    string
 	logFormat   string
+	// deletion GC (docs/03 §6)
+	gcEnabled   bool
+	gcInterval  time.Duration
+	gcBatch     int
+	agentScheme string
+	// dev bootstrap (docs/07 §1.8) and dev-tunable health timings
+	devBootstrap      bool
+	heartbeatInterval time.Duration
+	suspectAfter      time.Duration
+	offlineAfter      time.Duration
 }
 
 func run(args []string) error {
@@ -61,9 +76,9 @@ func run(args []string) error {
 	svc, err := coord.Open(ctx, cfg.dataDir, coord.Config{
 		Maintenance: cfg.maintenance,
 		Membership: membership.Config{
-			HeartbeatInterval: membership.DefaultHeartbeatInterval,
-			SuspectAfter:      membership.DefaultSuspectAfter,
-			OfflineAfter:      membership.DefaultOfflineAfter,
+			HeartbeatInterval: cfg.heartbeatInterval,
+			SuspectAfter:      cfg.suspectAfter,
+			OfflineAfter:      cfg.offlineAfter,
 		},
 		Placement: placement.DefaultConfig(),
 		Logger:    logger,
@@ -75,7 +90,44 @@ func run(args []string) error {
 
 	go svc.RunMaintenance(ctx)
 
-	handler := api.New(svc, logger).Handler()
+	// Dev bootstrap: create/reconcile the deterministic cluster before serving,
+	// then emit the one-line payload the agent/gateway tooling consumes.
+	if cfg.devBootstrap {
+		payload, err := bootstrap.Run(ctx, svc.Meta, svc.Auth, svc.Members, bootstrap.DevConfig(cfg.dataDir))
+		if err != nil {
+			return fmt.Errorf("dev bootstrap: %w", err)
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("dev bootstrap: encode payload: %w", err)
+		}
+		fmt.Printf("FASS_DEV_BOOTSTRAP %s\n", raw)
+		logger.Info("dev bootstrap ready",
+			"swarm", bootstrap.DevSwarmID,
+			"rc_id", payload.RCID,
+			"ring_id", payload.RingID,
+			"bucket", payload.Bucket,
+			"agents", len(payload.Agents),
+			"access_key_id", payload.AccessKeyID)
+	}
+
+	// Deletion GC: drain tombstoned versions' shards once their grace period has
+	// elapsed. Agent transport is HTTP in v1 (docs/07 §2).
+	server := api.New(svc, logger)
+	if cfg.gcEnabled {
+		agentClient := client.New(client.Options{Scheme: cfg.agentScheme, Timeout: 15 * time.Second})
+		executor := gc.New(svc.Meta, agentClient, gc.Config{
+			Interval: cfg.gcInterval,
+			Batch:    cfg.gcBatch,
+			Logger:   logger,
+		})
+		go executor.Run(ctx)
+		server.SetGCStats(executor.Stats)
+		logger.Info("deletion GC enabled", "interval", cfg.gcInterval.String(), "batch", cfg.gcBatch)
+	} else {
+		logger.Warn("deletion GC disabled: tombstoned shards will accumulate")
+	}
+	handler := server.Handler()
 	httpSrv := &http.Server{
 		Addr:              cfg.listen,
 		Handler:           handler,
@@ -130,6 +182,14 @@ func parseConfig(args []string) (config, error) {
 	fs.BoolVar(&cfg.maintenance, "maintenance", envBool("FASS_COORDINATOR_MAINTENANCE"), "reject agent announce with 503 under maintenance")
 	fs.StringVar(&cfg.logLevel, "log-level", envOr("FASS_COORDINATOR_LOG_LEVEL", "info"), "debug|info|warn|error")
 	fs.StringVar(&cfg.logFormat, "log-format", envOr("FASS_COORDINATOR_LOG_FORMAT", "json"), "json|text")
+	fs.BoolVar(&cfg.gcEnabled, "gc", envBoolDefault("FASS_COORDINATOR_GC", true), "run the deletion-queue shard GC")
+	fs.DurationVar(&cfg.gcInterval, "gc-interval", envDuration("FASS_COORDINATOR_GC_INTERVAL", gc.DefaultInterval), "deletion GC pass interval")
+	fs.IntVar(&cfg.gcBatch, "gc-batch", envInt("FASS_COORDINATOR_GC_BATCH", gc.DefaultBatch), "max deletion entries per GC pass")
+	fs.StringVar(&cfg.agentScheme, "agent-scheme", envOr("FASS_COORDINATOR_AGENT_SCHEME", "http"), "scheme for agent shard endpoints (http in dev, https in prod)")
+	fs.BoolVar(&cfg.devBootstrap, "dev-bootstrap", envBoolDefault("FASS_COORDINATOR_DEV_BOOTSTRAP", false), "create/reconcile the deterministic dev cluster and print FASS_DEV_BOOTSTRAP <json>")
+	fs.DurationVar(&cfg.heartbeatInterval, "heartbeat-interval", envDuration("FASS_COORDINATOR_HEARTBEAT_INTERVAL", membership.DefaultHeartbeatInterval), "expected agent heartbeat interval")
+	fs.DurationVar(&cfg.suspectAfter, "suspect-after", envDuration("FASS_COORDINATOR_SUSPECT_AFTER", membership.DefaultSuspectAfter), "mark an agent SUSPECT after this much silence")
+	fs.DurationVar(&cfg.offlineAfter, "offline-after", envDuration("FASS_COORDINATOR_OFFLINE_AFTER", membership.DefaultOfflineAfter), "mark an agent OFFLINE after this much silence")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
@@ -186,4 +246,29 @@ func envBool(key string) bool {
 		return true
 	}
 	return false
+}
+
+func envBoolDefault(key string, def bool) bool {
+	if _, ok := os.LookupEnv(key); !ok {
+		return def
+	}
+	return envBool(key)
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if raw, ok := os.LookupEnv(key); ok {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if raw, ok := os.LookupEnv(key); ok {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
 }

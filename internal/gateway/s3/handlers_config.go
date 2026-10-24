@@ -117,7 +117,7 @@ func (s *Server) handlePutObjectRetention(w http.ResponseWriter, r *http.Request
 		s.fail(w, r, ErrObjectLockConfigFault)
 		return
 	}
-	var req retentionXML
+	var req retentionRequest
 	if apiErr := decodeXMLBody(r, 64<<10, &req); apiErr != nil {
 		s.fail(w, r, apiErr)
 		return
@@ -202,7 +202,7 @@ func (s *Server) handlePutObjectLegalHold(w http.ResponseWriter, r *http.Request
 		s.fail(w, r, ErrObjectLockConfigFault)
 		return
 	}
-	var req legalHoldXML
+	var req legalHoldRequest
 	if apiErr := decodeXMLBody(r, 64<<10, &req); apiErr != nil {
 		s.fail(w, r, apiErr)
 		return

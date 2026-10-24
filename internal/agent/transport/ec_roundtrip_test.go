@@ -135,3 +135,172 @@ func ecRoundTrip(t *testing.T, params ec.Params, payloadSize int) {
 		t.Fatalf("decoded payload differs from original: got %d bytes, want %d", len(decoded), len(payload))
 	}
 }
+
+// TestECTwoTierSurvivesNexusLossAcrossThreeStores is the strongest data-plane
+// test in this package: it uses three independent store instances + three real
+// HTTP transports standing in for the three Nexuses of a geo 2+1 deployment,
+// then deletes a whole group's worth of shards to simulate one Nexus being
+// lost, and decodes the object from the surviving Nexuses.
+//
+// It proves the two-tier property against real on-disk shard layouts and real
+// HTTP, not just in-memory shard slices:
+//
+//  1. baseline: all shards present on their Nexus -> decode matches payload
+//  2. Nexus 1 lost entirely (all 20 shards of geo group 1) -> decode from
+//     groups 0 and 2 (outer reconstruct) still matches byte-for-byte
+//  3. Nexus 1 lost AND local_k=4 disks lost in surviving Nexus 0 -> inner
+//     reconstruct in group 0 + outer reconstruct -> still matches
+//  4. Nexus 2 lost as well (only 1 of geo_n=2 groups left) -> decode must fail,
+//     which proves the test is not silently passing on fewer shards than the
+//     code requires
+func TestECTwoTierSurvivesNexusLossAcrossThreeStores(t *testing.T) {
+	ctx := context.Background()
+	params := ec.Params{GeoN: 2, GeoK: 1, LocalN: 16, LocalK: 4}
+	groupSize := params.ShardsPerGroup()
+	groups := params.GeoN + params.GeoK
+	setID := contract.ShardSetID("3c0ffee0-1111-4222-8333-444455556666")
+
+	payload := make([]byte, 96<<10)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatalf("random payload: %v", err)
+	}
+	codec, err := ec.New(params)
+	if err != nil {
+		t.Fatalf("ec.New: %v", err)
+	}
+	shards, geom, err := codec.Encode(payload)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	// Three independent stores, one per Nexus, each behind its own HTTP transport.
+	type nexus struct {
+		store *store.Store
+		srv   *httptest.Server
+	}
+	nexuses := make([]nexus, groups)
+	for i := range nexuses {
+		st := newTestStore(t, store.Options{})
+		srv, err := New(Options{Store: st, Logger: discardLogger(), Version: "test"})
+		if err != nil {
+			t.Fatalf("transport.New(nexus %d): %v", i, err)
+		}
+		ts := httptest.NewServer(srv.Handler())
+		t.Cleanup(ts.Close)
+		nexuses[i] = nexus{store: st, srv: ts}
+	}
+	c := client.New(client.Options{})
+
+	// Write every shard of group g to Nexus g, through HTTP.
+	for g := 0; g < groups; g++ {
+		for i := 0; i < groupSize; i++ {
+			body := shards[g*groupSize+i]
+			if err := c.PutShard(ctx, nexuses[g].srv.URL, contract.PutShardRequest{
+				ShardSetID: setID,
+				GeoGroup:   g,
+				LocalIndex: i,
+				Params:     params,
+				PayloadLen: len(body),
+				Checksum:   shard.Sum64(body),
+				Body:       bytes.NewReader(body),
+			}); err != nil {
+				t.Fatalf("PutShard(nexus=%d,local=%d): %v", g, i, err)
+			}
+		}
+		if got := nexuses[g].store.Stats().ShardCount; got != int64(groupSize) {
+			t.Fatalf("nexus %d holds %d shards, want %d", g, got, groupSize)
+		}
+	}
+
+	type key struct{ group, index int }
+
+	// readSurvivors gathers every shard that is still present on its Nexus over
+	// real HTTP; missing shards stay nil.
+	readSurvivors := func(lost map[key]bool) [][]byte {
+		t.Helper()
+		out := make([][]byte, geom.TotalShards)
+		for g := 0; g < groups; g++ {
+			for i := 0; i < groupSize; i++ {
+				if lost[key{g, i}] {
+					continue
+				}
+				rc, info, err := c.GetShard(ctx, nexuses[g].srv.URL, setID, g, i)
+				if err != nil {
+					t.Fatalf("GetShard(nexus=%d,local=%d): %v", g, i, err)
+				}
+				got, err := io.ReadAll(rc)
+				rc.Close()
+				if err != nil {
+					t.Fatalf("read shard(nexus=%d,local=%d): %v", g, i, err)
+				}
+				idx := g*groupSize + i
+				if !bytes.Equal(got, shards[idx]) {
+					t.Fatalf("shard(nexus=%d,local=%d) bytes differ from encoder output", g, i)
+				}
+				if info.Checksum != shard.Sum64(got) {
+					t.Fatalf("shard(nexus=%d,local=%d) checksum header mismatch", g, i)
+				}
+				out[idx] = got
+			}
+		}
+		return out
+	}
+	decode := func(lost map[key]bool) ([]byte, error) {
+		return codec.Decode(readSurvivors(lost), geom)
+	}
+
+	lost := map[key]bool{}
+
+	// 1. Baseline through three real Nexuses.
+	decoded, err := decode(lost)
+	if err != nil {
+		t.Fatalf("baseline decode: %v", err)
+	}
+	if !bytes.Equal(decoded, payload) {
+		t.Fatal("baseline decode does not match payload")
+	}
+
+	// 2. Simulate a whole Nexus loss: wipe geo group 1 from its store.
+	for i := 0; i < groupSize; i++ {
+		if _, err := nexuses[1].store.DestroyShard(ctx, setID, 1, i); err != nil {
+			t.Fatalf("DestroyShard(nexus=1,local=%d): %v", i, err)
+		}
+		lost[key{1, i}] = true
+	}
+	if got := nexuses[1].store.Stats().ShardCount; got != 0 {
+		t.Fatalf("lost nexus still holds %d shards", got)
+	}
+	decoded, err = decode(lost)
+	if err != nil {
+		t.Fatalf("decode after whole-nexus loss: %v", err)
+	}
+	if !bytes.Equal(decoded, payload) {
+		t.Fatal("decode after whole-nexus loss does not match payload")
+	}
+
+	// 3. Also lose local_k disks in surviving Nexus 0 (inner reconstruct).
+	for i := 0; i < params.LocalK; i++ {
+		if _, err := nexuses[0].store.DestroyShard(ctx, setID, 0, i); err != nil {
+			t.Fatalf("DestroyShard(nexus=0,local=%d): %v", i, err)
+		}
+		lost[key{0, i}] = true
+	}
+	decoded, err = decode(lost)
+	if err != nil {
+		t.Fatalf("decode after nexus + disk loss: %v", err)
+	}
+	if !bytes.Equal(decoded, payload) {
+		t.Fatal("decode after nexus + disk loss does not match payload")
+	}
+
+	// 4. Losing Nexus 2 as well leaves only 1 of geo_n=2 groups: must fail.
+	for i := 0; i < groupSize; i++ {
+		if _, err := nexuses[2].store.DestroyShard(ctx, setID, 2, i); err != nil {
+			t.Fatalf("DestroyShard(nexus=2,local=%d): %v", i, err)
+		}
+		lost[key{2, i}] = true
+	}
+	if _, err := decode(lost); err == nil {
+		t.Fatal("decode with only one surviving geo group succeeded; want ErrTooFewShards")
+	}
+}

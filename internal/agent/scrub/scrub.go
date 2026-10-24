@@ -299,10 +299,9 @@ func (s *Scrubber) loadCursor() (string, bool) {
 
 // rateLimiter delays reads so the scrub pass stays under BytesPerSec.
 type rateLimiter struct {
-	rate    float64
-	start   time.Time
-	elapsed time.Duration
-	bytes   int64
+	rate  float64
+	start time.Time
+	bytes int64
 }
 
 func newRateLimiter(bytesPerSec int64) *rateLimiter {

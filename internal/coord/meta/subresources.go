@@ -379,6 +379,22 @@ type DeletionItem struct {
 	Reason       string             `json:"reason"`
 	CreatedAt    time.Time          `json:"created_at"`
 	DueAt        time.Time          `json:"due_at"`
+	// GC progress. StartedAt is set once a collector picks the entry up;
+	// AckedEndpoints records which agent endpoints have confirmed deletion. Both
+	// make a retry after a crash cheap: acknowledged endpoints are skipped
+	// instead of being deleted again.
+	StartedAt      *time.Time `json:"started_at,omitempty"`
+	AckedEndpoints []string   `json:"acked_endpoints,omitempty"`
+}
+
+// Acks reports whether an endpoint has already acknowledged deletion.
+func (d DeletionItem) Acks(endpoint string) bool {
+	for _, ep := range d.AckedEndpoints {
+		if ep == endpoint {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) enqueueDeletion(tx *storage.WriteTx, item DeletionItem) error {
@@ -418,6 +434,64 @@ func (s *Service) DrainDeletions(ctx context.Context, now time.Time, limit int) 
 		})
 	})
 	return out, err
+}
+
+// BeginDeletion marks a queue entry as in progress and returns its current
+// progress (including acknowledgements from an earlier pass). The marker is
+// written in the same transaction as the read, so two collectors cannot start
+// the same entry from a stale view.
+func (s *Service) BeginDeletion(ctx context.Context, deletionID uint64, now time.Time) (DeletionItem, error) {
+	var out DeletionItem
+	if err := ctx.Err(); err != nil {
+		return out, err
+	}
+	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+		rec, err := storage.GetJSON[DeletionItem](tx, spaceDeletions, seqKey(nil, deletionID))
+		if errors.Is(err, storage.ErrNotFound) {
+			return coerr.E(404, "NoSuchDeletion", "deletion entry %d does not exist", deletionID)
+		}
+		if err != nil {
+			return err
+		}
+		if rec.StartedAt == nil {
+			t := now.UTC()
+			rec.StartedAt = &t
+			if err := storage.PutJSON(tx, spaceDeletions, seqKey(nil, deletionID), rec); err != nil {
+				return err
+			}
+		}
+		out = rec
+		return nil
+	})
+	return out, err
+}
+
+// AckDeletionEndpoint records one endpoint's successful deletion for an entry.
+// It is idempotent and survives a crash before the final queue removal.
+func (s *Service) AckDeletionEndpoint(ctx context.Context, deletionID uint64, endpoint string) error {
+	if endpoint == "" {
+		return coerr.Invalidf("endpoint is required")
+	}
+	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+		rec, err := storage.GetJSON[DeletionItem](tx, spaceDeletions, seqKey(nil, deletionID))
+		if errors.Is(err, storage.ErrNotFound) {
+			return coerr.E(404, "NoSuchDeletion", "deletion entry %d does not exist", deletionID)
+		}
+		if err != nil {
+			return err
+		}
+		for _, ep := range rec.AckedEndpoints {
+			if ep == endpoint {
+				return nil
+			}
+		}
+		rec.AckedEndpoints = append(rec.AckedEndpoints, endpoint)
+		if rec.StartedAt == nil {
+			t := s.now().UTC()
+			rec.StartedAt = &t
+		}
+		return storage.PutJSON(tx, spaceDeletions, seqKey(nil, deletionID), rec)
+	})
 }
 
 // CompleteDeletion removes a drained entry.
