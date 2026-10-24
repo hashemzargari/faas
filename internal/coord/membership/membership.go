@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/fass-storage/fass/internal/chunk"
 	"github.com/fass-storage/fass/internal/contract"
 	"github.com/fass-storage/fass/internal/coord/coerr"
 	"github.com/fass-storage/fass/internal/coord/id"
@@ -1108,6 +1109,13 @@ func (s *Service) CreateRC(ctx context.Context, rc RedundancyClass) (RedundancyC
 
 // ValidateRC applies ec.Params.Validate plus the coordinator-side feasibility
 // rules from docs/03 §2.2.
+//
+// Chunk sizing follows the real cross-service contract: internal/chunk.ValidateSize
+// (1 MiB aligned, 4–64 MiB). Exact divisibility by geo_n*local_n is deliberately
+// NOT required — ec.Geometry pads each chunk to the coding unit and produces a
+// uniform shard size of ceil(chunk_size/(geo_n*local_n)). Do not re-add a
+// power-of-two or divisibility rule: it is not part of the design and would
+// reject valid profiles such as 6 MiB with (geo 2+1, local 3+1).
 func ValidateRC(rc RedundancyClass) error {
 	if err := rc.Params.Validate(); err != nil {
 		return coerr.Invalidf("invalid redundancy parameters: %v", err)
@@ -1116,15 +1124,14 @@ func ValidateRC(rc RedundancyClass) error {
 	if rc.AAG < 1 || rc.AAG > p.ShardsPerGroup() {
 		return coerr.Invalidf("aag must be in 1..%d (local_n+local_k)", p.ShardsPerGroup())
 	}
-	switch {
-	case rc.ChunkSize < 4<<20 || rc.ChunkSize > 64<<20:
-		return coerr.Invalidf("chunk_size must be between 4 MiB and 64 MiB")
-	case rc.ChunkSize&(rc.ChunkSize-1) != 0:
-		return coerr.Invalidf("chunk_size must be a power of two")
-	case rc.ChunkSize%(p.GeoN*p.LocalN) != 0:
-		return coerr.Invalidf("chunk_size must be divisible by geo_n*local_n (%d)", p.GeoN*p.LocalN)
-	case rc.ChunkSize/(p.GeoN*p.LocalN) < 4096:
-		return coerr.Invalidf("shard size must be at least 4 KiB (chunk_size/(geo_n*local_n) = %d)", rc.ChunkSize/(p.GeoN*p.LocalN))
+	if err := chunk.ValidateSize(rc.ChunkSize); err != nil {
+		return coerr.Invalidf("invalid chunk_size: %v", err)
+	}
+	unit := p.GeoN * p.LocalN
+	shardSize := (rc.ChunkSize + unit - 1) / unit
+	if shardSize < 4096 {
+		return coerr.Invalidf("shard size would be %d bytes (<4 KiB) for chunk_size %d and geo_n*local_n %d",
+			shardSize, rc.ChunkSize, unit)
 	}
 	return nil
 }

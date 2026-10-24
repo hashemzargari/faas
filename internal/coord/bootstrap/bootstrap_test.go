@@ -68,27 +68,35 @@ func TestBootstrapCreatesDevCluster(t *testing.T) {
 	if payload.Region != "eu-west-1" || payload.TenantID != bootstrap.DevTenantID || payload.ProjectID != bootstrap.DevProjectID {
 		t.Fatalf("payload tenant/region = %+v", payload)
 	}
-	if len(payload.Agents) != 6 {
-		t.Fatalf("payload agents = %d, want 6", len(payload.Agents))
+	if len(payload.Agents) != 12 {
+		t.Fatalf("payload agents = %d, want 12", len(payload.Agents))
 	}
-	seenNode := map[string]bool{}
+	seenSlot := map[string]bool{}
+	perNode := map[contract.NodeID]int{}
 	for _, ag := range payload.Agents {
 		if ag.NodeID == "" || ag.NexusID == "" || ag.DiskID == "" || ag.Secret == "" {
 			t.Fatalf("incomplete agent payload: %+v", ag)
 		}
-		if seenNode[string(ag.NodeID)] {
-			t.Fatalf("duplicate node %s", ag.NodeID)
+		slot := string(ag.NodeID) + "/" + ag.DiskID
+		if seenSlot[slot] {
+			t.Fatalf("duplicate agent slot %s", slot)
 		}
-		seenNode[string(ag.NodeID)] = true
+		seenSlot[slot] = true
+		perNode[ag.NodeID]++
+	}
+	for node, n := range perNode {
+		if n != 2 {
+			t.Fatalf("node %s has %d agents, want 2", node, n)
+		}
 	}
 	// Nexus ordering and composition.
-	wantNexus := map[string]int{"nexus-a": 2, "nexus-b": 2, "nexus-c": 2}
+	wantNexus := map[string]int{"nexus-a": 4, "nexus-b": 4, "nexus-c": 4}
 	for _, ag := range payload.Agents {
 		wantNexus[string(ag.NexusID)]--
 	}
 	for nx, left := range wantNexus {
 		if left != 0 {
-			t.Fatalf("nexus %s has %d unexpected agent slots", nx, 2-left)
+			t.Fatalf("nexus %s has an unexpected number of agent slots (left=%d)", nx, left)
 		}
 	}
 
@@ -97,17 +105,17 @@ func TestBootstrapCreatesDevCluster(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRC: %v", err)
 	}
-	if rc.Params != (ec.Params{GeoN: 2, GeoK: 1, LocalN: 1, LocalK: 1}) || rc.AAG != 1 || rc.ChunkSize != 4<<20 {
+	if rc.Params != (ec.Params{GeoN: 2, GeoK: 1, LocalN: 3, LocalK: 1}) || rc.AAG != 2 || rc.ChunkSize != 6<<20 {
 		t.Fatalf("dev RC = %+v", rc)
 	}
 	ring, err := f.mem.GetRing(ctx, bootstrap.DevRingID)
 	if err != nil {
 		t.Fatalf("GetRing: %v", err)
 	}
-	if len(ring.AgentIDs) != 6 || len(ring.NexusIDs) != 3 {
+	if len(ring.AgentIDs) != 12 || len(ring.NexusIDs) != 3 {
 		t.Fatalf("ring = %d agents over %d nexuses", len(ring.AgentIDs), len(ring.NexusIDs))
 	}
-	if ring.Capacity != 6*bootstrap.DevAgentCapacity {
+	if ring.Capacity != 12*bootstrap.DevAgentCapacity {
 		t.Fatalf("ring capacity = %d", ring.Capacity)
 	}
 	for _, aid := range ring.AgentIDs {
@@ -174,6 +182,7 @@ func TestBootstrapIsIdempotentAndNeverInvalidatesActiveAgents(t *testing.T) {
 	target := first.Agents[0]
 	agentID, secret, minted, err := f.mem.EnsurePending(ctx, membership.PendingRegistration{
 		NodeID:        target.NodeID,
+		Slot:          target.DiskID,
 		CapacityBytes: bootstrap.DevAgentCapacity,
 	})
 	if err != nil || !minted || secret == "" {
@@ -206,7 +215,7 @@ func TestBootstrapIsIdempotentAndNeverInvalidatesActiveAgents(t *testing.T) {
 	}
 	var activeSecret string
 	for _, ag := range second.Agents {
-		if ag.NodeID == target.NodeID {
+		if ag.NodeID == target.NodeID && ag.DiskID == target.DiskID {
 			activeSecret = ag.Secret
 			continue
 		}
@@ -262,13 +271,13 @@ func TestBootstrapRejectsChangedRC(t *testing.T) {
 
 func TestDevConfigMatchesDocumentedTopology(t *testing.T) {
 	cfg := bootstrap.DevConfig("")
-	if cfg.NodesPerNexus != 2 || len(cfg.Nexuses) != 3 {
-		t.Fatalf("dev topology = %d nexuses × %d nodes", len(cfg.Nexuses), cfg.NodesPerNexus)
+	if cfg.NodesPerNexus != 2 || cfg.AgentsPerNode != 2 || len(cfg.Nexuses) != 3 {
+		t.Fatalf("dev topology = %d nexuses × %d nodes × %d agents", len(cfg.Nexuses), cfg.NodesPerNexus, cfg.AgentsPerNode)
 	}
-	if cfg.Params != (ec.Params{GeoN: 2, GeoK: 1, LocalN: 1, LocalK: 1}) {
+	if cfg.Params != (ec.Params{GeoN: 2, GeoK: 1, LocalN: 3, LocalK: 1}) {
 		t.Fatalf("dev params = %+v", cfg.Params)
 	}
-	if cfg.AAG != 1 || cfg.ChunkSize != 4<<20 {
+	if cfg.AAG != 2 || cfg.ChunkSize != 6<<20 {
 		t.Fatalf("dev aag/chunk = %d/%d", cfg.AAG, cfg.ChunkSize)
 	}
 }

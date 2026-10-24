@@ -1,8 +1,12 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/fass-storage/fass/internal/agent/store"
+	"github.com/fass-storage/fass/internal/contract"
 )
 
 func TestParseFlagsDefaults(t *testing.T) {
@@ -82,5 +86,55 @@ func TestParseFlagsVersion(t *testing.T) {
 	}
 	if !cfg.showVersion {
 		t.Fatal("--version not honoured")
+	}
+}
+
+func TestBuildHeartbeatReportsBoundDiskID(t *testing.T) {
+	stats := store.Stats{FreeBytes: 100, UsedBytes: 200, ShardCount: 3, SetCount: 1}
+	now := time.Unix(1_726_000_000, 0).UTC()
+
+	hb, err := buildHeartbeat("agent-1", "disk-bound", "", stats, 0.25, "cursor-1", now)
+	if err != nil {
+		t.Fatalf("buildHeartbeat: %v", err)
+	}
+	if hb.DiskID != "disk-bound" {
+		t.Fatalf("DiskID = %q, want the bound id", hb.DiskID)
+	}
+	if hb.AgentID != "agent-1" || hb.FreeBytes != 100 || hb.UsedBytes != 200 ||
+		hb.ShardCount != 3 || hb.LoadEWMA != 0.25 || hb.ScrubCursor != "cursor-1" ||
+		!hb.Time.Equal(now) {
+		t.Fatalf("heartbeat = %+v", hb)
+	}
+	if hb.InventoryDigest == "" {
+		t.Fatal("empty inventory digest")
+	}
+
+	// An explicit flag that matches the bound identity is fine and still reports
+	// the bound value.
+	hb, err = buildHeartbeat("agent-1", "disk-bound", "disk-bound", stats, 0, "", now)
+	if err != nil {
+		t.Fatalf("matching flag: %v", err)
+	}
+	if hb.DiskID != "disk-bound" {
+		t.Fatalf("DiskID with matching flag = %q", hb.DiskID)
+	}
+}
+
+func TestBuildHeartbeatFailsLoudlyOnDivergence(t *testing.T) {
+	stats := store.Stats{}
+	now := time.Now().UTC()
+
+	// The flag must never override a different bound identity.
+	_, err := buildHeartbeat(contract.AgentID("agent-1"), "disk-bound", "disk-flag", stats, 0, "", now)
+	if err == nil {
+		t.Fatal("divergent disk identity did not fail")
+	}
+	if !strings.Contains(err.Error(), "disk-bound") || !strings.Contains(err.Error(), "disk-flag") {
+		t.Fatalf("error does not name both identities: %v", err)
+	}
+
+	// An agent with no bound identity must not heartbeart at all.
+	if _, err := buildHeartbeat("agent-1", "", "", stats, 0, "", now); err == nil {
+		t.Fatal("heartbeat with empty bound disk id succeeded")
 	}
 }

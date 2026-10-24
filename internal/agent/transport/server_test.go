@@ -605,3 +605,31 @@ func TestMissingContentLengthRejected(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+func TestStatsAndHealthReportBoundDiskID(t *testing.T) {
+	const want = "disk-explicit-42"
+	_, ts, st, _ := newTestServer(t, store.Options{DiskID: want})
+	if got := st.DiskID(); got != want {
+		t.Fatalf("store DiskID = %q, want %q", got, want)
+	}
+
+	resp, err := ts.Client().Get(ts.URL + "/v1/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stats statsResponse
+	readJSON(t, resp, &stats)
+	if stats.DiskID != want {
+		t.Fatalf("stats disk_id = %q, want %q", stats.DiskID, want)
+	}
+
+	resp, err = ts.Client().Get(ts.URL + "/v1/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var health healthResponse
+	readJSON(t, resp, &health)
+	if health.DiskID != want {
+		t.Fatalf("healthz disk_id = %q, want %q", health.DiskID, want)
+	}
+}

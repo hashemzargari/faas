@@ -133,11 +133,12 @@ func TestAnnounceHeartbeatShardStatus(t *testing.T) {
 	}
 
 	if err := c.Heartbeat(context.Background(), contract.Heartbeat{
-		AgentID: "agent-1", FreeBytes: 10, UsedBytes: 20, ShardCount: 3,
+		AgentID: "agent-1", DiskID: "disk-abc", FreeBytes: 10, UsedBytes: 20, ShardCount: 3,
 	}); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
-	if body := rec.body(t, "/v1/agents/heartbeat"); !bytes.Contains(body, []byte(`"agent_id":"agent-1"`)) {
+	if body := rec.body(t, "/v1/agents/heartbeat"); !bytes.Contains(body, []byte(`"agent_id":"agent-1"`)) ||
+		!bytes.Contains(body, []byte(`"disk_id":"disk-abc"`)) {
 		t.Fatalf("heartbeat body = %s", body)
 	}
 

@@ -307,6 +307,7 @@ type Coordinator interface {
 	CommitPart(ctx context.Context, up UploadID, partNumber int, etag string, size int64, chunks []ChunkRef, enc EncryptionMeta) error
 	ListParts(ctx context.Context, up UploadID) ([]PartInfo, error)
 	ListUploads(ctx context.Context, bucketID BucketID) ([]UploadInfo, error)
+	GetUpload(ctx context.Context, up UploadID) (UploadInfo, error)
 	CompleteUpload(ctx context.Context, up UploadID) (CommitResult, error)
 	AbortUpload(ctx context.Context, up UploadID) error
 
@@ -334,9 +335,13 @@ type ACL struct {
 }
 
 type UploadInfo struct {
-	UploadID     UploadID  `json:"upload_id"`
-	BucketID     BucketID  `json:"bucket_id"`
-	Key          string    `json:"key"`
+	UploadID UploadID `json:"upload_id"`
+	BucketID BucketID `json:"bucket_id"`
+	Key      string   `json:"key"`
+	// VersionID is the version id the gateway minted at CreateMultipartUpload.
+	// UploadPart binds it in the chunk AAD, and CompleteUpload promotes it to the
+	// manifest, so parts can never be spliced across object versions.
+	VersionID    VersionID `json:"version_id"`
 	Initiated    time.Time `json:"initiated"`
 	StorageClass string    `json:"storage_class"`
 }

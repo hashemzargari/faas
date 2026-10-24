@@ -303,16 +303,26 @@ func TestRedundancyClassValidation(t *testing.T) {
 			msg:     "aag",
 		},
 		{
-			name:    "chunk not divisible",
-			rc:      membership.RedundancyClass{Name: "bad", Params: ec.Params{GeoN: 2, GeoK: 0, LocalN: 3, LocalK: 1}, AAG: 1, ChunkSize: 4 << 20},
+			name: "chunk not divisible by coding unit is allowed (ec pads)",
+			rc:   membership.RedundancyClass{Name: "six-mib", Params: ec.Params{GeoN: 2, GeoK: 1, LocalN: 3, LocalK: 1}, AAG: 2, ChunkSize: 6 << 20},
+		},
+		{
+			name:    "chunk not 1 MiB aligned",
+			rc:      membership.RedundancyClass{Name: "bad", Params: ec.Params{GeoN: 2, GeoK: 1, LocalN: 3, LocalK: 1}, AAG: 2, ChunkSize: 6<<20 + 512<<10},
 			wantErr: true,
-			msg:     "divisible",
+			msg:     "chunk_size",
 		},
 		{
 			name:    "chunk too small",
 			rc:      membership.RedundancyClass{Name: "bad", Params: ec.Params{GeoN: 1, GeoK: 0, LocalN: 2, LocalK: 1}, AAG: 1, ChunkSize: 2 << 20},
 			wantErr: true,
-			msg:     "4 MiB",
+			msg:     "chunk",
+		},
+		{
+			name:    "degenerate shard size below 4 KiB",
+			rc:      membership.RedundancyClass{Name: "bad", Params: ec.Params{GeoN: 16, GeoK: 0, LocalN: 128, LocalK: 0}, AAG: 1, ChunkSize: 4 << 20},
+			wantErr: true,
+			msg:     "shard size",
 		},
 	}
 	for _, tt := range tests {

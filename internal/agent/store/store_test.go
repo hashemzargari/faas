@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -617,5 +618,113 @@ func TestCompactionKeepsIndexCorrect(t *testing.T) {
 	s2 := openTestStore(t, Options{Root: root})
 	if len(s2.idx) != live {
 		t.Fatalf("after replay inside = %d, want %d", len(s2.idx), live)
+	}
+}
+
+func TestDiskIDFlagOnFreshDisk(t *testing.T) {
+	const want = "disk-authoritative-0001"
+	root := t.TempDir()
+
+	s := openTestStore(t, Options{Root: root, DiskID: want})
+	if got := s.DiskID(); got != want {
+		t.Fatalf("DiskID = %q, want %q", got, want)
+	}
+
+	// The explicit identity must be persisted, not regenerated.
+	raw, err := os.ReadFile(filepath.Join(root, "state.json"))
+	if err != nil {
+		t.Fatalf("read state.json: %v", err)
+	}
+	var persisted State
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatalf("parse state.json: %v", err)
+	}
+	if persisted.DiskID != want {
+		t.Fatalf("persisted disk id = %q, want %q", persisted.DiskID, want)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A restart without the flag keeps the identity...
+	s2 := openTestStore(t, Options{Root: root})
+	if got := s2.DiskID(); got != want {
+		t.Fatalf("after restart without flag: DiskID = %q, want %q", got, want)
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// ...and so does a restart with the same flag.
+	s3 := openTestStore(t, Options{Root: root, DiskID: want})
+	if got := s3.DiskID(); got != want {
+		t.Fatalf("after restart with matching flag: DiskID = %q, want %q", got, want)
+	}
+}
+
+func TestDiskIDFlagConflictFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	const persistedID = "disk-alpha"
+	const otherID = "disk-beta"
+
+	s := openTestStore(t, Options{Root: root, DiskID: persistedID})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Open(context.Background(), Options{
+		Root:   root,
+		DiskID: otherID,
+		Logger: testLogger(),
+	})
+	if err == nil {
+		t.Fatal("Open with conflicting --disk-id succeeded; must fail closed")
+	}
+	if !errors.Is(err, ErrDiskIDMismatch) {
+		t.Fatalf("err = %v, want ErrDiskIDMismatch", err)
+	}
+	if !strings.Contains(err.Error(), persistedID) || !strings.Contains(err.Error(), otherID) {
+		t.Fatalf("error does not name both ids: %v", err)
+	}
+
+	// The persisted identity must not have been overridden by the flag.
+	raw, err := os.ReadFile(filepath.Join(root, "state.json"))
+	if err != nil {
+		t.Fatalf("read state.json: %v", err)
+	}
+	var persisted State
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.DiskID != persistedID {
+		t.Fatalf("state.json was changed to %q by the rejected flag", persisted.DiskID)
+	}
+
+	// The disk is still usable under its real identity.
+	s2 := openTestStore(t, Options{Root: root})
+	if got := s2.DiskID(); got != persistedID {
+		t.Fatalf("DiskID after rejected override = %q, want %q", got, persistedID)
+	}
+}
+
+func TestDiskIDValidation(t *testing.T) {
+	cases := []string{
+		" leading-space",
+		"trailing-space ",
+		strings.Repeat("x", maxDiskIDLen+1),
+		"control\x00char",
+		"line\nbreak",
+	}
+	for _, bad := range cases {
+		t.Run(bad, func(t *testing.T) {
+			_, err := Open(context.Background(), Options{
+				Root:   t.TempDir(),
+				DiskID: bad,
+				Logger: testLogger(),
+			})
+			if !errors.Is(err, ErrBadRequest) {
+				t.Fatalf("Open(disk_id=%q) err = %v, want ErrBadRequest", bad, err)
+			}
+		})
 	}
 }

@@ -9,11 +9,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fass-storage/fass/internal/contract"
 	"github.com/fass-storage/fass/internal/ec"
 	"github.com/fass-storage/fass/internal/gateway/authz"
 	"github.com/fass-storage/fass/internal/gateway/s3"
+	"github.com/fass-storage/fass/internal/gateway/sigv4"
 )
 
 var errAccessDenied = fmt.Errorf("%w: test policy denies", authz.ErrAccessDenied)
@@ -609,4 +611,94 @@ func TestPutRejectsSSECAndBadStorageClass(t *testing.T) {
 		t.Fatalf("storage class: %d", rec.Code)
 	}
 	mustContain(t, rec.Body.String(), "<Code>InvalidStorageClass</Code>")
+}
+
+// TestPutObjectStreamingSignedChunks drives a real STREAMING-AWS4-HMAC-SHA256-
+// PAYLOAD body through the complete edge: SigV4 verification, chunked-body
+// decoding, the S3 handler and the offloader seam. This is the aws-cli path.
+func TestPutObjectStreamingSignedChunks(t *testing.T) {
+	coord := newFakeCoord()
+	if err := coord.CreateBucket(t.Context(), bucketCfg("streambkt")); err != nil {
+		t.Fatal(err)
+	}
+	off := &fakeOffloader{coord: coord}
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	verifier := authz.New(coord, authz.Options{Now: func() time.Time { return now }})
+	srv := s3.New(s3.Deps{
+		Coord: coord, Authn: verifier, Authz: verifier, Off: off,
+		Config: s3.Config{
+			Region: "eu-west-1", Addressing: s3.AddressingBoth, ServerVersion: "test",
+			Limits: s3.DefaultLimits(), Compat: s3.DefaultCompat(), ChunkSize: 4 << 20,
+		},
+		Now: func() time.Time { return now },
+	})
+
+	payload := []byte("streamed payload from a chunked-signed client")
+	req := httptest.NewRequest(http.MethodPut, "http://s3.test.local/streambkt/streamed.bin", nil)
+	if err := sigv4.SignRequest(req, "AKIATEST", "secret", now, sigv4.PayloadStreaming); err != nil {
+		t.Fatal(err)
+	}
+	auth := req.Header.Get("Authorization")
+	i := strings.LastIndex(auth, "Signature=")
+	if i < 0 {
+		t.Fatalf("no signature in %q", auth)
+	}
+	seed := auth[i+len("Signature="):]
+
+	scope := sigv4.NewScope(now, "eu-west-1", "s3")
+	key := sigv4.SigningKey("secret", scope)
+	amzDate := now.Format("20060102T150405Z")
+	prev := seed
+	var body bytes.Buffer
+	// Two payload chunks plus the terminating zero chunk.
+	for _, part := range [][]byte{payload[:20], payload[20:]} {
+		sts := "AWS4-HMAC-SHA256-PAYLOAD\n" + amzDate + "\n" + scope.String() + "\n" +
+			prev + "\n" + sigv4.EmptyStringSHA256 + "\n" + sigv4.HashPayload(part)
+		sig := sigv4.Sign(key, sts)
+		fmt.Fprintf(&body, "%x;chunk-signature=%s\r\n", len(part), sig)
+		body.Write(part)
+		body.WriteString("\r\n")
+		prev = sig
+	}
+	emptySTS := "AWS4-HMAC-SHA256-PAYLOAD\n" + amzDate + "\n" + scope.String() + "\n" +
+		prev + "\n" + sigv4.EmptyStringSHA256 + "\n" + sigv4.EmptyStringSHA256
+	fmt.Fprintf(&body, "0;chunk-signature=%s\r\n\r\n", sigv4.Sign(key, emptySTS))
+
+	req.Body = io.NopCloser(bytes.NewReader(body.Bytes()))
+	req.ContentLength = int64(body.Len())
+	req.Header.Set("x-amz-decoded-content-length", fmt.Sprintf("%d", len(payload)))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("streaming PUT: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// The stored object must be the decoded payload.
+	getReq := httptest.NewRequest(http.MethodGet, "http://s3.test.local/streambkt/streamed.bin", nil)
+	if err := sigv4.SignRequest(getReq, "AKIATEST", "secret", now, sigv4.EmptyStringSHA256); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, getReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != string(payload) {
+		t.Fatalf("stored payload = %q, want %q", rec.Body.String(), payload)
+	}
+
+	// A tampered chunk signature must be rejected before the object is written.
+	bad := bytes.Replace(body.Bytes(), []byte(";chunk-signature="), []byte(";chunk-signature=0"), 1)
+	badReq := httptest.NewRequest(http.MethodPut, "http://s3.test.local/streambkt/tampered.bin", nil)
+	if err := sigv4.SignRequest(badReq, "AKIATEST", "secret", now, sigv4.PayloadStreaming); err != nil {
+		t.Fatal(err)
+	}
+	badReq.Body = io.NopCloser(bytes.NewReader(bad))
+	badReq.ContentLength = int64(len(bad))
+	badReq.Header.Set("x-amz-decoded-content-length", fmt.Sprintf("%d", len(payload)))
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, badReq)
+	if rec.Code == http.StatusOK {
+		t.Fatal("tampered streaming body was accepted")
+	}
 }

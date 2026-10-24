@@ -71,8 +71,12 @@ type Config struct {
 	SwarmName string
 	Nexuses   []string
 
-	// NodesPerNexus is the number of nodes (and therefore agents) in each Nexus.
+	// NodesPerNexus is the number of nodes in each Nexus.
 	NodesPerNexus int
+	// AgentsPerNode is the number of disks (agents) on each node. The dev
+	// cluster uses 2 so a genuine (4,3) inner code fits: 2 nodes × 2 agents = 4
+	// shards per Nexus at aag 2.
+	AgentsPerNode int
 
 	TenantID    contract.TenantID
 	TenantName  string
@@ -111,6 +115,7 @@ func DevConfig(dataDir string) Config {
 		SwarmName:       DevSwarmName,
 		Nexuses:         append([]string(nil), DevNexuses...),
 		NodesPerNexus:   2,
+		AgentsPerNode:   2,
 		TenantID:        DevTenantID,
 		TenantName:      DevTenantName,
 		ProjectID:       DevProjectID,
@@ -119,9 +124,9 @@ func DevConfig(dataDir string) Config {
 		AccessKeySecret: DevAccessKeySecret,
 		RCID:            DevRCID,
 		RCName:          DevRCName,
-		Params:          ec.Params{GeoN: 2, GeoK: 1, LocalN: 1, LocalK: 1},
-		AAG:             1,
-		ChunkSize:       4 << 20,
+		Params:          ec.Params{GeoN: 2, GeoK: 1, LocalN: 3, LocalK: 1},
+		AAG:             2,
+		ChunkSize:       6 << 20,
 		RingID:          DevRingID,
 		RingName:        DevRingName,
 		Bucket:          DevBucket,
@@ -172,7 +177,7 @@ func Run(ctx context.Context, m *meta.Service, a *auth.Service, mem *membership.
 	nodeNexus := make(map[contract.NodeID]contract.NexusID)
 	type nodeSlot struct {
 		node membership.Node
-		disk string
+		disk string // operator-facing disk label; also the node-scoped slot key
 	}
 	var slots []nodeSlot
 	for _, nexusName := range cfg.Nexuses {
@@ -195,7 +200,13 @@ func Run(ctx context.Context, m *meta.Service, a *auth.Service, mem *membership.
 				return Payload{}, fmt.Errorf("bootstrap: node %s: %w", nodeID, err)
 			}
 			nodeNexus[nodeID] = nexusID
-			slots = append(slots, nodeSlot{node: node, disk: fmt.Sprintf("disk-%s%d", suffix, i)})
+			for a := 1; a <= cfg.AgentsPerNode; a++ {
+				label := fmt.Sprintf("disk-%s%d", suffix, i)
+				if cfg.AgentsPerNode > 1 {
+					label = fmt.Sprintf("disk-%s%d-%d", suffix, i, a)
+				}
+				slots = append(slots, nodeSlot{node: node, disk: label})
+			}
 		}
 	}
 
@@ -372,6 +383,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.NodesPerNexus <= 0 {
 		c.NodesPerNexus = 2
+	}
+	if c.AgentsPerNode <= 0 {
+		c.AgentsPerNode = 1
 	}
 	if c.SwarmID == "" {
 		c.SwarmID = DevSwarmID

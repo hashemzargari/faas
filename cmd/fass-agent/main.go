@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -388,16 +389,12 @@ func runMembership(
 			return nil
 		case <-ticker.C:
 		}
-		stStats := st.Stats()
-		hb := contract.Heartbeat{
-			AgentID:         res.AgentID,
-			FreeBytes:       stStats.FreeBytes,
-			UsedBytes:       stStats.UsedBytes,
-			ShardCount:      stStats.ShardCount,
-			LoadEWMA:        srv.LoadEWMA(),
-			ScrubCursor:     cursorFn(),
-			InventoryDigest: inventoryDigest(stStats),
-			Time:            time.Now().UTC(),
+		hb, err := buildHeartbeat(res.AgentID, st.DiskID(), cfg.diskID, st.Stats(),
+			srv.LoadEWMA(), cursorFn(), time.Now().UTC())
+		if err != nil {
+			// Identity divergence would make the agent lie about which disk it
+			// serves. Fail the membership loop loudly instead.
+			return fmt.Errorf("heartbeat: %w", err)
 		}
 		if err := coord.Heartbeat(ctx, hb); err != nil {
 			if ctx.Err() != nil {
@@ -406,6 +403,41 @@ func runMembership(
 			logger.Warn("heartbeat failed", "err", err)
 		}
 	}
+}
+
+// buildHeartbeat assembles the heartbeat payload. The reported disk id is
+// always the identity bound to the disk in <disk>/state.json (Store.DiskID()),
+// never the raw --disk-id flag: in a healthy agent they are identical, and if
+// they ever diverge the agent must fail loudly rather than report an identity it
+// is not actually serving.
+func buildHeartbeat(
+	agentID contract.AgentID,
+	boundDiskID string,
+	flagDiskID string,
+	stats store.Stats,
+	loadEWMA float64,
+	scrubCursor string,
+	now time.Time,
+) (contract.Heartbeat, error) {
+	if boundDiskID == "" {
+		return contract.Heartbeat{}, errors.New("agent has no bound disk identity")
+	}
+	if flagDiskID != "" && flagDiskID != boundDiskID {
+		return contract.Heartbeat{}, fmt.Errorf(
+			"disk identity diverged: --disk-id=%q but the store is bound to %q; refusing to heartbeat",
+			flagDiskID, boundDiskID)
+	}
+	return contract.Heartbeat{
+		AgentID:         agentID,
+		DiskID:          boundDiskID,
+		FreeBytes:       stats.FreeBytes,
+		UsedBytes:       stats.UsedBytes,
+		ShardCount:      stats.ShardCount,
+		LoadEWMA:        loadEWMA,
+		ScrubCursor:     scrubCursor,
+		InventoryDigest: inventoryDigest(stats),
+		Time:            now,
+	}, nil
 }
 
 // inventoryDigest is a cheap summary the coordinator compares between reports;
