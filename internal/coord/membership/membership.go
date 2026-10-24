@@ -1446,6 +1446,10 @@ func (s *Service) Snapshot(ctx context.Context, geoFence map[string][]contract.N
 			return err
 		}
 		if err := storage.ScanJSON[Agent](tx, spaceAgents, nil, func(_ []byte, v Agent) error {
+			// Never expose announce-secret material (even its digest) through a
+			// read-only view: only the announce path needs it.
+			v.SecretHash = nil
+			v.SecretExpires = time.Time{}
 			snap.Agents = append(snap.Agents, v)
 			return nil
 		}); err != nil {

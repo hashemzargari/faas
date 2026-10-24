@@ -225,3 +225,33 @@ func TestNewUUIDIsVersion4AndUnique(t *testing.T) {
 		seen[u] = true
 	}
 }
+
+// TestShardSetIDForScoped proves the multipart collision fix: the same chunk
+// index in two different parts must derive different shard-set ids, while the
+// empty scope must keep the historical derivation byte-identical.
+func TestShardSetIDForScoped(t *testing.T) {
+	const (
+		b  = BucketID("bkt")
+		k  = "video.mp4"
+		v  = VersionID("11111111-2222-3333-4444-555555555555")
+		ch = 0
+	)
+	part1 := ShardSetIDForScoped(b, k, v, "part/1", ch)
+	part2 := ShardSetIDForScoped(b, k, v, "part/2", ch)
+	plain := ShardSetIDForScoped(b, k, v, "", ch)
+
+	if part1 == part2 {
+		t.Fatal("different multipart parts must not share a shard-set id")
+	}
+	if part1 == plain || part2 == plain {
+		t.Fatal("a multipart part must not reuse the single-PUT shard-set id")
+	}
+	if plain != ShardSetIDFor(b, k, v, ch) {
+		t.Fatal("empty scope must equal the historical derivation")
+	}
+	// And the historical value must still be the pinned golden one.
+	if got := ShardSetIDFor("bkt-123", "path/to/object.bin",
+		"11111111-2222-3333-4444-555555555555", 7); got != ShardSetID("a80cb7b1-e700-44c6-ac8d-1030564a1bdb") {
+		t.Fatalf("historical derivation changed: %q", got)
+	}
+}

@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/fass-storage/fass/internal/contract"
 	"github.com/fass-storage/fass/internal/coord/coerr"
@@ -201,6 +202,10 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	// The announce-secret digest must never leave the coordinator, even though it
+	// cannot be inverted for a 32-byte random secret.
+	ag.SecretHash = nil
+	ag.SecretExpires = time.Time{}
 	writeJSON(w, r, http.StatusOK, ag)
 }
 

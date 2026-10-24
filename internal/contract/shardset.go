@@ -23,8 +23,25 @@ import (
 // This lives in the contract package (not the gateway) because the dependency
 // direction must be coordinator → contract, never coordinator → gateway.
 func ShardSetIDFor(bucketID BucketID, key string, versionID VersionID, chunkIndex int) ShardSetID {
+	return ShardSetIDForScoped(bucketID, key, versionID, "", chunkIndex)
+}
+
+// ShardSetIDForScoped is ShardSetIDFor with a scope discriminator.
+//
+// scope MUST be empty for a normal single-PUT object, and MUST be unique per
+// multipart part (use "part/<n>"). Without it, every part restarts chunk
+// indices at zero and part 2 derives the same shard-set id as part 1, so its
+// shards collide with part 1's immutable shards and the write fails with 409 —
+// which is exactly the bug that broke every aws-cli upload over the multipart
+// threshold. The empty scope keeps the historical derivation byte-identical,
+// so objects written before this field existed still resolve.
+func ShardSetIDForScoped(bucketID BucketID, key string, versionID VersionID, scope string, chunkIndex int) ShardSetID {
 	h := sha256.New()
 	h.Write([]byte("fass/shardset/v1\x00"))
+	if scope != "" {
+		h.Write([]byte(scope))
+		h.Write([]byte{0})
+	}
 	h.Write([]byte(bucketID))
 	h.Write([]byte{0})
 	h.Write([]byte(key))

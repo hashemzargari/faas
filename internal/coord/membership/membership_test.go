@@ -626,3 +626,33 @@ func TestActivateBeforeAnnounceIsRefused(t *testing.T) {
 		t.Fatalf("refused activation mutated the agent: %+v", ag)
 	}
 }
+
+func TestSnapshotsNeverExposeSecretDigests(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	nx := f.addNexus(t, "site-a")
+	node := f.addNode(t, nx, "host-1")
+	if _, _, err := f.svc.RegisterPending(ctx, membership.PendingRegistration{
+		NodeID: node.ID, DiskID: "disk-1", CapacityBytes: 1 << 40,
+	}); err != nil {
+		t.Fatalf("RegisterPending: %v", err)
+	}
+	snap, err := f.svc.Snapshot(ctx, nil)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(snap.Agents) != 1 {
+		t.Fatalf("agents = %d", len(snap.Agents))
+	}
+	if len(snap.Agents[0].SecretHash) != 0 || !snap.Agents[0].SecretExpires.IsZero() {
+		t.Fatalf("snapshot leaked announce-secret material: %+v", snap.Agents[0])
+	}
+	// The stored record still has the digest; only views are redacted.
+	ag, err := f.svc.GetAgent(ctx, snap.Agents[0].ID)
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if len(ag.SecretHash) == 0 {
+		t.Fatalf("stored agent lost its announce secret digest")
+	}
+}
