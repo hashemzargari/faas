@@ -656,3 +656,67 @@ func TestSnapshotsNeverExposeSecretDigests(t *testing.T) {
 		t.Fatalf("stored agent lost its announce secret digest")
 	}
 }
+
+// TestRingUsageBatchedFlush: per-commit accounting is accumulated in memory and
+// flushed in one transaction; failures retain pending bytes; a deleted ring drops
+// them explicitly (counted, not silently).
+func TestRingUsageBatchedFlush(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	ringID := contract.RingID("ring-batched")
+	if err := f.db.Update(ctx, func(tx storage.Writer) error {
+		return storage.PutJSON(tx, []byte("rings"), []byte(ringID), membership.Ring{ID: ringID, UsedBytes: 10})
+	}); err != nil {
+		t.Fatalf("seed ring: %v", err)
+	}
+	read := func() int64 {
+		var r membership.Ring
+		_ = f.db.View(ctx, func(tx storage.Reader) error {
+			r, _ = storage.GetJSON[membership.Ring](tx, []byte("rings"), []byte(ringID))
+			return nil
+		})
+		return r.UsedBytes
+	}
+
+	f.svc.RecordRingUsage(ringID, 100)
+	f.svc.RecordRingUsage(ringID, -30)
+	if pending, _, _ := f.svc.UsageAccounting(); pending != 70 {
+		t.Fatalf("pending = %d, want 70", pending)
+	}
+	if err := f.svc.FlushRingUsage(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got := read(); got != 80 {
+		t.Fatalf("used bytes = %d, want 80", got)
+	}
+	if pending, _, _ := f.svc.UsageAccounting(); pending != 0 {
+		t.Fatalf("pending after flush = %d", pending)
+	}
+
+	// Failed flush (cancelled context) retains the deltas for retry.
+	f.svc.RecordRingUsage(ringID, 5)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := f.svc.FlushRingUsage(cancelled); err == nil {
+		t.Fatalf("flush with cancelled context unexpectedly succeeded")
+	}
+	if pending, failures, _ := f.svc.UsageAccounting(); pending != 5 || failures == 0 {
+		t.Fatalf("after failed flush pending=%d failures=%d, want pending 5 and >=1 failure", pending, failures)
+	}
+	if err := f.svc.FlushRingUsage(ctx); err != nil {
+		t.Fatalf("retry flush: %v", err)
+	}
+	if got := read(); got != 85 {
+		t.Fatalf("used bytes after retry = %d, want 85", got)
+	}
+
+	// A deleted ring drops pending deltas explicitly.
+	f.svc.RecordRingUsage("ring-gone", 42)
+	if err := f.svc.FlushRingUsage(ctx); err != nil {
+		t.Fatalf("flush for deleted ring: %v", err)
+	}
+	pending, _, dropped := f.svc.UsageAccounting()
+	if pending != 0 || dropped != 42 {
+		t.Fatalf("pending=%d dropped=%d, want 0/42", pending, dropped)
+	}
+}

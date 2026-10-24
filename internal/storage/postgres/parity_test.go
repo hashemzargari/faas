@@ -204,3 +204,52 @@ func TestMetadataKeyWithinBtreeLimit(t *testing.T) {
 		t.Fatalf("max composite key = %d bytes, want < 2048", len(key))
 	}
 }
+
+// TestListingProjectionCost measures the listing access path: the current adapter
+// scans the whole prefix range with no LIMIT and transfers/decodes full JSONB
+// records, while a bounded narrow projection only needs key+size+etag+timestamp.
+func TestListingProjectionCost(t *testing.T) {
+	kv := openTestDB(t)
+	ctx := context.Background()
+	db := kv.DB()
+	const rows = 20000
+	// Seed rows that look like version records (only the projected fields matter).
+	for start := 0; start < rows; start += 1000 {
+		if err := kv.Update(ctx, func(w storage.Writer) error {
+			for i := start; i < start+1000 && i < rows; i++ {
+				key := []byte(fmt.Sprintf("bucket-1\x00key-%06d\x00\x00\x00\x00\x00\x00\x00\x01", i))
+				val := []byte(fmt.Sprintf(`{"key":"key-%06d","size":1024,"etag":"etag-%06d","created_at":"2026-01-01T00:00:00Z","manifest_hash":"h","user_meta":{"a":"b"},"tags":{"x":"y"}}`, i, i))
+				if err := w.Put([]byte("objects_versions"), key, val); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, "ANALYZE kv"); err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	prefix := []byte("bucket-1\x00key-")
+	end := []byte("bucket-1\x00key0") // '0' > '-' so the range covers key-000000..
+	timeQuery := func(name, q string) {
+		start := time.Now()
+		raw, err := db.QueryContext(ctx, q, string("objects_versions"), prefix, end)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		n := 0
+		for raw.Next() {
+			n++
+		}
+		raw.Close()
+		t.Logf("%s: %d rows in %v", name, n, time.Since(start))
+	}
+	// Current adapter shape: full range, full JSONB value transfer.
+	timeQuery("full-jsonb-20000", "SELECT key, value FROM kv WHERE space=$1 AND key >= $2 AND key < $3 ORDER BY key")
+	// Bounded page: what a listing actually needs (max-keys=1000).
+	timeQuery("limited-jsonb-1000", "SELECT key, value FROM kv WHERE space=$1 AND key >= $2 AND key < $3 ORDER BY key LIMIT 1000")
+	// Narrow projection: only the fields a listing renders, pushed down to SQL.
+	timeQuery("limited-projection-1000", "SELECT key, (value->>'size')::bigint, value->>'etag', value->>'created_at' FROM kv WHERE space=$1 AND key >= $2 AND key < $3 ORDER BY key LIMIT 1000")
+}

@@ -23,6 +23,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/fass-storage/fass/internal/chunk"
@@ -285,11 +287,127 @@ var (
 type Service struct {
 	db  storage.Store
 	cfg Config
+
+	// Ring usage is accumulated in memory and flushed in one transaction by a
+	// background loop: a per-commit read-modify-write on the shared ring row
+	// serialised every PUT behind the same lock (and cancelled under
+	// statement_timeout at load, silently dropping accounting). Pending deltas are
+	// retained on flush failure and only dropped when the ring no longer exists.
+	usageMu       sync.Mutex
+	usagePending  map[contract.RingID]int64
+	usageFailures int64
+	usageDropped  int64
 }
 
 // New creates the membership service.
 func New(db storage.Store, cfg Config) *Service {
-	return &Service{db: db, cfg: cfg.withDefaults()}
+	return &Service{db: db, cfg: cfg.withDefaults(), usagePending: map[contract.RingID]int64{}}
+}
+
+// RecordRingUsage adds delta to the in-memory pending ring usage (non-blocking).
+// The background flusher applies it; callers never wait on the database.
+func (s *Service) RecordRingUsage(ringID contract.RingID, delta int64) {
+	if ringID == "" || delta == 0 {
+		return
+	}
+	s.usageMu.Lock()
+	s.usagePending[ringID] += delta
+	s.usageMu.Unlock()
+}
+
+// UsageAccounting reports (pending bytes, flush failures, dropped bytes) for
+// tests and operators. Dropped only happens when the ring no longer exists.
+func (s *Service) UsageAccounting() (int64, int64, int64) {
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	var pending int64
+	for _, v := range s.usagePending {
+		pending += v
+	}
+	return pending, s.usageFailures, s.usageDropped
+}
+
+// FlushRingUsage applies all pending deltas. It is idempotent-ish: a failed
+// flush keeps the deltas pending for the next attempt; deltas added while the
+// flush runs remain pending (only the snapshot is subtracted on success).
+func (s *Service) FlushRingUsage(ctx context.Context) error {
+	s.usageMu.Lock()
+	if len(s.usagePending) == 0 {
+		s.usageMu.Unlock()
+		return nil
+	}
+	snapshot := make(map[contract.RingID]int64, len(s.usagePending))
+	for id, d := range s.usagePending {
+		snapshot[id] = d
+	}
+	s.usageMu.Unlock()
+
+	var dropped []contract.RingID
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
+		for id, delta := range snapshot {
+			r, err := storage.GetJSON[Ring](tx, spaceRings, []byte(id))
+			if errors.Is(err, storage.ErrNotFound) {
+				// The ring is gone; its deltas are dropped explicitly after the
+				// transaction commits (see below), not silently.
+				dropped = append(dropped, id)
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			r.UsedBytes += delta
+			if r.UsedBytes < 0 {
+				r.UsedBytes = 0
+			}
+			if err := storage.PutJSON(tx, spaceRings, []byte(id), r); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		s.usageMu.Lock()
+		s.usageFailures++
+		s.usageMu.Unlock()
+		return err
+	}
+	// Apply the snapshot to the pending map, preserving deltas recorded while the
+	// flush was running.
+	s.usageMu.Lock()
+	for id, delta := range snapshot {
+		s.usagePending[id] -= delta
+		if s.usagePending[id] == 0 {
+			delete(s.usagePending, id)
+		}
+	}
+	for _, id := range dropped {
+		if d := snapshot[id]; d > 0 {
+			s.usageDropped += d
+		}
+	}
+	s.usageMu.Unlock()
+	return nil
+}
+
+// RunUsageFlusher flushes pending ring usage on an interval until ctx ends.
+func (s *Service) RunUsageFlusher(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.FlushRingUsage(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				// Rate-limit the log: one line per flush interval is acceptable, and
+				// the pending bytes are retained (never silently dropped).
+				slog.Default().Warn("ring usage flush failed", "err", err)
+			}
+		}
+	}
 }
 
 // Config returns the effective configuration.

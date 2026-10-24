@@ -126,6 +126,8 @@ func (s *Service) SetMaintenance(on bool) { s.Members.SetMaintenance(on) }
 // this loop only reports backlog; it never drops a queue entry without deleting
 // the shards.
 func (s *Service) RunMaintenance(ctx context.Context) {
+	// Ring usage is flushed once per second (one transaction, not one per PUT).
+	go s.Members.RunUsageFlusher(ctx, time.Second)
 	interval := s.Members.Config().HeartbeatInterval
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -283,9 +285,10 @@ func (s *Service) CommitObject(ctx context.Context, req contract.CommitRequest) 
 			stored += int64(len(c.Slots)) * int64(c.ShardSize)
 		}
 		if stored > 0 {
-			if err := s.Members.AddRingUsage(ctx, req.RingID, stored); err != nil {
-				s.Logger.Warn("ring usage accounting failed", "ring_id", req.RingID, "bytes", stored, "err", err)
-			}
+			// Non-blocking: accumulated in memory and flushed in one transaction by
+			// the maintenance loop. Per-commit read-modify-write on the shared ring
+			// row serialised PUTs and failed under statement_timeout at load.
+			s.Members.RecordRingUsage(req.RingID, stored)
 		}
 	}
 	return res, nil
