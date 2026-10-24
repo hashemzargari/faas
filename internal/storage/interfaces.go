@@ -25,6 +25,15 @@ type Reader interface {
 	Count(space, prefix []byte) (int, error)
 }
 
+// LimitedScanner is an optional capability of read transactions: visit at most
+// limit keys of the prefix range. Implementations must visit keys in the same
+// ascending order as Scan. Callers that need pagination-correct results ask for
+// one more key than the page bound and fall back to Scan when the bound is hit
+// (a marker may need to skip an unbounded number of rows).
+type LimitedScanner interface {
+	ScanLimited(space, prefix []byte, limit int, fn func(key, value []byte) error) error
+}
+
 // Writer is a read/write transaction: reads observe the transaction's own staged
 // writes (read-your-writes), and nothing is durable until Update returns nil.
 type Writer interface {

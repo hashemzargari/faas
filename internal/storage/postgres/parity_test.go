@@ -158,6 +158,7 @@ func TestPostgresIndexUsage(t *testing.T) {
 		{"point-get", "SELECT value FROM kv WHERE space = $1 AND key = $2", []any{"objects_versions", []byte("bucket-0007\x00key-002007")}},
 		{"version-range-scan", "SELECT key, value FROM kv WHERE space = $1 AND key >= $2 AND key < $3 ORDER BY key", []any{"objects_versions", []byte("bucket-0007\x00key-002000"), []byte("bucket-0007\x00key-002100")}},
 		{"prefix-list", "SELECT key, value FROM kv WHERE space = $1 AND key >= $2 AND key < $3 ORDER BY key", []any{"objects_versions", []byte("bucket-0007\x00"), []byte("bucket-0007\x01")}},
+		{"bounded-page", "SELECT key, value FROM kv WHERE space = $1 AND key >= $2 AND key < $3 ORDER BY key LIMIT 101", []any{"objects_versions", []byte("bucket-0007\x00"), []byte("bucket-0007\x01")}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -252,4 +253,41 @@ func TestListingProjectionCost(t *testing.T) {
 	timeQuery("limited-jsonb-1000", "SELECT key, value FROM kv WHERE space=$1 AND key >= $2 AND key < $3 ORDER BY key LIMIT 1000")
 	// Narrow projection: only the fields a listing renders, pushed down to SQL.
 	timeQuery("limited-projection-1000", "SELECT key, (value->>'size')::bigint, value->>'etag', value->>'created_at' FROM kv WHERE space=$1 AND key >= $2 AND key < $3 ORDER BY key LIMIT 1000")
+}
+
+// TestScanLimitedTransfersBoundedRows asserts the adapter's bounded scan visits
+// at most limit keys (the SQL carries LIMIT; the plan test asserts it too).
+func TestScanLimitedTransfersBoundedRows(t *testing.T) {
+	kv := openTestDB(t)
+	ctx := context.Background()
+	if err := kv.Update(ctx, func(w storage.Writer) error {
+		for i := 0; i < 500; i++ {
+			key := []byte(fmt.Sprintf("b\\x00k%04d", i))
+			if err := w.Put([]byte("objects_latest"), key, []byte(`{"key":"x"}`)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := kv.View(ctx, func(r storage.Reader) error {
+		ls, ok := r.(storage.LimitedScanner)
+		if !ok {
+			t.Fatalf("PostgreSQL read tx does not implement LimitedScanner")
+		}
+		n := 0
+		if err := ls.ScanLimited([]byte("objects_latest"), []byte("b\\x00k"), 25, func(_, _ []byte) error {
+			n++
+			return nil
+		}); err != nil {
+			return err
+		}
+		if n != 25 {
+			t.Fatalf("visited %d keys, want 25", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("view: %v", err)
+	}
 }

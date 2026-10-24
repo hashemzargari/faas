@@ -38,6 +38,7 @@ func Run(t *testing.T, store storage.Store) {
 	t.Run("DeleteMarkerReplacement", func(t *testing.T) { testDeleteMarkerReplacement(t, ctx, m) })
 	t.Run("SuspendedNullVersion", func(t *testing.T) { testSuspendedNullVersion(t, ctx, m) })
 	t.Run("PrefixDelimiterPages", func(t *testing.T) { testPrefixDelimiterPages(t, ctx, m) })
+	t.Run("ListingBoundedScans", func(t *testing.T) { testListingBoundedScans(t, ctx, m) })
 	t.Run("ContinuationTokenResume", func(t *testing.T) { testContinuationTokenResume(t, ctx, m) })
 	t.Run("ZeroByteObjects", func(t *testing.T) { testZeroByteObjects(t, ctx, m) })
 	t.Run("ConcurrentCommitsSameKey", func(t *testing.T) { testConcurrentCommits(t, ctx, m) })
@@ -428,4 +429,73 @@ func testConcurrentCommits(t *testing.T, ctx context.Context, m *meta.Service) {
 			t.Fatalf("latest etag = %q, want one of the writers", man.ETag)
 		}
 	})
+}
+
+// testListingBoundedScans covers the two failure modes of a bounded listing:
+// a delimiter that splits mid-group (many raw keys per emitted prefix) and
+// pagination across mutations (adds/deletes between pages must not duplicate or
+// lose keys).
+func testListingBoundedScans(t *testing.T, ctx context.Context, m *meta.Service) {
+	bucket := newBucket(t, m, "")
+	// 40 keys under one delimiter group "g/" and 60 root keys.
+	for i := 0; i < 40; i++ {
+		commit(t, m, commitReq(bucket, fmt.Sprintf("g/%02d", i), fmt.Sprintf("g-%02d", i)))
+	}
+	for i := 0; i < 60; i++ {
+		commit(t, m, commitReq(bucket, fmt.Sprintf("k%02d", i), fmt.Sprintf("k-%02d", i)))
+	}
+	// Delimiter grouping: page size 5 must return 1 CommonPrefix + 4 root keys
+	// without silently dropping the group or over-truncating.
+	page, err := m.ListObjects(ctx, contract.ListRequest{
+		BucketID: bucket.BucketID, Delimiter: "/", MaxKeys: 5,
+	})
+	if err != nil {
+		t.Fatalf("grouped page: %v", err)
+	}
+	if len(page.Entries) != 5 || page.Entries[0].CommonPrefix != "g/" {
+		t.Fatalf("grouped page entries = %+v, want 1 prefix + 4 keys (5 total)", page.Entries)
+	}
+	if !page.IsTruncated {
+		t.Fatalf("grouped page with 61 entries should be truncated")
+	}
+	// Walk all root keys with the continuation token; mutations between pages must
+	// not duplicate or lose pre-existing keys.
+	seen := map[string]bool{}
+	pageIdx := 0
+	var token string
+	for pageIdx < 40 {
+		res, err := m.ListObjects(ctx, contract.ListRequest{
+			BucketID: bucket.BucketID, MaxKeys: 7, ContinuationToken: token,
+		})
+		if err != nil {
+			t.Fatalf("page %d: %v", pageIdx, err)
+		}
+		before := len(seen)
+		for _, e := range res.Entries {
+			if e.CommonPrefix != "" {
+				continue
+			}
+			if seen[e.Key] {
+				t.Fatalf("duplicate key %q across pages", e.Key)
+			}
+			seen[e.Key] = true
+		}
+		_ = before
+		if pageIdx == 1 {
+			// Mutate between pages: add a key after the walk has started and delete
+			// one already seen; the not-yet-seen keys must still all appear.
+			commit(t, m, commitReq(bucket, "zzz-new", "zzz"))
+			if _, _, err := m.DeleteObject(ctx, bucket.Name, "k00", "", false); err != nil {
+				t.Fatalf("delete between pages: %v", err)
+			}
+		}
+		if !res.IsTruncated {
+			break
+		}
+		token = res.NextContinuationToken
+		pageIdx++
+	}
+	if len(seen) < 60 {
+		t.Fatalf("paged walk saw %d root keys, want >= 60 (no lost keys)", len(seen))
+	}
 }

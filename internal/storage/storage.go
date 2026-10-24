@@ -242,6 +242,53 @@ func (tx *ReadTx) Scan(space, prefix []byte, fn func(key, value []byte) error) e
 	return nil
 }
 
+// ScanLimited visits at most limit keys of the prefix range, in key order. The
+// embedded engine bounds its in-memory scan loop; callers must still handle the
+// "bound hit" case (see ScanJSONLimited).
+func (tx *ReadTx) ScanLimited(space, prefix []byte, limit int, fn func(key, value []byte) error) error {
+	if limit <= 0 {
+		return nil
+	}
+	visited := 0
+	err := tx.Scan(space, prefix, func(k, v []byte) error {
+		if visited >= limit {
+			return StopScan()
+		}
+		visited++
+		return fn(k, v)
+	})
+	if errors.Is(err, errStop) {
+		return nil
+	}
+	return err
+}
+
+// ScanJSONLimited is ScanJSON over a bounded read. It asks for limit+1 rows:
+// returning limited=true means the bound was hit and the caller must fall back to
+// an unbounded scan to preserve pagination correctness.
+func ScanJSONLimited[T any](tx Reader, space, prefix []byte, limit int, fn func(key []byte, v T) error) (limited bool, err error) {
+	ls, ok := tx.(LimitedScanner)
+	if !ok || limit <= 0 {
+		return false, ScanJSON[T](tx, space, prefix, fn)
+	}
+	visited := 0
+	scanErr := ls.ScanLimited(space, prefix, limit+1, func(k, raw []byte) error {
+		visited++
+		if visited > limit {
+			return StopScan()
+		}
+		var v T
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return fmt.Errorf("storage: decode %s/%q: %w", space, k, err)
+		}
+		return fn(k, v)
+	})
+	if errors.Is(scanErr, errStop) {
+		return true, nil
+	}
+	return false, scanErr
+}
+
 // Count returns the number of keys in space with prefix.
 func (tx *ReadTx) Count(space, prefix []byte) (int, error) {
 	n := 0

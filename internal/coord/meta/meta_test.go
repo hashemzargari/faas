@@ -1090,3 +1090,58 @@ func TestMaxKeysZeroReturnsEmptyPage(t *testing.T) {
 		t.Fatalf("max-keys=0 = %+v, want empty non-truncated page", res)
 	}
 }
+
+// countingStore wraps a Store and counts keys visited by bounded listing scans.
+type countingStore struct {
+	storage.Store
+	visits *int
+}
+
+func (c countingStore) View(ctx context.Context, fn func(storage.Reader) error) error {
+	return c.Store.View(ctx, func(r storage.Reader) error {
+		return fn(countingReader{Reader: r, visits: c.visits})
+	})
+}
+
+type countingReader struct {
+	storage.Reader
+	visits *int
+}
+
+func (r countingReader) ScanLimited(space, prefix []byte, limit int, fn func(key, value []byte) error) error {
+	ls, ok := r.Reader.(storage.LimitedScanner)
+	if !ok {
+		return r.Reader.Scan(space, prefix, fn)
+	}
+	return ls.ScanLimited(space, prefix, limit, func(k, v []byte) error {
+		*r.visits++
+		return fn(k, v)
+	})
+}
+
+// TestListingScansBoundedRows: a page of 100 from a 5 000-key bucket must visit
+// at most the bounded headroom, not the whole prefix range. This is the assertion
+// that the LIMIT pushdown is actually in effect (the 48.8 ms→3.5 ms measurement).
+func TestListingScansBoundedRows(t *testing.T) {
+	ctx := context.Background()
+	m := newMeta(t)
+	bucket := newBucket(t, m, "")
+	for i := 0; i < 5000; i++ {
+		mustCommit(t, m, commitReq(bucket, fmt.Sprintf("big/%04d", i), chunkSize, makeChunks(t, 1)))
+	}
+	visits := 0
+	counted := meta.New(countingStore{Store: m.DB(), visits: &visits})
+	page, err := counted.ListObjects(ctx, contract.ListRequest{BucketID: bucket.BucketID, Prefix: "big/", MaxKeys: 100})
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	// ScanJSONLimited asks for bound+1 rows to detect a hit; visiting at most
+	// bound+1 still proves the whole 5 000-key range is not transferred.
+	bound := 100*4 + 256 + 1
+	if len(page.Entries) != 100 || !page.IsTruncated {
+		t.Fatalf("page = %d entries truncated=%v, want 100/true", len(page.Entries), page.IsTruncated)
+	}
+	if visits > bound {
+		t.Fatalf("listing visited %d keys, want <= %d (bounded scan not in effect)", visits, bound)
+	}
+}

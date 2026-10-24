@@ -286,3 +286,43 @@ func TestJoinKey(t *testing.T) {
 		t.Fatalf("JoinKeyN = %q", got)
 	}
 }
+
+// TestScanLimitedHonoursLimit: the embedded backend must bound its scan loop, not
+// just the PostgreSQL adapter, or parity hides a dev-backend slowdown.
+func TestScanLimitedHonoursLimit(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open("")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if err := db.Update(ctx, func(tx Writer) error {
+		for i := 0; i < 1000; i++ {
+			if err := tx.Put([]byte("s"), []byte(fmt.Sprintf("k%04d", i)), []byte("v")); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	var visited []string
+	if err := db.View(ctx, func(tx Reader) error {
+		ls, ok := tx.(LimitedScanner)
+		if !ok {
+			t.Fatalf("embedded ReadTx does not implement LimitedScanner")
+		}
+		return ls.ScanLimited([]byte("s"), []byte("k"), 10, func(k, _ []byte) error {
+			visited = append(visited, string(k))
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("ScanLimited: %v", err)
+	}
+	if len(visited) != 10 || visited[0] != "k0000" || visited[9] != "k0009" {
+		t.Fatalf("visited = %v, want first 10 keys in order", visited)
+	}
+}

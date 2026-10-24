@@ -219,7 +219,7 @@ Prometheus handler, which is less code than the abstraction.
 
 ---
 
-## 8. What "done" means for this design phase
+## 8. What "done" means (written before coding; kept as the acceptance record)
 
 - [x] Cubbit's public architecture reverse-engineered and cited (`01`)
 - [x] Service decomposition + data flows + ADRs (`02`)

@@ -246,6 +246,35 @@ func candidateAfter(c candidate, t listToken) bool {
 	return c.seq < t.Seq
 }
 
+// listScanBound is the bounded-scan headroom: delimiter grouping can consume
+// several raw keys per emitted entry, and pagination must detect a next page.
+func listScanBound(maxKeys int) int {
+	b := maxKeys*4 + 256
+	if b < 512 {
+		b = 512
+	}
+	if b > 20000 {
+		b = 20000
+	}
+	return b
+}
+
+// scanJSONBounded scans at most a page-sized bound and falls back to an
+// unbounded scan when the bound was hit. The fallback keeps pagination correct
+// when a marker has to skip an unbounded number of rows; reset must clear the
+// collector state before the fallback scan.
+func scanJSONBounded[T any](tx storage.Reader, space, prefix []byte, bound int, reset func(), fn func([]byte, T) error) error {
+	limited, err := storage.ScanJSONLimited(tx, space, prefix, bound, fn)
+	if err != nil {
+		return err
+	}
+	if limited {
+		reset()
+		return storage.ScanJSON[T](tx, space, prefix, fn)
+	}
+	return nil
+}
+
 func (s *Service) collectCandidates(ctx context.Context, req contract.ListRequest) ([]candidate, error) {
 	if req.Versions {
 		return s.collectVersions(ctx, req)
@@ -258,7 +287,10 @@ func (s *Service) collectLatest(ctx context.Context, req contract.ListRequest) (
 	seenPrefix := make(map[string]bool)
 	scanPrefix := append(bucketPrefix(req.BucketID), req.Prefix...)
 	err := s.db.View(ctx, func(tx storage.Reader) error {
-		return storage.ScanJSON[latestRecord](tx, spaceLatest, scanPrefix, func(k []byte, rec latestRecord) error {
+		return scanJSONBounded(tx, spaceLatest, scanPrefix, listScanBound(req.MaxKeys), func() {
+			out = nil
+			seenPrefix = make(map[string]bool)
+		}, func(k []byte, rec latestRecord) error {
 			key := strings.TrimSuffix(string(k[len(bucketPrefix(req.BucketID)):]), "\x00")
 			if !strings.HasPrefix(key, req.Prefix) {
 				return nil
@@ -303,13 +335,18 @@ func (s *Service) collectVersions(ctx context.Context, req contract.ListRequest)
 	base := bucketPrefix(req.BucketID)
 	scanPrefix := append(append([]byte(nil), base...), req.Prefix...)
 	err := s.db.View(ctx, func(tx storage.Reader) error {
-		if err := storage.ScanJSON[latestRecord](tx, spaceLatest, base, func(_ []byte, rec latestRecord) error {
+		if err := scanJSONBounded(tx, spaceLatest, base, listScanBound(req.MaxKeys), func() {
+			latestByKey = make(map[string]uint64)
+		}, func(_ []byte, rec latestRecord) error {
 			latestByKey[rec.Key] = rec.Seq
 			return nil
 		}); err != nil {
 			return err
 		}
-		return storage.ScanJSON[versionRecord](tx, spaceVersions, scanPrefix, func(k []byte, rec versionRecord) error {
+		return scanJSONBounded(tx, spaceVersions, scanPrefix, listScanBound(req.MaxKeys), func() {
+			out = nil
+			seenPrefix = make(map[string]bool)
+		}, func(k []byte, rec versionRecord) error {
 			key := versionKeyToObjectKey(k, base)
 			if key == "" || !strings.HasPrefix(key, req.Prefix) {
 				return nil
