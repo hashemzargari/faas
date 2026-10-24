@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/fass-storage/fass/internal/contract"
 	"github.com/fass-storage/fass/internal/ec"
 	"github.com/fass-storage/fass/internal/gateway/authz"
+	"github.com/fass-storage/fass/internal/gateway/metrics"
 	"github.com/fass-storage/fass/internal/gateway/s3"
 	"github.com/fass-storage/fass/internal/gateway/sigv4"
 )
@@ -33,6 +35,13 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	h, _ := newHarnessWithMetrics(t)
+	return h
+}
+
+func newHarnessWithMetrics(t *testing.T) (*harness, *metrics.Registry) {
+	t.Helper()
+	reg := metrics.New()
 	coord := newFakeCoord()
 	off := &fakeOffloader{coord: coord}
 	az := &fakeAuthz{}
@@ -48,14 +57,15 @@ func newHarness(t *testing.T) *harness {
 		DefaultRCID:       "rc-default",
 	}
 	srv := s3.New(s3.Deps{
-		Coord:  coord,
-		Authn:  fakeAuthn{},
-		Authz:  az,
-		Off:    off,
-		Config: cfg,
-		Now:    nowUTC,
+		Coord:   coord,
+		Authn:   fakeAuthn{},
+		Authz:   az,
+		Off:     off,
+		Metrics: reg,
+		Config:  cfg,
+		Now:     nowUTC,
 	})
-	return &harness{coord: coord, off: off, authz: az, srv: srv}
+	return &harness{coord: coord, off: off, authz: az, srv: srv}, reg
 }
 
 func (h *harness) do(t *testing.T, method, target string, body io.Reader, headers map[string]string) *httptest.ResponseRecorder {
@@ -71,6 +81,14 @@ func (h *harness) do(t *testing.T, method, target string, body io.Reader, header
 	rec := httptest.NewRecorder()
 	h.srv.ServeHTTP(rec, req)
 	return rec
+}
+
+func (h *harness) mustPutObject(t *testing.T, bucket, key string, body []byte) {
+	t.Helper()
+	rec := h.do(t, http.MethodPut, "/"+bucket+"/"+key, bytes.NewReader(body), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put %s/%s: status %d body %s", bucket, key, rec.Code, rec.Body.String())
+	}
 }
 
 func (h *harness) mustCreateBucket(t *testing.T, name string) {
@@ -1210,5 +1228,82 @@ func TestListObjectsMaxKeysZero(t *testing.T) {
 	}
 	if len(v1.Contents) != 0 || v1.IsTruncated || v1.MaxKeys != 0 {
 		t.Fatalf("v1 max-keys=0 = %+v", v1)
+	}
+}
+
+// TestGetFailureWithinPrefixReturnsXMLError is the silent-data-loss guard: a
+// shard/decode failure before the response status is committed must produce an
+// S3 error envelope, never a truncated 200. Each case is a failure that occurs
+// inside the prefetch window (0 bytes or part of the prefix).
+func TestGetFailureWithinPrefixReturnsXMLError(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		readAfter int
+	}{
+		{name: "first shard fetch fails (0 bytes)", readAfter: 0},
+		{name: "fails partway through the prefix", readAfter: 16 << 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.mustCreateBucket(t, "prefixerr")
+			h.mustPutObject(t, "prefixerr", "k", bytes.Repeat([]byte("x"), 256<<10))
+			h.off.readErr = errors.New("shard unavailable: simulated")
+			h.off.readAfter = tc.readAfter
+
+			rec := h.do(t, http.MethodGet, "/prefixerr/k", nil, nil)
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500 (a clean error, not a truncated 200)\nbody: %s", rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "xml") {
+				t.Fatalf("Content-Type = %q, want XML error envelope", got)
+			}
+			body := rec.Body.String()
+			mustContain(t, body, "<Error>")
+			mustContain(t, body, "<Code>InternalError</Code>")
+			if got := rec.Header().Get("Content-Length"); got != "" {
+				t.Fatalf("stale object Content-Length %q survived the error response", got)
+			}
+			// The object bytes must not leak into the error envelope.
+			if bytes.Contains(rec.Body.Bytes(), bytes.Repeat([]byte("x"), 32)) {
+				t.Fatal("partial object body was written before the error envelope")
+			}
+		})
+	}
+}
+
+// TestGetFailureAfterPrefixIsCounted documents the unavoidable case: once the
+// prefix is flushed the 200 cannot be retracted, so the truncation must at least
+// be observable server-side (counter + log) and detectable client-side
+// (Content-Length is retained).
+func TestGetFailureAfterPrefixIsCounted(t *testing.T) {
+	h, reg := newHarnessWithMetrics(t)
+	h.mustCreateBucket(t, "afterprefix")
+	payload := bytes.Repeat([]byte("y"), 512<<10)
+	h.mustPutObject(t, "afterprefix", "k", payload)
+	h.off.readErr = errors.New("shard went away mid-stream")
+	h.off.readAfter = 64 << 10 // == responsePrefixBytes; failure arrives after commit
+	rec := h.do(t, http.MethodGet, "/afterprefix/k", nil, nil)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (headers were already committed)", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Length"); got != fmt.Sprint(len(payload)) {
+		t.Fatalf("Content-Length = %q, want %d so clients can detect truncation", got, len(payload))
+	}
+	if rec.Body.Len() >= len(payload) {
+		t.Fatalf("expected a truncated body, got %d bytes", rec.Body.Len())
+	}
+	var sb strings.Builder
+	if err := reg.WritePrometheus(&sb); err != nil {
+		t.Fatal(err)
+	}
+	metricsText := sb.String()
+	for _, want := range []string{
+		"s3_response_aborted_total",
+		"fass_gateway_response_aborted_after_headers_total",
+	} {
+		if !strings.Contains(metricsText, want) {
+			t.Fatalf("metric %s missing after an aborted GET:\n%s", want, metricsText)
+		}
 	}
 }

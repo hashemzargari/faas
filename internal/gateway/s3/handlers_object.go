@@ -309,21 +309,131 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, t targe
 		setContentRange(w, rng.Start, rng.Length, manifest.Size)
 	}
 	h.Set("Content-Length", fmt.Sprintf("%d", length))
-	w.WriteHeader(status)
 	if head {
+		w.WriteHeader(status)
 		return
 	}
-	if err := s.off.Read(r.Context(), offloader.ReadRequest{
+
+	// Fetch a bounded prefix *before* committing the status line. A shard-fetch,
+	// decode or decrypt failure in this window is common enough under load (one
+	// failed first shard) and can still be answered honestly with an XML error;
+	// without this, the client receives a truncated 200 and may record the object
+	// as downloaded. The prefix is deliberately small: buffering a whole 6 MiB
+	// chunk would destroy TTFB for large objects, while 64 KiB is enough to cover
+	// the first chunk's first shard fetch.
+	//
+	// Failures after the prefix are unavoidable in HTTP/1.1 without buffering the
+	// entire response; they are counted (s3_response_aborted_total) and logged
+	// with the request id so truncation is visible server-side. Content-Length is
+	// still set, so clients can detect the short body instead of silently
+	// accepting corruption.
+	pr, pw := io.Pipe()
+	readReq := offloader.ReadRequest{
 		Bucket:    t.Bucket,
 		Key:       t.Key,
 		TenantID:  manifest.TenantID,
 		ProjectID: manifest.ProjectID,
 		Manifest:  manifest,
 		Range:     rng,
-	}, w); err != nil && !errors.Is(err, r.Context().Err()) {
-		s.log.Error("object read failed after headers were sent",
-			"request_id", requestIDFromRequest(r), "bucket", t.Bucket, "key", t.Key, "error", err.Error())
 	}
+	readErrCh := make(chan error, 1)
+	go func() {
+		err := s.off.Read(r.Context(), readReq, pw)
+		_ = pw.CloseWithError(err) // nil => io.EOF
+		readErrCh <- err
+	}()
+
+	prefix := make([]byte, 0, responsePrefixBytes)
+	buf := make([]byte, 32<<10)
+	var prefixErr error
+	for len(prefix) < responsePrefixBytes {
+		want := responsePrefixBytes - len(prefix)
+		if want > len(buf) {
+			want = len(buf)
+		}
+		n, err := pr.Read(buf[:want])
+		if n > 0 {
+			prefix = append(prefix, buf[:n]...)
+		}
+		if err != nil {
+			prefixErr = err
+			break
+		}
+	}
+
+	if prefixErr != nil && !errors.Is(prefixErr, io.EOF) {
+		_ = pr.CloseWithError(prefixErr)
+		<-readErrCh // the read goroutine is done; nothing was sent
+		if r.Context().Err() == nil {
+			clearObjectBodyHeaders(h)
+			s.fail(w, r, prefixErr)
+		}
+		return
+	}
+
+	w.WriteHeader(status)
+	if len(prefix) > 0 {
+		if _, err := w.Write(prefix); err != nil {
+			_ = pr.CloseWithError(err)
+			<-readErrCh
+			return
+		}
+	}
+	if prefixErr != nil { // io.EOF: short object, fully buffered
+		<-readErrCh
+		return
+	}
+	if _, err := io.Copy(w, pr); err != nil {
+		_ = pr.CloseWithError(err) // unblock the producer if it is still writing
+		var offErr error
+		select {
+		case offErr = <-readErrCh:
+		default:
+		}
+		if r.Context().Err() == nil {
+			s.abortedAfterHeaders(r, t, offErr, err)
+		}
+		return
+	}
+	<-readErrCh
+}
+
+// responsePrefixBytes bounds how much of a GET body is fetched before the status
+// line is committed (see handleGetObject). Keep it small enough that TTFB is
+// governed by the first shard fetch, not by a whole chunk.
+const responsePrefixBytes = 64 << 10
+
+// clearObjectBodyHeaders removes headers that describe a body which will no
+// longer be sent, so an error envelope is not framed by a stale Content-Length
+// or Content-Range from the aborted object response.
+func clearObjectBodyHeaders(h http.Header) {
+	for _, k := range []string{"Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
+		h.Del(k)
+	}
+}
+
+// abortedAfterHeaders records a GET whose status line and some body were already
+// sent and then failed. It cannot be retracted, so it must be visible: the metric
+// labels the failure class, and the log line carries the request id an operator
+// can correlate with a client-side "unexpected EOF".
+func (s *Server) abortedAfterHeaders(r *http.Request, t target, readErr, writeErr error) {
+	kind := "client_write"
+	if readErr != nil {
+		kind = "offloader_read"
+	}
+	if s.metrics != nil {
+		// Keep the generic counter coord-dev's middleware already exposes, plus a
+		// labelled one so the failure class (read vs client write) is queryable.
+		s.metrics.Inc("fass_gateway_response_aborted_after_headers_total", nil)
+		s.metrics.Inc("s3_response_aborted_total", map[string]string{"reason": kind})
+	}
+	err := writeErr
+	if readErr != nil {
+		err = readErr
+	}
+	s.log.Error("object response aborted after headers were sent; client sees a truncated body (Content-Length still lets it detect this)",
+		"request_id", requestIDFromRequest(r), "bucket", t.Bucket, "key", t.Key,
+		"error_kind", kind, "error", err.Error())
 }
 
 // failHead writes either a full XML error (GET) or only the status (HEAD), as

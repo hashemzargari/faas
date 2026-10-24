@@ -555,6 +555,10 @@ type fakeOffloader struct {
 	next  int
 	// failWrites makes Write fail for tests.
 	failWrites error
+	// readErr/readAfter inject a Read failure: after writing readAfter bytes, Read
+	// returns readErr. readAfter=0 models "the first shard fetch fails".
+	readErr   error
+	readAfter int
 }
 
 func (o *fakeOffloader) Write(ctx context.Context, spec offloader.ObjectSpec, body io.Reader) (contract.CommitResult, error) {
@@ -663,6 +667,18 @@ func (o *fakeOffloader) Read(ctx context.Context, req offloader.ReadRequest, w i
 	o.coord.mu.Lock()
 	data, ok := o.coord.contents[string(req.Manifest.VersionID)]
 	o.coord.mu.Unlock()
+	if o.readErr != nil {
+		limit := o.readAfter
+		if limit > len(data) {
+			limit = len(data)
+		}
+		if limit > 0 {
+			if _, err := w.Write(data[:limit]); err != nil {
+				return err
+			}
+		}
+		return o.readErr
+	}
 	if !ok {
 		return fmt.Errorf("no content for version %s", req.Manifest.VersionID)
 	}
