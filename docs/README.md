@@ -57,7 +57,7 @@ Supporting research: [Cubbit DS3 API report](research/cubbit-ds3-api-report.md) 
 | Shard transport | QUIC + mTLS, one stream per shard |
 | Control transport | gRPC/protobuf |
 | Erasure coding | `klauspost/reedsolomon`, GF(2⁸), two tiers |
-| Metadata | PostgreSQL primary + sync standby (SQLite for dev mode) |
+| Metadata | PostgreSQL primary + sync standby; dependency-free embedded journal store for dev mode |
 | Encryption | AES-256-GCM framed at 1 MiB, HKDF per-chunk keys, envelope-wrapped file keys, KMIP 1.4 |
 | Default redundancy | `geo 2+1`, `local 16+4`, `aag 2` ⇒ 1.875× overhead, survives 1 site |
 | S3 surface | 42 operations supported, 55 explicitly `501` — the Cubbit-published matrix |

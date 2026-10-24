@@ -174,7 +174,7 @@ Dev credentials are `dev-access-key` / `dev-secret-key`, region `eu-west-1`,
 bucket `dev-bucket`, RC `dev-rc`, ring `dev-ring`.
 
 Stop everything with `kill` on the PIDs (the smoke script does it in a `trap`).
-The coordinator's SQLite store lives in `--data-dir`; delete it for a clean
+The coordinator's embedded store (dev mode) lives in `--data-dir`; delete it for a clean
 slate.
 
 ### 2.5 Agent configuration: environment variables and secret files

@@ -365,7 +365,7 @@ Usable capacity = raw / ratio. Shard size per chunk = `chunk / (geo_n × local_n
 | Control transport | **gRPC + protobuf** | typed contracts, streaming for inventory/repair |
 | Erasure coding | `klauspost/reedsolomon` (GF(2⁸), SIMD, GFNI where available) | mature, handles up to 256 shards, `n+k=60` fits comfortably |
 | Metadata store | **PostgreSQL 16** used as a **transactional KV store** (jsonb entity records, `(space,key)` primary key, row locks in transactions); typed relational projection deferred | delivers the things we actually need now — multi-writer, MVCC, WAL, replication, PITR, atomic multi-key commits — without rewriting 152 call sites of proven entity logic. See ADR-3 (revised) |
-| Embedded/dev DB | SQLite (WAL) behind the same repository interface | zero-dependency `fass all` mode; not for production |
+| Embedded/dev DB | Dependency-free journal store (WAL-style) behind the same repository interface | zero-dependency `fass all` mode; not for production. SQLite is deliberately not used (D-C in docs/06) |
 | Shard index (agent) | **Pebble** + raw files on disk | shard bytes are immutable: write-temp → fsync → rename; no WAL needed for payload |
 | Config | YAML + env + flags, single `Config` struct, validated at boot | |
 | Telemetry | Prometheus + OpenTelemetry + `slog` (JSON) | |

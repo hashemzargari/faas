@@ -210,7 +210,7 @@ Prometheus handler, which is less code than the abstraction.
 | # | Question | My default if you don't care |
 |---|---|---|
 | Q1 | **First milestone demo goal:** single-node dev cluster (fast visual progress) or 3-site simulated cluster (proves the actual thesis)? | Start single-node (M0–M3), then 3-site (M4). Both, in that order. |
-| Q2 | **Metadata store:** PostgreSQL (production-grade, external dependency) or embedded-only (zero-dependency `fass all`)? | PostgreSQL primary + SQLite for dev mode |
+| Q2 | **Metadata store:** PostgreSQL (production-grade, external dependency) or embedded-only (zero-dependency `fass all`)? | PostgreSQL primary + embedded journal store for dev mode (originally answered "SQLite"; superseded by D-C) |
 | Q3 | **Scope of v1 S3 surface:** full matrix (adds ~8 d) or core CRUD+multipart+versioning first, lock/lifecycle/tagging in v1.1? | Full matrix, because "exactly reverse engineer it" implies the published surface |
 | Q4 | **Zero-knowledge client SDK** in v1, or gateway-side crypto only (ZK deferred)? | Gateway-side crypto in v1; Go SDK with ZK as v1.1 |
 | Q5 | **Platform target:** Kubernetes operator in v1, or systemd/compose only? | Compose + systemd in v1, operator in v1.1 |

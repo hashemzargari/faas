@@ -99,6 +99,10 @@ The reasoning lives in [`docs/`](docs/README.md):
 
 Stated plainly rather than implied:
 
+- **Dev metadata backend is not SQLite.** The approved design change (D-C in [docs/06](docs/06-delivery-plan.md))
+  replaced it with a dependency-free embedded journal store behind the same repository interface: dev mode
+  keeps the zero-dependency `fass all` story without vendoring a ~40 MB SQLite driver, and it is explicitly
+  dev-grade rather than pretending to production durability.
 - **KMIP/KMS** is not implemented — the tenant key seed is supplied as a hex value and its custody is manual.
 - **Console auth** is a single Basic credential (no RBAC/OIDC/sessions) and is documented as dev-grade.
 - **Kubernetes operator** (`cmd/fass-operator`) is not implemented; the Helm chart covers deployment.

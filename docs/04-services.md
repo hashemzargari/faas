@@ -183,7 +183,7 @@ service Coordinator {
 * **Service accounts**: project-scoped IAM users; secrets shown once, stored as Argon2id; an invited-but-unused account is soft-deleted after 7 days (Cubbit-documented behaviour).
 
 ### 5.2 Metadata Service (`internal/coord/meta`)
-System of record in **PostgreSQL**. Repository interfaces keep SQLite/embedded mode possible. Core tables (§02 §5, full DDL in `docs/schema.sql` when coding starts):
+System of record in **PostgreSQL**. Repository interfaces keep an embedded dev mode possible (see D-C in docs/06 — a dependency-free journal store, not SQLite). Core tables (§02 §5, full DDL in `docs/schema.sql` when coding starts):
 
 `tenants, projects, users, memberships, access_keys, iam_policies, bucket_policies, swarms, nexuses, nodes, agents, disks, rings, redundancy_classes, buckets, objects, object_versions, manifests, shard_sets, shard_displacements, uploads, upload_parts, bucket_acls, object_acls, object_tags, retention, legal_holds, lifecycle_rules, deletion_queue, repair_jobs, usage_hourly, audit_log`
 
