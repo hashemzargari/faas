@@ -139,10 +139,12 @@ Preset roles: `Owner`, `Admin`, `Member`, `ReadOnly`. Policy JSON uses `syntax_v
 Supported: `private`, `public-read`, `public-read-write`, `authenticated-read`, `bucket-owner-read`, `bucket-owner-full-control`. Groups limited to `AllUsers`, `AuthenticatedUsers`. Grantees: user by id or project email.
 
 ### 5.5 Tagging
-Object tagging only (10 tags max, 256-char key/value). **No** inline tagging at `PutObject`/`CreateMultipartUpload`; `GetObject` does not return `x-amz-tagging-count`; `CopyObject` preserves tags but cannot replace them. No bucket tagging.
+Object tagging only (10 tags max, 256-char key/value). `GetObject` does not return `x-amz-tagging-count`; `CopyObject` preserves tags but cannot replace them; no bucket tagging.
+
+**Inline tagging at upload (`x-amz-tagging`) is honoured** — an intentional superset of Cubbit, which accepts and ignores the header (see §9, divergence D8). Rationale: accepting a header and silently discarding its effect is a correctness trap, and every mainstream client that sets it expects the tags to exist. This reconciles the earlier contradiction between §4 and §5.5: §4 (honoured) is the normative behaviour, and `compat: cubbit-strict` must ignore it for parity testing.
 
 ### 5.6 Lifecycle (partial by design)
-* Rules: `Expiration` and `NoncurrentVersionExpiration` only.
+* Rules: `Expiration`, `NoncurrentVersionExpiration` and `ExpiredObjectDeleteMarker` only. (Transitions, `NoncurrentVersionTransition`, `AbortIncompleteMultipartUpload`, `Filter` and `Prefix` remain rejected.)
 * **No** `Filter`, `Prefix`, `Transition`, `NoncurrentVersionTransition`, `AbortIncompleteMultipartUpload`.
 * `Expiration.Date` must be **midnight UTC**; `ExpiredObjectDeleteMarker` cannot be combined with `Date`/`Days`.
 * Expiry surfaces on `HEAD`/`GET` as `x-amz-expiration: expiry-date="…", rule-id="…"`.
@@ -229,6 +231,7 @@ Range/precondition precedence (documented because clients depend on it): auth �
 | D5 | `Content-Language`/`Expires` **stored** | harmless, more AWS-compatible | none |
 | D6 | Public-read ACLs **work** | Cubbit's limitation is a gap, not a feature | none |
 | D7 | Bucket-policy S3 APIs remain unsupported (matching Cubbit) but a `--enable-bucket-policy-api` flag can turn them on | surface parity by default, escape hatch available | none |
+| D8 | `x-amz-tagging` at upload is **honoured** rather than accepted-and-ignored, and `x-amz-tagging-directive` on copy is honoured | silently discarding a header whose effect clients assume exists is a correctness trap | tags may appear where Cubbit would have none; `cubbit-strict` disables it |
 
 Everything in D1–D4 is guarded by a single config block so a strict-parity mode (`compat: cubbit-strict`) can reproduce Cubbit's behaviour exactly for conformance testing:
 ```yaml
