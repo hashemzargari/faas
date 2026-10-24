@@ -30,7 +30,18 @@ func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request, _ tar
 		Owner: xmlOwner{ID: ownerIDFromIdentity(id), DisplayName: ownerDisplayName(id)},
 	}
 	for _, b := range buckets {
-		res.Buckets.Bucket = append(res.Buckets.Bucket, bucketXML{Name: b.Name})
+		created := b.CreatedAt
+		if created.IsZero() {
+			// Legacy/back-filled bucket: emit a parseable epoch rather than an
+			// empty <CreationDate>, which aws-sdk-go-v2 (and therefore rclone)
+			// treats as a hard deserialisation error.
+			s.warnMissingBucketDate(b.Name)
+			created = time.Unix(0, 0)
+		}
+		res.Buckets.Bucket = append(res.Buckets.Bucket, bucketXML{
+			Name:         b.Name,
+			CreationDate: xmlTime(created),
+		})
 	}
 	writeXML(w, http.StatusOK, res)
 }
@@ -83,6 +94,8 @@ func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, t ta
 		Region:      region,
 		Ownership:   "ObjectWriter",
 		DefaultRCID: s.cfg.DefaultRCID,
+		// S3 requires a parseable CreationDate; the coordinator may normalise it.
+		CreatedAt: s.now().UTC(),
 	}
 	if strings.EqualFold(r.Header.Get("x-amz-bucket-object-lock-enabled"), "true") {
 		cfg.ObjectLock = true
@@ -574,6 +587,14 @@ func validateLifecycle(body []byte) *APIError {
 		}
 	}
 	return nil
+}
+
+// warnMissingBucketDate logs once per bucket that has no creation timestamp.
+func (s *Server) warnMissingBucketDate(bucket string) {
+	if _, loaded := s.warnedZeroDates.LoadOrStore(bucket, struct{}{}); !loaded {
+		s.log.Warn("bucket has no CreatedAt; emitting epoch <CreationDate> for S3 compatibility",
+			"bucket", bucket)
+	}
 }
 
 // ownerIDFromIdentity is the owner id used before a bucket exists.

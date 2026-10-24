@@ -148,6 +148,10 @@ type Server struct {
 	// round trip per part.
 	uploadsMu    sync.Mutex
 	uploadsCache map[contract.UploadID]cachedUpload
+
+	// warnedZeroDates deduplicates the compatibility warning for legacy buckets
+	// without a creation timestamp.
+	warnedZeroDates sync.Map
 }
 
 // New builds a Server. It panics only on programmer error (nil coordinator),

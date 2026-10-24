@@ -138,6 +138,9 @@ func TestBootstrapCreatesDevCluster(t *testing.T) {
 	if bucket.TenantID != bootstrap.DevTenantID || bucket.ProjectID != bootstrap.DevProjectID || bucket.DefaultRCID != bootstrap.DevRCID {
 		t.Fatalf("bucket = %+v", bucket)
 	}
+	if bucket.CreatedAt.IsZero() {
+		t.Fatalf("dev bucket has no creation time (breaks S3 ListBuckets clients)")
+	}
 	if _, err := f.m.GetTenant(ctx, bootstrap.DevTenantID); err != nil {
 		t.Fatalf("GetTenant: %v", err)
 	}

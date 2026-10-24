@@ -226,11 +226,31 @@ func TestCoordinatorEndToEnd(t *testing.T) {
 	if bucket.BucketID == "" {
 		t.Fatalf("bucket id not assigned")
 	}
+	if bucket.CreatedAt.IsZero() {
+		t.Fatalf("CreateBucket response has no created_at (breaks S3 ListBuckets clients)")
+	}
 	var got contract.BucketConfig
 	resp = h.doJSON("GET", "/v1/buckets/e2e-bucket", nil, &got)
 	h.mustStatus(resp, http.StatusOK)
 	if got.Name != "e2e-bucket" || got.Region != "eu-west-1" {
 		t.Fatalf("bucket read back = %+v", got)
+	}
+	if !got.CreatedAt.Equal(bucket.CreatedAt) || got.CreatedAt.IsZero() {
+		t.Fatalf("bucket created_at changed between create and get: %v vs %v", bucket.CreatedAt, got.CreatedAt)
+	}
+	var listedBuckets struct {
+		Buckets []contract.BucketConfig `json:"buckets"`
+	}
+	resp = h.doJSON("GET", "/v1/buckets", nil, &listedBuckets)
+	h.mustStatus(resp, http.StatusOK)
+	foundCreatedAt := false
+	for _, b := range listedBuckets.Buckets {
+		if b.Name == "e2e-bucket" {
+			foundCreatedAt = !b.CreatedAt.IsZero() && b.CreatedAt.Equal(got.CreatedAt)
+		}
+	}
+	if !foundCreatedAt {
+		t.Fatalf("ListBuckets returned no/zero/creation-time-mismatched e2e-bucket: %+v", listedBuckets.Buckets)
 	}
 
 	// ---- Commit objects ---------------------------------------------------

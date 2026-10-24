@@ -109,6 +109,7 @@ func TestListBucketsXML(t *testing.T) {
 	mustContain(t, body, `<Name>alpha</Name>`)
 	mustContain(t, body, `<Name>beta</Name>`)
 	mustContain(t, body, `<Owner><ID>p1</ID>`)
+	mustContain(t, body, `<CreationDate>2026-10-24T12:00:00.000Z</CreationDate>`)
 
 	var doc struct {
 		Buckets []struct {
@@ -124,7 +125,10 @@ func TestListBucketsXML(t *testing.T) {
 }
 
 func bucketCfg(name string) contract.BucketConfig {
-	return contract.BucketConfig{Name: name, TenantID: "t1", ProjectID: "p1", Region: "eu-west-1"}
+	return contract.BucketConfig{
+		Name: name, TenantID: "t1", ProjectID: "p1", Region: "eu-west-1",
+		CreatedAt: nowUTC(),
+	}
 }
 
 func TestBucketLifecycleAndErrors(t *testing.T) {
@@ -585,6 +589,61 @@ func TestListObjectVersionsMarkers(t *testing.T) {
 	body := rec.Body.String()
 	mustContain(t, body, "<KeyMarker>k1</KeyMarker>")
 	mustContain(t, body, "<VersionIdMarker>vid-1</VersionIdMarker>")
+}
+
+// TestListBucketsCreationDateAlwaysParseable is the rclone/aws-sdk-go-v2
+// regression: an empty <CreationDate> makes the SDK fail the whole ListBuckets
+// response. A legacy bucket (zero CreatedAt) must emit a parseable epoch.
+func TestListBucketsCreationDateAlwaysParseable(t *testing.T) {
+	h := newHarness(t)
+	// A modern bucket with a real timestamp, and a legacy one without.
+	if err := h.coord.CreateBucket(t.Context(), bucketCfg("modern")); err != nil {
+		t.Fatal(err)
+	}
+	legacy := bucketCfg("legacy-bucket")
+	legacy.CreatedAt = time.Time{}
+	if err := h.coord.CreateBucket(t.Context(), legacy); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := h.do(t, http.MethodGet, "/", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	mustContain(t, body, `<CreationDate>1970-01-01T00:00:00.000Z</CreationDate>`)
+	if strings.Contains(body, "<CreationDate></CreationDate>") {
+		t.Fatalf("emitted an empty CreationDate: %s", body)
+	}
+
+	var doc struct {
+		Buckets []struct {
+			Name         string `xml:"Name"`
+			CreationDate string `xml:"CreationDate"`
+		} `xml:"Buckets>Bucket"`
+	}
+	if err := xml.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(doc.Buckets) != 2 {
+		t.Fatalf("buckets = %+v", doc.Buckets)
+	}
+	seen := make(map[string]bool, len(doc.Buckets))
+	for _, b := range doc.Buckets {
+		ts, err := time.Parse(time.RFC3339, b.CreationDate)
+		if err != nil {
+			t.Fatalf("bucket %s CreationDate %q does not parse as RFC3339: %v", b.Name, b.CreationDate, err)
+		}
+		if ts.IsZero() {
+			t.Fatalf("bucket %s parsed to the zero time", b.Name)
+		}
+		seen[b.Name] = true
+	}
+	if !seen["modern"] || !seen["legacy-bucket"] {
+		t.Fatalf("missing buckets: %+v", seen)
+	}
+	// The modern bucket keeps its real value (round trip through XML).
+	mustContain(t, body, `<CreationDate>2026-10-24T12:00:00.000Z</CreationDate>`)
 }
 
 func TestVirtualHostedAddressing(t *testing.T) {

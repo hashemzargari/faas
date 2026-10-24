@@ -14,11 +14,26 @@ const xmlNS = "http://s3.amazonaws.com/doc/2006-03-01/"
 // timeFormat is the timestamp format S3 uses in XML (millisecond precision).
 const timeFormat = "2006-01-02T15:04:05.000Z"
 
+// epochTime is emitted when a stored timestamp is missing. S3 SDKs (notably
+// aws-sdk-go-v2) reject the whole response when a time element is empty, so a
+// wrong-but-parseable date is strictly better than an absent one.
+const epochTime = "1970-01-01T00:00:00.000Z"
+
+// xmlTime renders an XML timestamp, substituting the Unix epoch when t is zero.
 func xmlTime(t time.Time) string {
 	if t.IsZero() {
-		return ""
+		return epochTime
 	}
 	return t.UTC().Format(timeFormat)
+}
+
+// httpTime renders an HTTP Last-Modified value, substituting the Unix epoch when
+// t is zero (an empty value is a protocol error).
+func httpTime(t time.Time) string {
+	if t.IsZero() {
+		t = time.Unix(0, 0)
+	}
+	return t.UTC().Format(http.TimeFormat)
 }
 
 // xmlOwner is the Owner element shared by several responses.
@@ -443,7 +458,7 @@ func canonicalMetadataHeader(k string) string {
 // setManifestHeaders writes the headers shared by GET and HEAD object responses.
 func setManifestHeaders(h http.Header, m manifestView, etag string) {
 	h.Set("ETag", quoteETag(etag))
-	h.Set("Last-Modified", m.createdAt.UTC().Format(http.TimeFormat))
+	h.Set("Last-Modified", httpTime(m.createdAt))
 	h.Set("Accept-Ranges", "bytes")
 	if m.contentType != "" {
 		h.Set("Content-Type", m.contentType)

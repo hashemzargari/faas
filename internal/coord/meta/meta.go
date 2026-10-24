@@ -89,9 +89,42 @@ func (s *Service) DB() *storage.DB { return s.db }
 // metadata that never leaves the coordinator.
 type Bucket struct {
 	contract.BucketConfig
-	CreatedAt time.Time    `json:"created_at"`
 	ACL       contract.ACL `json:"acl"`
 	Lifecycle []byte       `json:"lifecycle,omitempty"`
+}
+
+// bucketCreatedAtFallback is served and lazily persisted for legacy bucket
+// records written before BucketConfig.CreatedAt existed. Unix epoch is stable and
+// unambiguous; persisting it means it can never flap between reads, and the
+// gateway never sees the zero time (which renders as an empty <CreationDate> and
+// makes aws-sdk-go-v2 / rclone reject the entire ListBuckets response).
+var bucketCreatedAtFallback = time.Unix(0, 0).UTC()
+
+// normalizeBucketCreatedAt back-fills a missing creation time on read and
+// persists it in the same transaction, returning the stored configuration.
+func (s *Service) normalizeBucketCreatedAt(ctx context.Context, cfg contract.BucketConfig) (contract.BucketConfig, error) {
+	if !cfg.CreatedAt.IsZero() {
+		return cfg, nil
+	}
+	var out contract.BucketConfig
+	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+		rec, err := storage.GetJSON[Bucket](tx, spaceBuckets, []byte(cfg.Name))
+		if errors.Is(err, storage.ErrNotFound) {
+			return coerr.ErrNoSuchBucket
+		}
+		if err != nil {
+			return err
+		}
+		if rec.CreatedAt.IsZero() {
+			rec.CreatedAt = bucketCreatedAtFallback
+			if err := storage.PutJSON(tx, spaceBuckets, []byte(rec.Name), rec); err != nil {
+				return err
+			}
+		}
+		out = rec.BucketConfig
+		return nil
+	})
+	return out, err
 }
 
 // CreateBucket creates a bucket. Creating an existing bucket owned by the same
@@ -121,6 +154,9 @@ func (s *Service) CreateBucket(ctx context.Context, cfg contract.BucketConfig) e
 	if cfg.QuotaBytes < 0 {
 		return coerr.Invalidf("quota_bytes must be >= 0")
 	}
+	if cfg.CreatedAt.IsZero() {
+		cfg.CreatedAt = s.now().UTC()
+	}
 
 	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
 		key := []byte(cfg.Name)
@@ -130,12 +166,17 @@ func (s *Service) CreateBucket(ctx context.Context, cfg contract.BucketConfig) e
 			if rec.TenantID != cfg.TenantID || rec.ProjectID != cfg.ProjectID {
 				return coerr.E(409, "BucketAlreadyExists", "The requested bucket name is not available")
 			}
-			// Idempotent create: keep the existing bucket ID and creation time.
+			// Idempotent create: keep the existing bucket ID and creation time;
+			// back-fill a legacy record that predates the field.
+			if rec.CreatedAt.IsZero() {
+				rec.CreatedAt = bucketCreatedAtFallback
+				return storage.PutJSON(tx, spaceBuckets, key, rec)
+			}
 			return nil
 		case !errors.Is(getErr, storage.ErrNotFound):
 			return getErr
 		}
-		rec = Bucket{BucketConfig: cfg, CreatedAt: s.now().UTC()}
+		rec = Bucket{BucketConfig: cfg}
 		if err := storage.PutJSON(tx, spaceBuckets, key, rec); err != nil {
 			return err
 		}
@@ -160,7 +201,10 @@ func (s *Service) GetBucket(ctx context.Context, name string) (contract.BucketCo
 		out = rec.BucketConfig
 		return nil
 	})
-	return out, err
+	if err != nil {
+		return out, err
+	}
+	return s.normalizeBucketCreatedAt(ctx, out)
 }
 
 // GetBucketByID returns a bucket by its opaque ID (the data path uses IDs).
@@ -187,7 +231,10 @@ func (s *Service) GetBucketByID(ctx context.Context, id contract.BucketID) (cont
 		out = rec.BucketConfig
 		return nil
 	})
-	return out, err
+	if err != nil {
+		return out, err
+	}
+	return s.normalizeBucketCreatedAt(ctx, out)
 }
 
 // ListBuckets returns the buckets visible to a principal.
@@ -205,7 +252,21 @@ func (s *Service) ListBuckets(ctx context.Context, p contract.Principal) ([]cont
 			return nil
 		})
 	})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	// Back-fill any legacy record once, so repeated listings and restarts return
+	// an identical, non-zero creation time.
+	for i := range out {
+		if out[i].CreatedAt.IsZero() {
+			normalized, err := s.normalizeBucketCreatedAt(ctx, out[i])
+			if err != nil {
+				return nil, err
+			}
+			out[i] = normalized
+		}
+	}
+	return out, nil
 }
 
 // UpdateBucket applies a mutable bucket configuration change (versioning,
@@ -241,6 +302,12 @@ func (s *Service) UpdateBucket(ctx context.Context, cfg contract.BucketConfig) e
 		}
 		if cfg.Ownership == "" {
 			cfg.Ownership = rec.Ownership
+		}
+		if cfg.CreatedAt.IsZero() {
+			cfg.CreatedAt = rec.CreatedAt
+		}
+		if cfg.CreatedAt.IsZero() {
+			cfg.CreatedAt = bucketCreatedAtFallback
 		}
 		rec.BucketConfig = cfg
 		return storage.PutJSON(tx, spaceBuckets, []byte(cfg.Name), rec)

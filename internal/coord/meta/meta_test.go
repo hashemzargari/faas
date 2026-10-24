@@ -784,3 +784,164 @@ func TestCompleteUploadPreservesChunkIdentityAndEncryption(t *testing.T) {
 		}
 	}
 }
+
+// TestBucketCreatedAtIsNonZeroAndSurvivesReopen: S3 ListBuckets carries
+// <CreationDate>, and aws-sdk-go-v2 rejects the whole response on an empty value,
+// so a created bucket must always carry a real timestamp that is stable across a
+// store restart.
+func TestBucketCreatedAtIsNonZeroAndSurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db, err := storage.Open(dir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := storage.Migrate(ctx, db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	m := meta.New(db)
+	cfg := contract.BucketConfig{
+		BucketID:  contract.BucketID(id.New()),
+		Name:      "created-at-bucket",
+		TenantID:  tenantID,
+		ProjectID: projectID,
+		Region:    contract.DefaultRegion,
+		Ownership: "ObjectWriter",
+	}
+	if err := m.CreateBucket(ctx, cfg); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	created, err := m.GetBucket(ctx, cfg.Name)
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	if created.CreatedAt.IsZero() {
+		t.Fatalf("CreateBucket did not populate CreatedAt")
+	}
+	if created.CreatedAt.Unix() <= 0 {
+		t.Fatalf("CreatedAt = %v, want a real creation time", created.CreatedAt)
+	}
+	buckets, err := m.ListBuckets(ctx, contract.Principal{IsRoot: true})
+	if err != nil {
+		t.Fatalf("ListBuckets: %v", err)
+	}
+	if len(buckets) != 1 || buckets[0].CreatedAt.IsZero() || !buckets[0].CreatedAt.Equal(created.CreatedAt) {
+		t.Fatalf("ListBuckets CreatedAt = %v, want %v", buckets, created.CreatedAt)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	db2, err := storage.Open(dir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() { _ = db2.Close() })
+	if err := storage.Migrate(ctx, db2); err != nil {
+		t.Fatalf("migrate reopen: %v", err)
+	}
+	reopened, err := meta.New(db2).GetBucket(ctx, cfg.Name)
+	if err != nil {
+		t.Fatalf("GetBucket after reopen: %v", err)
+	}
+	if !reopened.CreatedAt.Equal(created.CreatedAt) {
+		t.Fatalf("CreatedAt changed across reopen: %v -> %v", created.CreatedAt, reopened.CreatedAt)
+	}
+}
+
+// TestLegacyBucketCreatedAtBackfillIsStableAndPersisted: records written before
+// BucketConfig.CreatedAt existed must get a stable, non-zero fallback that is
+// persisted on first read (so it can never flap and is repaired for the gateway).
+func TestLegacyBucketCreatedAtBackfillIsStableAndPersisted(t *testing.T) {
+	ctx := context.Background()
+	m := newMeta(t)
+	bucketID := contract.BucketID(id.New())
+	const name = "legacy-bucket"
+	legacy := map[string]any{
+		"bucket_id":  bucketID,
+		"name":       name,
+		"tenant_id":  tenantID,
+		"project_id": projectID,
+		"region":     contract.DefaultRegion,
+		"ownership":  "ObjectWriter",
+	}
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal legacy record: %v", err)
+	}
+	if err := m.DB().Update(ctx, func(tx *storage.WriteTx) error {
+		if err := tx.Put([]byte("buckets"), []byte(name), raw); err != nil {
+			return err
+		}
+		return tx.Put([]byte("bucket_ids"), []byte(bucketID), []byte(name))
+	}); err != nil {
+		t.Fatalf("seed legacy record: %v", err)
+	}
+
+	first, err := m.GetBucket(ctx, name)
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	if first.CreatedAt.IsZero() {
+		t.Fatalf("legacy bucket still returns the zero time")
+	}
+	second, err := m.GetBucket(ctx, name)
+	if err != nil {
+		t.Fatalf("GetBucket second read: %v", err)
+	}
+	if !second.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("fallback flapped between reads: %v -> %v", first.CreatedAt, second.CreatedAt)
+	}
+	// The fallback is the documented Unix epoch, persisted so future reads (and
+	// the SQL migration) see the same value.
+	if first.CreatedAt.Unix() != 0 {
+		t.Fatalf("fallback = %v, want Unix epoch", first.CreatedAt)
+	}
+	var stored map[string]any
+	if err := m.DB().View(ctx, func(tx *storage.ReadTx) error {
+		rec, err := tx.Get([]byte("buckets"), []byte(name))
+		if err != nil {
+			return err
+		}
+		return json.Unmarshal(rec, &stored)
+	}); err != nil {
+		t.Fatalf("read stored record: %v", err)
+	}
+	if ts, ok := stored["created_at"].(string); !ok || ts == "" {
+		t.Fatalf("back-fill was not persisted: %v", stored["created_at"])
+	}
+
+	// Listings go through the same path.
+	buckets, err := m.ListBuckets(ctx, contract.Principal{IsRoot: true})
+	if err != nil {
+		t.Fatalf("ListBuckets: %v", err)
+	}
+	if len(buckets) != 1 || buckets[0].CreatedAt.IsZero() {
+		t.Fatalf("ListBuckets = %+v", buckets)
+	}
+}
+
+// TestUpdateBucketPreservesCreatedAt: mutable config updates must not erase the
+// creation timestamp (the gateway PATCHes versioning/ownership etc.).
+func TestUpdateBucketPreservesCreatedAt(t *testing.T) {
+	ctx := context.Background()
+	m := newMeta(t)
+	bucket := newBucket(t, m, "")
+	got, err := m.GetBucket(ctx, bucket.Name)
+	if err != nil {
+		t.Fatalf("GetBucket: %v", err)
+	}
+	cfg := got
+	cfg.Versioning = "Enabled"
+	cfg.CreatedAt = time.Time{} // simulate a caller that omits it
+	if err := m.UpdateBucket(ctx, cfg); err != nil {
+		t.Fatalf("UpdateBucket: %v", err)
+	}
+	after, err := m.GetBucket(ctx, bucket.Name)
+	if err != nil {
+		t.Fatalf("GetBucket after update: %v", err)
+	}
+	if !after.CreatedAt.Equal(got.CreatedAt) || after.Versioning != "Enabled" {
+		t.Fatalf("update = %+v, want CreatedAt %v preserved", after, got.CreatedAt)
+	}
+}
