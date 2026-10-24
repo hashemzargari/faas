@@ -1,7 +1,7 @@
 {{- if .Values.console.enabled }}
 {{- if not .Values.tls.enabled }}
 # WARNING: tls.enabled=false — DEV ONLY. The console talks to a plaintext
-# coordinator; it has no TLS of its own in either mode (front it with a proxy).
+# coordinator over plaintext HTTP (banner + /healthz report it). Never expose it.
 {{- end }}
 {{- $con := .Values.console }}
 {{- $name := printf "%s-console" (include "fass.fullname" .) }}
@@ -101,15 +101,61 @@ spec:
             - name: FASS_LOG_FORMAT
               value: "json"
             {{- if .Values.tls.enabled }}
-            # The console has no CA flag; Go honours SSL_CERT_FILE for its
-            # coordinator HTTP client, so mount the cluster CA and point at it.
+            # Coordinator client TLS: CA verification + optional clientAuth
+            # identity (required when the coordinator runs --require-mtls).
+            - name: FASS_CONSOLE_COORDINATOR_CA
+              value: {{ printf "/etc/fass/tls/ca/%s" .Values.tls.caKey | quote }}
+            {{- if $con.coordinatorClient.existingSecret }}
+            - name: FASS_CONSOLE_COORDINATOR_CLIENT_CERT
+              value: {{ printf "/etc/fass/tls/client/%s" $con.coordinatorClient.certKey | quote }}
+            - name: FASS_CONSOLE_COORDINATOR_CLIENT_KEY
+              value: {{ printf "/etc/fass/tls/client/%s" $con.coordinatorClient.keyKey | quote }}
+            {{- end }}
+            {{- if $con.coordinatorClient.serverName }}
+            - name: FASS_CONSOLE_COORDINATOR_SERVER_NAME
+              value: {{ $con.coordinatorClient.serverName | quote }}
+            {{- end }}
+            {{- if $con.tls.enabled }}
+            - name: FASS_CONSOLE_TLS_CERT
+              value: {{ printf "/etc/fass/tls/server/%s" $con.tls.certKey | quote }}
+            - name: FASS_CONSOLE_TLS_KEY
+              value: {{ printf "/etc/fass/tls/server/%s" $con.tls.keyKey | quote }}
+            {{- if $con.tls.requireMTLS }}
+            - name: FASS_CONSOLE_TLS_CLIENT_CA
+              value: {{ printf "/etc/fass/tls/ca/%s" .Values.tls.caKey | quote }}
+            - name: FASS_CONSOLE_REQUIRE_MTLS
+              value: "true"
+            {{- end }}
+            {{- end }}
+            # Kept for tooling that relies on Go's SSL_CERT_FILE default.
             - name: SSL_CERT_FILE
               value: {{ printf "/etc/fass/tls/ca/%s" .Values.tls.caKey | quote }}
+            {{- else }}
+            - name: FASS_CONSOLE_COORDINATOR_INSECURE
+              value: "true"
             {{- end }}
           ports:
             - name: http
               containerPort: {{ $con.listenPort }}
               protocol: TCP
+          {{- if $con.tls.enabled }}
+          # TLS listener: the local probe skips certificate verification (the
+          # certificate SANs are for operators, not loopback).
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/fass-dev-healthcheck", "-insecure", "https://127.0.0.1:{{ $con.listenPort }}/healthz"]
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/fass-dev-healthcheck", "-insecure", "https://127.0.0.1:{{ $con.listenPort }}/healthz"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          {{- else }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -126,6 +172,7 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
+          {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -139,6 +186,16 @@ spec:
               mountPath: {{ printf "/etc/fass/tls/ca/%s" .Values.tls.caKey }}
               subPath: {{ .Values.tls.caKey }}
               readOnly: true
+            {{- if $con.coordinatorClient.existingSecret }}
+            - name: tls-client
+              mountPath: /etc/fass/tls/client
+              readOnly: true
+            {{- end }}
+            {{- if $con.tls.enabled }}
+            - name: tls-server
+              mountPath: /etc/fass/tls/server
+              readOnly: true
+            {{- end }}
           {{- end }}
       {{- if .Values.tls.enabled }}
       volumes:
@@ -146,5 +203,17 @@ spec:
           secret:
             secretName: {{ .Values.tls.caSecret }}
             defaultMode: 0440
+        {{- if $con.coordinatorClient.existingSecret }}
+        - name: tls-client
+          secret:
+            secretName: {{ $con.coordinatorClient.existingSecret }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if $con.tls.enabled }}
+        - name: tls-server
+          secret:
+            secretName: {{ $con.tls.existingSecret }}
+            defaultMode: 0400
+        {{- end }}
       {{- end }}
 {{- end }}

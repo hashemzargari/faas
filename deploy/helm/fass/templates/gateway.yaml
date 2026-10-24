@@ -146,8 +146,6 @@ spec:
               value: "true"
             - name: FASS_GATEWAY_AGENT_TLS
               value: "off"
-            - name: FASS_GATEWAY_COORDINATOR_INSECURE
-              value: "true"
             {{- end }}
             {{- if and $g.tls.enabled .Values.tls.enabled }}
             - name: FASS_GATEWAY_TLS_CERT

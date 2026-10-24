@@ -53,9 +53,11 @@ explicit `--dev`/`--insecure` and is visible in every `/healthz`):
   network and each agent certificate must cover the name peers dial.
 * **Agent → coordinator**: HTTPS announce/heartbeat/repair (outbound), verified
   against the cluster CA.
-* **Console → coordinator**: HTTPS. The console itself has no TLS listener and a
-  single Basic credential — bind it to loopback/private and front it with your
-  TLS reverse proxy + SSO. It trusts the cluster CA via `SSL_CERT_FILE`.
+* **Console → coordinator**: HTTPS with CA verification and (for strict mTLS) a
+  clientAuth identity. The console can serve HTTPS itself
+  (`--tls-cert/--tls-key`) or sit behind a TLS proxy; it still has a single
+  Basic credential and no RBAC, so bind it to loopback/private and use SSO at the
+  proxy.
 
 The coordinator admin API (`/v1/topology`, `/v1/agents*`, `/v1/rings`,
 `/v1/redundancy-classes`, `/metrics`) is **unauthenticated** by design in v1
@@ -96,7 +98,7 @@ be in the certificate, DNS *and* IP:
 
 An `x509: certificate is valid for X, not Y` error means exactly this: re-issue
 with the missing `--dns`/`--ip`. Generate with
-`fass-gateway pki init|issue-server|issue-client`; there is no `fass-agent pki`
+`fass pki init|issue-server|issue-client`; there is no `fass-agent pki`
 subcommand yet (agent identities are issued with the same gateway pki tool).
 
 **Expiry and rotation.** Default lifetime is 90 days; a component reloads its
@@ -106,10 +108,12 @@ lifetime, capped at 24 h ⇒ 30 days for a 90-day cert). Rotation is therefore
 agent is *undesirable* because it starts a repair clock. Strict-mTLS rollout
 order: TLS everywhere with `requireMTLS=false`, verify
 `security.insecure=false` on every `/healthz`, then enable `requireMTLS` in one
-change. **Caveat:** the console has no client-certificate support yet, so strict
-mTLS requires `console.enabled=false` (or front the console with a proxy that
-terminates mTLS); the chart therefore refuses `tls.requireMTLS=true` while the
-console is enabled.
+change. **Console + strict mTLS:** issue a clientAuth identity for the console
+(`fass pki issue-client --ca-dir ... --dir ./pki/console-client --identity console`),
+reference it as `console.coordinatorClient.existingSecret` in the chart (and
+`--coordinator-client-cert/-key` for systemd), then strict mTLS works end to end;
+the console also serves its own HTTPS listener via `console.tls.enabled` /
+`--tls-cert/--tls-key`. No console disable step is needed.
 
 **If the CA is lost** (private key destroyed, no backup): you cannot issue or
 enroll *new* certificates, and after the current certificates expire the
@@ -357,28 +361,33 @@ never needed at runtime.
 
 ```bash
 # CA (offline key; distribute only ca.crt)
-fass-gateway pki init --dir ./pki/ca --cn fass-cluster-ca
+fass pki init --dir ./pki/ca --cn fass-cluster-ca
 
 # Coordinator — SANs must include every DNS name gateways/agents dial.
 # With the in-chart Service those are (adjust release/namespace):
-fass-gateway pki issue-server --ca-dir ./pki/ca --dir ./pki/coordinator \
+fass pki issue-server --ca-dir ./pki/ca --dir ./pki/coordinator \
   --dns fass-coordinator \
   --dns fass-coordinator.fass.svc \
   --dns fass-coordinator.fass.svc.cluster.local
 # For a per-site release add the external name/IP clients use, e.g. --dns coordinator.site-a.example
 
+# Console: optional HTTPS listener + clientAuth identity for a strict-mTLS coordinator
+fass pki issue-server --ca-dir ./pki/ca --dir ./pki/console \
+  --dns console.site-a.example --ip 10.0.1.30
+fass pki issue-client --ca-dir ./pki/ca --dir ./pki/console-client --identity console
+
 # Gateway S3 listener (client-facing name + LB IP) and gateway mTLS client identity
-fass-gateway pki issue-server --ca-dir ./pki/ca --dir ./pki/gateway \
+fass pki issue-server --ca-dir ./pki/ca --dir ./pki/gateway \
   --dns s3.site-a.example --ip 203.0.113.10
-fass-gateway pki issue-client --ca-dir ./pki/ca --dir ./pki/gateway-client \
+fass pki issue-client --ca-dir ./pki/ca --dir ./pki/gateway-client \
   --identity gateway-1
 
 # One agent certificate per node. The chart runs agents with hostNetwork=true,
 # so an agent announces status.hostIP: include that node IP (and FQDN).
-fass-gateway pki issue-server --ca-dir ./pki/ca --dir ./pki/agent-node-a1 \
+fass pki issue-server --ca-dir ./pki/ca --dir ./pki/agent-node-a1 \
   --ip 10.0.0.11 --dns node-a1.example.internal
 # Shared agent repair client identity (or one per agent if your policy requires it)
-fass-gateway pki issue-client --ca-dir ./pki/ca --dir ./pki/agent-client --identity agent-client
+fass pki issue-client --ca-dir ./pki/ca --dir ./pki/agent-client --identity agent-client
 ```
 
 Every name/IP a peer dials must be a SAN (**DNS or IP**) — see §1.1. A missing
@@ -419,7 +428,14 @@ kubectl -n fass create secret generic fass-gateway-key-seed --from-literal=key-s
 kubectl -n fass create secret generic fass-coordinator-db-dsn \
   --from-literal=dsn='postgres://fass:CHANGEME@postgres.example:5432/fass?sslmode=require'
 
-# Console HTTP Basic (the console itself is plaintext HTTP behind a TLS proxy).
+# Console: HTTPS listener (console.tls) + clientAuth identity (console.coordinatorClient;
+# required when tls.requireMTLS=true). Skip the TLS Secret if a proxy terminates TLS.
+kubectl -n fass create secret tls fass-console-tls \
+  --cert=./pki/console/tls.crt --key=./pki/console/tls.key
+kubectl -n fass create secret generic fass-console-client-tls \
+  --from-file=tls.crt=./pki/console-client/tls.crt --from-file=tls.key=./pki/console-client/tls.key
+
+# Console HTTP Basic (Basic credentials; the listener is HTTPS when configured).
 kubectl -n fass create secret generic fass-console-auth \
   --from-literal=console-user=admin --from-literal=console-password="$(openssl rand -base64 24)"
 
@@ -647,7 +663,7 @@ sudo systemctl restart fass-agent@disk0
 | Spread one shard-set wider than `aag` per node "for safety" | Placement will not use the extra slots; size by **nodes**, not disks. |
 | Restart a whole Nexus during an upgrade | That is a site-loss event; repair starts while you are still upgrading. |
 | Rotate/replace the gateway key seed casually | Existing objects were encrypted under it and become unreadable. Seed custody is a first-class secret. |
-| Expose the coordinator (7000) or console (8081) directly to the internet | TLS protects transport, but coordinator admin is unauthenticated and the console has one shared Basic credential and no TLS listener; front both with a proxy/private network. |
+| Expose the coordinator (7000) or console (8081) directly to the internet | TLS protects transport, but coordinator admin is unauthenticated and the console has one shared Basic credential; front both with a proxy/private network (the console can serve HTTPS but still needs SSO/RBAC). |
 | Run with `tls.enabled=false`/`--insecure` in production | Plaintext is a dev-only opt-out; every `/healthz` reports `security.insecure=true`. |
 | Rotate the CA without re-issuing every certificate | There is no cross-signed CA bundle: peers verify against one CA. Issue the new CA and roll all certificates in order. |
 | Lose the CA private key | You cannot enroll new agents/gateways; existing ones fail verification when their certs expire. Back it up offline (like the key seed). |
@@ -690,13 +706,13 @@ loudly rather than pretending they are supported.
    before relying on it for the control plane.
 2. **No certificate manager integration and no cross-signed CA rollover.** The
    chart/systemd consume existing Secrets/files; issuing/rotating certs is an
-   operator runbook (`fass-gateway pki`), not a cert-manager/ACME integration.
+   operator runbook (`fass pki`), not a cert-manager/ACME integration.
    There is no CA-bundle rotation: a CA change means re-issuing every identity.
    Losing the CA key means no new enrollments and eventual verification failure
    as existing certs expire (existing agents work until then) — see §1.1.
-3. **No `fass-agent pki` subcommand.** Agent certificates are issued with
-   `fass-gateway pki issue-server|issue-client` (same CA tool, documented; not
-   an invented agent command). Related: the Helm chart still renders one pinned
+3. **No `fass-agent pki` subcommand.** Certificates are issued with the neutral
+   `fass pki issue-server|issue-client` (the old `fass-gateway pki` form remains
+   a compatibility alias). Related: the Helm chart still renders one pinned
    Deployment per node instead of one DaemonSet per Nexus because every disk has
    a distinct one-time announce Secret that Kubernetes cannot vary per pod; the
    agent's env/secret-file support removed the argv-secret problem but not the
@@ -704,12 +720,12 @@ loudly rather than pretending they are supported.
 4. **No KMIP/key service.** Only `--key-seed`/`FASS_GATEWAY_KEY_SEED` static
    single-key mode exists; KMIP 1.4 (docs/03 §3.3) is not implemented. Today
    the seed is a manually custodied secret; the chart requires its Secret.
-5. **Console is single-credential Basic auth, no TLS listener, no client
-   certificate, no RBAC/OIDC.** It trusts the cluster CA via `SSL_CERT_FILE` and
-   talks to an https coordinator, but it cannot present a client certificate:
-   strict mTLS requires the console to be disabled (or fronted by a proxy).
-   Bind it to loopback/private and front with a TLS reverse proxy + SSO.
-   (Tracked as multi-tenant console work, not a deployment bug.)
+5. **Console is single-credential Basic auth, no RBAC/OIDC, and no browser
+   client-certificate UX.** It now serves HTTPS (`--tls-cert/--tls-key`) and
+   presents a clientAuth identity to a `--require-mtls` coordinator, so strict
+   mTLS no longer disables the UI. Browser client certificates are supported
+   technically but are a poor operator experience; use a proxy/SSO for human
+   auth. (Tracked as multi-tenant console work, not a deployment bug.)
 6. **No object-store/Ingress resources in the chart.** The chart exposes
    ClusterIP services and leaves LB/Ingress/TLS-termination choices to the
    platform; this is deliberate, but means "install + expose to clients" is two

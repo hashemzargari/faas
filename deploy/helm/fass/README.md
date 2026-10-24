@@ -52,6 +52,8 @@ follows that:
 | `gateway.mtls.existingSecret` | gateway clientAuth identity (required when `tls.requireMTLS=true`) |
 | `agents.tls.existingSecret` **or** `agents.nodes[].tlsSecret` | agent shard-listener cert(s) |
 | `agents.tls.clientCertSecret` | agent repair clientAuth identity (required when `agents.repair=true`) |
+| `console.tls.existingSecret` | console HTTPS listener (when `console.tls.enabled=true`) |
+| `console.coordinatorClient.existingSecret` | console clientAuth identity (required when `tls.requireMTLS=true`) |
 
 `gateway.keySeed.existingSecret`, `console.auth.existingSecret`,
 `coordinator.db.existingSecret` (PostgreSQL) and the per-disk announce Secrets
@@ -68,10 +70,10 @@ instead. Coordinator and gateway certificates need the service DNS names peers
 use (`<release>-coordinator`, `...svc`, `...svc.cluster.local`), and the gateway
 S3 certificate needs the client-facing name.
 
-The exact `fass-gateway pki init|issue-server|issue-client` invocations with SAN
+The exact `fass pki init|issue-server|issue-client` invocations with SAN
 examples are in the chart's rendered `NOTES.txt` (written for your release's
 service names). There is no `fass-agent pki` subcommand yet: agent certificates
-are issued with the same `fass-gateway pki` tool (a documented gap, not an
+are issued with the same `fass pki` tool (a documented gap, not an
 invented command).
 
 Typical SAN coverage:
@@ -111,8 +113,8 @@ declared Nexus topologies that placement cannot fill
 per Nexus). See docs/09 §"AAG is a per-Node rule".
 
 **Probes and TLS.** Gateway probes hit the plaintext admin listener
-(`:9000/healthz`, `/readyz`). Coordinator and agent listeners are TLS-only, so
-their exec probes use the image's `/usr/local/bin/fass-dev-healthcheck
+(`:9000/healthz`, `/readyz`). Coordinator, agent and (when enabled) console TLS
+listeners use exec probes with the image's `/usr/local/bin/fass-dev-healthcheck
 -insecure` against `127.0.0.1`: the probe verifies liveness locally and skips
 certificate verification (SANs are peer names, not loopback); real peer traffic
 is still verified. Do not interpret `-insecure` there as a security setting.
@@ -123,9 +125,11 @@ is still verified. Do not interpret `-insecure` there as a security setting.
 
 * `tls.enabled=true` but `tls.caSecret`, `coordinator.tls.certSecret/keySecret`,
   `gateway.tls.existingSecret`, any agent listener certificate
-  (`agents.tls.existingSecret` or per-node `tlsSecret`) or (with
-  `agents.repair=true`) `agents.tls.clientCertSecret` is empty — the error names
-  the value;
+  (`agents.tls.existingSecret` or per-node `tlsSecret`), (with
+  `agents.repair=true`) `agents.tls.clientCertSecret`, (with
+  `console.tls.enabled=true`) `console.tls.existingSecret`, or (with
+  `tls.requireMTLS=true`) `console.coordinatorClient.existingSecret` is empty —
+  the error names the value;
 * `tls.enabled=true` with `gateway.coordinatorURL` not `https://`;
 * `tls.enabled=false` without `tls.allowInsecure=true` (prevents silent
   production plaintext);
@@ -162,9 +166,10 @@ Upgrade **coordinator → gateways → agents**, one failure domain at a time; s
 docs/09-deployment.md §Upgrade. For the strict-mTLS rollout, run every component
 with `tls.requireMTLS=false` first, confirm `security.insecure=false` and
 `require_mtls=false` on each `/healthz`, then flip the flag in one `helm upgrade`.
-Strict mTLS requires `console.enabled=false`: the console cannot present a
-client certificate yet, and the chart fails the render rather than producing a
-broken console pod.
+Strict mTLS works with the console enabled: create a clientAuth identity
+(`fass pki issue-client --identity console`) and point
+`console.coordinatorClient.existingSecret` at its Secret. The console can also
+serve its own HTTPS listener (`console.tls.enabled`).
 `make deploy-lint` runs `helm lint` + `helm template` for every values file and
 `systemd-analyze verify` for the systemd units (skipped cleanly when tools are
 absent).

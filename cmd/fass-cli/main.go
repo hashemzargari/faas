@@ -237,6 +237,12 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return runRepair(ctx, g, cmdArgs, stdout, stderr)
 	case "gc":
 		return runGC(ctx, g, cmdArgs, stdout, stderr)
+	case "pki":
+		if g.help {
+			printPKIUsage(stdout)
+			return nil
+		}
+		return runPKI(cmdArgs, stdout)
 	default:
 		return usagef("unknown command %q (try `fass help`)", cmd)
 	}
@@ -450,6 +456,12 @@ Coordinator admin commands (HTTP+JSON):
   repair status                        repair/risk summary (derived from topology)
   gc status                            deletion-GC counters from /metrics
 
+Certificates (offline; neutral CLI):
+  pki init                            create the cluster CA (keep ca.key offline)
+  pki issue-server                    issue a listener certificate (repeatable --dns/--ip)
+  pki issue-client                    issue a clientAuth identity
+  pki inspect                         print subject/SANs/fingerprint/expiry
+
 Global flags:
   --endpoint URL        S3 gateway (default http://127.0.0.1:8080)
   --region REGION       default eu-west-1
@@ -491,6 +503,8 @@ func printCommandUsage(w io.Writer, cmd string) {
 		fmt.Fprintln(w, "usage: fass repair status [--json]")
 	case "gc":
 		fmt.Fprintln(w, "usage: fass gc status [--json]")
+	case "pki":
+		printPKIUsage(w)
 	default:
 		fmt.Fprintf(w, "usage: fass %s ...\n", cmd)
 	}

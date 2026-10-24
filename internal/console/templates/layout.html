@@ -33,6 +33,11 @@
     <span class="muted">Showing empty/last-known data; the page keeps working while the control plane recovers.</span>
   </div>
   {{end}}
+  {{if .Common.SecurityWarning}}
+  <div class="banner warn" role="status">
+    <strong>Insecure configuration.</strong> {{.Common.SecurityWarning}}
+  </div>
+  {{end}}
   {{if .Common.Flash}}<div class="banner ok" role="status">{{.Common.Flash}}</div>{{end}}
 
   <main>

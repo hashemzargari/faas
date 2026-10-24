@@ -54,6 +54,7 @@ footer { text-align: center; color: var(--muted); font-size: 12px; padding: 24px
 .banner { padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; border: 1px solid; }
 .banner.bad { background: rgba(255,107,107,.08); border-color: rgba(255,107,107,.4); color: #ffc9c9; }
 .banner.ok { background: rgba(62,207,142,.08); border-color: rgba(62,207,142,.35); color: #c3f3dd; }
+.banner.warn { background: rgba(255,196,84,.08); border-color: rgba(255,196,84,.4); color: #ffe1a3; }
 .banner .muted { display: block; margin-top: 4px; }
 
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 20px; }

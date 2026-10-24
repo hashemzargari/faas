@@ -131,8 +131,13 @@ app.kubernetes.io/component: {{ .component }}
 {{- fail "coordinator.tls.keySecret is required when tls.enabled=true: an existing Secret with the coordinator listener private key (PEM)." -}}
 {{- end -}}
 {{- end -}}
-{{- if and $tls.requireMTLS .Values.console.enabled -}}
-{{- fail "tls.requireMTLS=true is not supported with console.enabled=true: fass-console has no client-certificate/TLS-client flags yet, so strict mTLS would make the console unable to reach the coordinator. Set console.enabled=false or keep tls.requireMTLS=false (documented gap in docs/09-deployment.md §Known product gaps)." -}}
+{{- if .Values.console.enabled -}}
+{{- if and .Values.console.tls.enabled (not .Values.console.tls.existingSecret) -}}
+{{- fail "console.tls.existingSecret is required when console.tls.enabled=true: an existing Secret with the console listener certificate/key (tls.crt/tls.key)." -}}
+{{- end -}}
+{{- if and $tls.requireMTLS (not .Values.console.coordinatorClient.existingSecret) -}}
+{{- fail "console.coordinatorClient.existingSecret is required when tls.requireMTLS=true: the coordinator requires a client certificate from the console. Issue one with `fass pki issue-client` and reference its Secret (cert+key)." -}}
+{{- end -}}
 {{- end -}}
 {{- if .Values.gateway.enabled -}}
 {{- if and .Values.gateway.tls.enabled (not .Values.gateway.tls.existingSecret) -}}

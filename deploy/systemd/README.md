@@ -195,7 +195,9 @@ Each component's `/healthz` reports a `security` block (`insecure`, `tls`,
 `require_mtls`, certificate expiry) — check it after a rollout; `insecure=true`
 on a production host is an incident.
 
-The console has no TLS and no RBAC of its own: keep it on loopback (the example
-env file does) and front it with a TLS reverse proxy. See docs/09-deployment.md
-§"Known product gaps" for the remaining product gaps (KMIP key custody,
-console SSO/RBAC, CA-bundle rollover).
+The console has no RBAC/OIDC of its own: keep the listener on loopback (the
+example env file does) and front it with a TLS reverse proxy, or enable its own
+HTTPS listener and client certificate (`FASS_CONSOLE_TLS_*`,
+`FASS_CONSOLE_COORDINATOR_CLIENT_*`) when the coordinator runs `--require-mtls`.
+See docs/09-deployment.md §"Known product gaps" for the remaining product gaps
+(KMIP key custody, console SSO/RBAC, CA-bundle rollover).

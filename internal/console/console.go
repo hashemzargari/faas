@@ -20,6 +20,7 @@ import (
 	"crypto/subtle"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -48,6 +49,26 @@ type Config struct {
 	Now func() time.Time
 	// HTTPClient is used for coordinator requests (default: 5s timeout).
 	HTTPClient *http.Client
+	// Security is the operator-visible TLS posture (health endpoint + banner).
+	Security SecurityInfo
+}
+
+// SecurityInfo describes the console's transport posture. It is reported on
+// /healthz and drives the "plaintext coordinator" banner so an insecure dev
+// opt-out can never be silent.
+type SecurityInfo struct {
+	CoordinatorScheme   string `json:"coordinator_scheme"`
+	CoordinatorInsecure bool   `json:"insecure"`
+	ServeTLS            bool   `json:"tls"`
+	RequireMTLS         bool   `json:"require_mtls"`
+}
+
+// Warning returns the persistent banner text for an insecure posture, or "".
+func (s SecurityInfo) Warning() string {
+	if s.CoordinatorInsecure {
+		return "the coordinator connection is PLAINTEXT (--coordinator-insecure); dev-only, do not use outside a throwaway cluster."
+	}
+	return ""
 }
 
 // Server is the console HTTP handler.
@@ -152,7 +173,11 @@ func (s *Server) routes() {
 	// Liveness for probes; no auth so a load balancer can check it.
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","version":%q}`+"\n", s.cfg.Version)
+		_ = json.NewEncoder(w).Encode(struct {
+			Status   string       `json:"status"`
+			Version  string       `json:"version"`
+			Security SecurityInfo `json:"security"`
+		}{Status: "ok", Version: s.cfg.Version, Security: s.cfg.Security})
 	})
 	s.mux.Handle("GET /static/", s.static)
 
@@ -264,6 +289,7 @@ type Common struct {
 	CSRF             string
 	Flash            string
 	CoordinatorError string
+	SecurityWarning  string
 	Version          string
 	Now              time.Time
 	CurrentPath      string
@@ -275,14 +301,15 @@ func (s *Server) common(w http.ResponseWriter, r *http.Request, title string) Co
 		flash = flash[:200]
 	}
 	return Common{
-		Title:       title,
-		User:        s.cfg.User,
-		ReadOnly:    s.cfg.ReadOnly,
-		CSRF:        s.csrfToken(w, r),
-		Flash:       flash,
-		Version:     s.cfg.Version,
-		Now:         s.now(),
-		CurrentPath: r.URL.Path,
+		Title:           title,
+		User:            s.cfg.User,
+		ReadOnly:        s.cfg.ReadOnly,
+		CSRF:            s.csrfToken(w, r),
+		SecurityWarning: s.cfg.Security.Warning(),
+		Flash:           flash,
+		Version:         s.cfg.Version,
+		Now:             s.now(),
+		CurrentPath:     r.URL.Path,
 	}
 }
 

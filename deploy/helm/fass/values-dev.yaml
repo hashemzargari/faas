@@ -52,6 +52,9 @@ console:
   readOnly: false
   auth:
     existingSecret: fass-console-auth
+  # Dev console is plaintext (behind a local proxy if exposed at all).
+  tls:
+    enabled: false
 
 agents:
   enabled: true

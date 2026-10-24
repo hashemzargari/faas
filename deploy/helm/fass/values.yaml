@@ -162,9 +162,6 @@ gateway:
   # -- Data-plane mode: require (default) | auto (mixed-mode rollout) | off
   # (only valid together with tls.enabled=false / --insecure).
   agentTLS: require
-  # -- Explicit plaintext control-plane opt-in (dev/transition only); ignored
-  # when tls.enabled=true.
-  coordinatorInsecure: false
   # -- Optional Smart Data Placement policy (JSON) in an existing ConfigMap.
   sdpPolicy:
     existingConfigMap: ""
@@ -201,6 +198,24 @@ console:
     existingSecret: "CHANGEME-fass-console-auth"
     userKey: console-user
     passwordKey: console-password
+  # -- Optional TLS listener. When disabled the console serves plaintext HTTP and
+  # must sit behind a TLS reverse proxy. Browser user-cert UX is poor, so
+  # requireMTLS is off by default even when the console serves TLS.
+  tls:
+    enabled: false
+    existingSecret: ""
+    certKey: tls.crt
+    keyKey: tls.key
+    requireMTLS: false
+  # -- Client identity used to reach the coordinator over TLS. REQUIRED when
+  # tls.requireMTLS=true (the coordinator demands a client certificate); the
+  # certificate must carry the clientAuth EKU (`fass pki issue-client`).
+  coordinatorClient:
+    existingSecret: ""
+    certKey: tls.crt
+    keyKey: tls.key
+    # -- Override the verified server name (default: host from coordinatorURL).
+    serverName: ""
   resources:
     requests:
       cpu: 50m

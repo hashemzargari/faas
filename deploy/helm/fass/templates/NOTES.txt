@@ -38,6 +38,8 @@ Before this is usable:
       - gateway client identity  (gateway.mtls.existingSecret; required when tls.requireMTLS=true)
       - agent listener(s)        (agents.tls.existingSecret or per-node agents.nodes[].tlsSecret)
       - agent repair identity    (agents.tls.clientCertSecret; clientAuth EKU)
+      - console listener cert    (console.tls.existingSecret; optional if a proxy terminates operator TLS)
+      - console client identity  (console.coordinatorClient.existingSecret; required when tls.requireMTLS=true)
       - gateway key seed         (gateway.keySeed.existingSecret; losing it makes existing data unreadable)
       - console basic auth       (console.auth.existingSecret: console-user / console-password)
       - one announce Secret per disk (agents.nodes[].disks[].existingSecret)
@@ -48,25 +50,31 @@ Before this is usable:
     node IP, so a shared agent cert needs every node IP as an IP SAN; per-node
     certs are cleaner. Typical generation (CA key stays on your workstation):
 
-      fass-gateway pki init --dir ./pki/ca --cn fass-cluster-ca
+      fass pki init --dir ./pki/ca --cn fass-cluster-ca
 
       # coordinator — include service DNS names peers use
-      fass-gateway pki issue-server --ca-dir ./pki/ca --dir ./pki/coordinator \
+      fass pki issue-server --ca-dir ./pki/ca --dir ./pki/coordinator \
         --dns {{ $fullname }}-coordinator \
         --dns {{ $fullname }}-coordinator.{{ .Release.Namespace }}.svc \
         --dns {{ $fullname }}-coordinator.{{ .Release.Namespace }}.svc.cluster.local
 
       # gateway S3 edge (clients dial this name) and gateway client identity
-      fass-gateway pki issue-server --ca-dir ./pki/ca --dir ./pki/gateway \
+      fass pki issue-server --ca-dir ./pki/ca --dir ./pki/gateway \
         --dns s3.example.com --ip <load-balancer-ip>
-      fass-gateway pki issue-client --ca-dir ./pki/ca --dir ./pki/gateway-client \
+      fass pki issue-client --ca-dir ./pki/ca --dir ./pki/gateway-client \
         --identity gateway-1
 
       # agent on node-a1 (agent announces status.hostIP:port by default)
-      fass-gateway pki issue-server --ca-dir ./pki/ca --dir ./pki/agent-node-a1 \
+      fass pki issue-server --ca-dir ./pki/ca --dir ./pki/agent-node-a1 \
         --ip <node-a1-ip> --dns <node-a1-fqdn>
-      fass-gateway pki issue-client --ca-dir ./pki/ca --dir ./pki/agent-client \
+      fass pki issue-client --ca-dir ./pki/ca --dir ./pki/agent-client \
         --identity agent-client
+
+      # console (optional HTTPS listener + clientAuth identity for strict mTLS)
+      fass pki issue-server --ca-dir ./pki/ca --dir ./pki/console \
+        --dns console.example.com --ip <console-ip>
+      fass pki issue-client --ca-dir ./pki/ca --dir ./pki/console-client \
+        --identity console
 
     Then load them into the referenced Secrets (cert+key in the same Secret for
     `tls.crt`/`tls.key`), e.g.:
@@ -103,4 +111,6 @@ Verify:
 {{- end }}
 
 Upgrade order is coordinator -> gateways -> agents (see docs/09-deployment.md §Upgrade).
-Strict mTLS: roll all components with tls.requireMTLS=false first, then set it true.
+Strict mTLS: roll all components with tls.requireMTLS=false first, then set it
+true. The console works under strict mTLS: set console.coordinatorClient to its
+clientAuth Secret (see above); no need to disable the UI.

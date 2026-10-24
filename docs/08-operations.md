@@ -165,7 +165,7 @@ done
 
 # 5. Console (writes enabled; omit --read-only=false for read-only).
 ./bin/fass-console --listen=127.0.0.1:8081 \
-  --coordinator=http://127.0.0.1:7000 \
+  --coordinator=http://127.0.0.1:7000 --coordinator-insecure \
   --console-user=admin --console-password=change-me \
   --read-only=false >.dev/console.log 2>&1 &
 ```
@@ -368,21 +368,44 @@ fass cluster status --coordinator http://127.0.0.1:1 ; echo $?   # 2
 
 ```bash
 export FASS_CONSOLE_PASSWORD='change-me'
+# Dev/plaintext coordinator: the opt-in is explicit and shows in the banner.
 ./bin/fass-console \
   --listen=127.0.0.1:8081 \
-  --coordinator=http://127.0.0.1:7000 \
+  --coordinator=http://127.0.0.1:7000 --coordinator-insecure \
   --console-user=admin \
   --console-password="$FASS_CONSOLE_PASSWORD" \
   --read-only=false          # omit / =true for read-only (the default)
+
+# Production shape: HTTPS listener + TLS-only coordinator + mTLS client identity.
+./bin/fass-console \
+  --listen=0.0.0.0:8443 \
+  --tls-cert=/etc/fass/tls/console/tls.crt --tls-key=/etc/fass/tls/console/tls.key \
+  --coordinator=https://coordinator.example.internal:7000 \
+  --coordinator-ca=/etc/fass/tls/ca/ca.crt \
+  --coordinator-client-cert=/etc/fass/tls/console-client/tls.crt \
+  --coordinator-client-key=/etc/fass/tls/console-client/tls.key \
+  --console-user=admin --console-password="$FASS_CONSOLE_PASSWORD"
 ```
 
 Flags: `--listen`, `--coordinator`, `--console-user`, `--console-password`,
 `--read-only` (default **true**), `--coordinator-timeout`, `--log-level`,
 `--log-format`, `--version`.
 
-The password is mandatory; the process refuses to start without one. Basic
-auth is sent in clear text — terminate TLS in front of the console (or rely on
-localhost/SSH tunnels) and never expose it directly to the Internet.
+TLS flags: `--tls-cert/--tls-key` serve the console over HTTPS; optional
+`--tls-client-ca` + `--require-mtls` demand operator client certificates
+(browser UX is poor — prefer a proxy/SSO for humans). `--coordinator-ca` is
+**required** for an `https://` coordinator; `--coordinator-client-cert/-key` are
+presented to a `--require-mtls` coordinator; `--coordinator-server-name`
+overrides the verified name. An `http://` coordinator requires the explicit
+`--coordinator-insecure`; either plaintext choice is reported in `/healthz`
+(`"security":{"insecure":true,...}`) and as a persistent banner.
+
+The password is mandatory; the process refuses to start without one. When the
+console listener is plaintext, Basic auth is sent in clear text — terminate TLS
+in front of it (or rely on localhost/SSH tunnels) and never expose it directly to
+the Internet. A wrong coordinator CA makes startup fail with an actionable
+`coordinator TLS verification failed` error instead of a running console that
+returns 500s.
 
 ### 4.2 Routes
 
@@ -573,20 +596,22 @@ plaintext fallback during a mixed-mode rollout) or `off` (plaintext, only with
 ### 4.1 Three-step runbook: init CA → issue certs → enable strict
 
 TLS 1.3 only (`crypto/tls`, `crypto/x509`; no external dependencies). The CA key
-is written `0600` and is **never required at runtime** by agents or gateways.
+is written `0600` and is **never required at runtime** by any component.
 
 ```console
 # 1. Create the cluster CA (keep ca.key offline; only ca.crt is distributed).
-fass-gateway pki init --dir /etc/fass/pki/ca --cn fass-cluster-ca
+fass pki init --dir /etc/fass/pki/ca --cn fass-cluster-ca
 
 # 2. Issue certificates (one per listener identity; SANs must match how peers dial it).
 #    Gateway S3/control client + agent shard listeners:
-fass-gateway pki issue-server --ca-dir /etc/fass/pki/ca --dir /etc/fass/pki/agent \
+fass pki issue-server --ca-dir /etc/fass/pki/ca --dir /etc/fass/pki/agent \
   --dns agent-a1.internal --ip 10.0.0.11 --ttl 2160h
-fass-gateway pki issue-client --ca-dir /etc/fass/pki/ca --dir /etc/fass/pki/gateway \
+fass pki issue-client --ca-dir /etc/fass/pki/ca --dir /etc/fass/pki/gateway \
   --identity gateway-1 --ttl 2160h
+#    (The same commands remain available as `fass-gateway pki ...` for
+#    compatibility; the neutral CLI is the documented form.)
 #    Inspect any certificate (expiry, SANs, fingerprint):
-fass-gateway pki inspect --cert /etc/fass/pki/agent/tls.crt
+fass pki inspect --cert /etc/fass/pki/agent/tls.crt
 
 # 3. Enable TLS, then strict mTLS once every peer presents a certificate.
 #    The coordinator is fail-closed outside --dev: it needs its own certificate.
@@ -610,21 +635,21 @@ fass-gateway --ca-cert /etc/fass/pki/ca/ca.crt \
 | `--require-mtls` | `FASS_GATEWAY_REQUIRE_MTLS` | strict: no plaintext peers, client certs mandatory |
 | `--coordinator-ca` | `FASS_GATEWAY_COORDINATOR_CA` | CA bundle for the coordinator (defaults to `--ca-cert`) |
 | `--insecure` | `FASS_GATEWAY_INSECURE` | explicit plaintext; warning on every start, visible in `/healthz` |
-| `--coordinator-insecure` | `FASS_GATEWAY_COORDINATOR_INSECURE` | **transitional**: plaintext control plane while the data plane is TLS (see below) |
 | `--tls-cert` / `--tls-key` | `FASS_GATEWAY_TLS_CERT` / `FASS_GATEWAY_TLS_KEY` | serve the S3 edge over HTTPS |
 
 Non-dev gateways refuse to start with `--ca-cert` missing, `--agent-tls=off`
 (without `--insecure`), `--require-mtls` without a client certificate, or a
 plaintext `--coordinator` URL.
 
-> **Control-plane TLS status.** Gateway → coordinator TLS is already supported
-> (`--coordinator https://… --coordinator-ca`, fail-closed for non-dev). Agent →
-> coordinator TLS is the one remaining hop; until it lands, a coordinator
-> listener cannot be switched to TLS without stranding the agents.
-> `--coordinator-insecure` exists *only* to bridge that gap: it is an explicit,
-> loud, opt-in dev/transitional escape hatch, and it is scheduled to be removed
-> from this runbook and from `scripts/compat.sh` on the day agent → coordinator
-> TLS ships. Do not treat it as an operating mode.
+> **Control plane is TLS end to end.** The coordinator listener takes
+> `--tls-cert/--tls-key` and `--tls-client-ca --require-mtls`; the gateway dials
+> it with `--coordinator https://… --coordinator-ca` and fails closed otherwise;
+> agents dial it with `--coordinator-ca` plus
+> `--coordinator-client-cert/--coordinator-client-key` (see the agent table
+> below). There is no "plaintext control plane" flag. The only exception is an
+> explicitly labelled dev cluster: `--dev` with an `http://` coordinator is
+> permitted, warns on every start, and reports `security.coordinator_tls:false`
+> in `/healthz` — never use it outside local development.
 
 **Agent listener flags.** Agents follow the same fail-closed rule: TLS is
 required unless `--insecure` is passed explicitly.
@@ -721,7 +746,7 @@ connections alive — no coordinated restart of twelve agents.
 
 ```console
 # Issue the replacement to the same paths the component reads (atomic replace),
-fass-gateway pki issue-server --ca-dir /etc/fass/pki/ca --dir /etc/fass/pki/agent.new ...
+fass pki issue-server --ca-dir /etc/fass/pki/ca --dir /etc/fass/pki/agent.new ...
 # then move tls.crt/tls.key into place for the component; in-flight connections finish
 # on the old certificate, the next handshake picks up the new one.
 ```
@@ -745,16 +770,27 @@ rejects a plaintext peer, and an expired certificate fails with an actionable
 ### 4.4 Verifying the shipped matrix in both modes
 
 ```console
-make compat-clients            # 16 checks, plaintext data plane, HTTP edge
-make compat-clients-tls        # mTLS data plane, HTTP edge
-make compat-clients-tls-edge   # mTLS data plane + HTTPS on the S3 edge
-                               # (= COMPAT_TLS=1 COMPAT_EDGE_TLS=1)
+make compat-clients              # 16 checks, plaintext data plane, HTTP edge
+make compat-clients-tls          # mTLS data plane, HTTP edge
+make compat-clients-control-tls  # + mTLS control plane (coordinator+agents+gateway)
+make compat-clients-full-tls     # every hop TLS: data + control + HTTPS S3 edge
 ```
 
-`COMPAT_TLS=1` mints a throwaway CA under the run's temp directory with
-`fass-gateway pki`, starts the 12 agents with `--require-mtls` and the gateway
-with `--agent-tls=require --require-mtls`. `COMPAT_EDGE_TLS=1` additionally
-serves the S3 edge with `--tls-cert/--tls-key` from the same CA.
+Each mode mints a throwaway CA under the run's temp directory with
+`fass pki`; nothing is written to the repository.
+
+| Mode | Environment | What is encrypted |
+|---|---|---|
+| plaintext | (none) | nothing — dev cluster, `--insecure` everywhere, warned and visible |
+| data plane | `COMPAT_TLS=1` | agent shard transport mTLS (12 agents `--require-mtls`, gateway `--agent-tls=require --require-mtls`) |
+| control plane | `COMPAT_CONTROL_TLS=1` | + coordinator listener mTLS, agents `--coordinator-ca`/client certs, gateway `https://` + `--coordinator-ca`; implies `COMPAT_TLS=1` |
+| edge | `COMPAT_EDGE_TLS=1` | + S3 edge HTTPS (`--tls-cert/--tls-key` from the same CA) |
+| end state | `COMPAT_CONTROL_TLS=1 COMPAT_EDGE_TLS=1` | **every hop**: shard, control, S3 edge (repair uses the same CA/identity) |
+
+The script asserts each `/healthz` posture it claims: gateway
+`security.{insecure,agent_mode,require_mtls,s3_tls,coordinator_tls,…}`,
+coordinator `{tls,mtls,insecure}`, agents `{tls,insecure,tls_not_after}`. A
+matrix that passes with a mislabelled posture fails here.
 
 The edge certificate must have a SAN for the host clients dial
 (`--ip 127.0.0.1` and `--dns "$(hostname)"` — the script does both); SNI uses
@@ -767,12 +803,9 @@ mechanism, which is the friction worth knowing:
 | rclone | global `--ca-cert /path/ca.crt` on every invocation | no per-remote `ca_cert` for the `s3` backend, so it must be in the rclone wrapper/config flags |
 | s3cmd | `ca_certs_file = /path/ca.crt` + `use_https = True` + `check_ssl_certificate = True` in `.s3cfg` | a stale `use_https = False` silently downgrades the client, so verify it in the generated config |
 
-The coordinator stays plaintext in these dev matrices only because
-agent → coordinator TLS is not wired yet; the gateway opts in explicitly with
-the transitional `--coordinator-insecure` (see the control-plane note in §4.1).
-When that last hop ships, the modes should run with
-`--coordinator https://… --coordinator-ca …` and the flag should disappear from
-both the script and these docs; the script's success line reports exactly which
-hops were encrypted (`data plane mTLS; S3 edge HTTPS (custom CA)`).
+The script's success line reports exactly which hops were encrypted, e.g.
+`COMPAT: PASS (data plane mTLS; control plane mTLS; S3 edge HTTPS (custom CA))`.
+A mode that has never been executed is not coverage; all four are run as part of
+the release check.
 Nothing is written to the repository and the temp directory is removed on
 success (`COMPAT_KEEP=1` keeps the logs).

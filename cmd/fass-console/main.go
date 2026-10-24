@@ -11,10 +11,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -37,6 +39,20 @@ type config struct {
 	httpTimeout time.Duration
 	logLevel    string
 	logFormat   string
+
+	// Server-side TLS (optional; run behind a TLS proxy when disabled).
+	tlsCert     string
+	tlsKey      string
+	tlsClientCA string
+	requireMTLS bool
+
+	// Coordinator (client-side) TLS. Required for https://; the client identity
+	// is needed when the coordinator runs --require-mtls.
+	coordinatorCA         string
+	coordinatorClientCert string
+	coordinatorClientKey  string
+	coordinatorServerName string
+	coordinatorInsecure   bool
 }
 
 func main() {
@@ -56,6 +72,28 @@ func run(args []string) error {
 		return err
 	}
 
+	coordinatorClient, err := coordinatorHTTPClient(cfg)
+	if err != nil {
+		return err
+	}
+	serverTLS, err := serverTLSConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("console listener TLS: %w", err)
+	}
+	coordScheme, coordHost, err := coordinatorURLParts(cfg.coordinator)
+	if err != nil {
+		return err
+	}
+	if coordScheme == "http" {
+		logger.Warn("PLAINTEXT coordinator connection: --coordinator-insecure is set; this is dev-only")
+	}
+	if serverTLS == nil {
+		logger.Warn("console listener is plaintext HTTP; front it with a TLS reverse proxy")
+	}
+	if err := probeCoordinator(context.Background(), coordinatorClient, cfg.coordinator, coordHost, logger); err != nil {
+		return err
+	}
+
 	srv, err := console.New(console.Config{
 		CoordinatorURL: cfg.coordinator,
 		User:           cfg.user,
@@ -63,7 +101,13 @@ func run(args []string) error {
 		ReadOnly:       cfg.readOnly,
 		Version:        version,
 		Logger:         logger,
-		HTTPClient:     &http.Client{Timeout: cfg.httpTimeout},
+		HTTPClient:     coordinatorClient,
+		Security: console.SecurityInfo{
+			CoordinatorScheme:   coordScheme,
+			CoordinatorInsecure: coordScheme == "http",
+			ServeTLS:            serverTLS != nil,
+			RequireMTLS:         cfg.requireMTLS,
+		},
 	})
 	if err != nil {
 		return err
@@ -87,11 +131,21 @@ func run(args []string) error {
 			"coordinator", cfg.coordinator,
 			"read_only", cfg.readOnly,
 			"user", cfg.user,
+			"tls", serverTLS != nil,
+			"coordinator_tls", coordScheme == "https",
 		)
 		if !cfg.readOnly {
 			logger.Warn("write actions are ENABLED: activate/decommission are available to anyone with the console password")
 		}
-		errCh <- httpSrv.ListenAndServe()
+		ln, err := net.Listen("tcp", cfg.listen)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if serverTLS != nil {
+			ln = tls.NewListener(ln, serverTLS)
+		}
+		errCh <- httpSrv.Serve(ln)
 	}()
 
 	select {
@@ -123,6 +177,16 @@ func parseConfig(args []string) (config, error) {
 		httpTimeout: 5 * time.Second,
 		logLevel:    envOr("FASS_LOG_LEVEL", "info"),
 		logFormat:   envOr("FASS_LOG_FORMAT", "text"),
+
+		tlsCert:               envOr("FASS_CONSOLE_TLS_CERT", ""),
+		tlsKey:                envOr("FASS_CONSOLE_TLS_KEY", ""),
+		tlsClientCA:           envOr("FASS_CONSOLE_TLS_CLIENT_CA", ""),
+		requireMTLS:           envBool("FASS_CONSOLE_REQUIRE_MTLS"),
+		coordinatorCA:         envOr("FASS_CONSOLE_COORDINATOR_CA", ""),
+		coordinatorClientCert: envOr("FASS_CONSOLE_COORDINATOR_CLIENT_CERT", ""),
+		coordinatorClientKey:  envOr("FASS_CONSOLE_COORDINATOR_CLIENT_KEY", ""),
+		coordinatorServerName: envOr("FASS_CONSOLE_COORDINATOR_SERVER_NAME", ""),
+		coordinatorInsecure:   envBool("FASS_CONSOLE_COORDINATOR_INSECURE"),
 	}
 	fs.StringVar(&cfg.listen, "listen", cfg.listen, "HTTP listen address (env FASS_CONSOLE_LISTEN)")
 	fs.StringVar(&cfg.coordinator, "coordinator", cfg.coordinator, "coordinator base URL (env FASS_COORDINATOR_URL)")
@@ -130,6 +194,15 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.password, "console-password", cfg.password, "HTTP Basic password (env FASS_CONSOLE_PASSWORD, required)")
 	fs.BoolVar(&cfg.readOnly, "read-only", cfg.readOnly, "disable the activate/decommission write actions (env FASS_CONSOLE_READ_ONLY)")
 	fs.DurationVar(&cfg.httpTimeout, "coordinator-timeout", cfg.httpTimeout, "per-request coordinator timeout")
+	fs.StringVar(&cfg.tlsCert, "tls-cert", cfg.tlsCert, "TLS certificate for the console listener (env FASS_CONSOLE_TLS_CERT)")
+	fs.StringVar(&cfg.tlsKey, "tls-key", cfg.tlsKey, "TLS key for the console listener (env FASS_CONSOLE_TLS_KEY)")
+	fs.StringVar(&cfg.tlsClientCA, "tls-client-ca", cfg.tlsClientCA, "CA bundle for verifying console client certificates (env FASS_CONSOLE_TLS_CLIENT_CA)")
+	fs.BoolVar(&cfg.requireMTLS, "require-mtls", cfg.requireMTLS, "require client certificates on the console listener (needs --tls-cert/--tls-key/--tls-client-ca; browser UX is poor)")
+	fs.StringVar(&cfg.coordinatorCA, "coordinator-ca", cfg.coordinatorCA, "CA bundle that verifies the coordinator certificate; required for https:// (env FASS_CONSOLE_COORDINATOR_CA)")
+	fs.StringVar(&cfg.coordinatorClientCert, "coordinator-client-cert", cfg.coordinatorClientCert, "client certificate presented to a coordinator with --require-mtls (env FASS_CONSOLE_COORDINATOR_CLIENT_CERT)")
+	fs.StringVar(&cfg.coordinatorClientKey, "coordinator-client-key", cfg.coordinatorClientKey, "client key for --coordinator-client-cert (env FASS_CONSOLE_COORDINATOR_CLIENT_KEY)")
+	fs.StringVar(&cfg.coordinatorServerName, "coordinator-server-name", cfg.coordinatorServerName, "server name verified against the coordinator certificate (default: host from --coordinator)")
+	fs.BoolVar(&cfg.coordinatorInsecure, "coordinator-insecure", cfg.coordinatorInsecure, "explicitly allow a plaintext http:// coordinator (dev only; visible in the banner and /healthz)")
 	fs.StringVar(&cfg.logLevel, "log-level", cfg.logLevel, "debug|info|warn|error")
 	fs.StringVar(&cfg.logFormat, "log-format", cfg.logFormat, "json|text")
 	showVersion := fs.Bool("version", false, "print version and exit")
@@ -151,6 +224,31 @@ func parseConfig(args []string) (config, error) {
 	}
 	if !strings.HasPrefix(cfg.coordinator, "http://") && !strings.HasPrefix(cfg.coordinator, "https://") {
 		return config{}, fmt.Errorf("--coordinator %q must start with http:// or https://", cfg.coordinator)
+	}
+	if (cfg.tlsCert == "") != (cfg.tlsKey == "") {
+		return config{}, errors.New("--tls-cert and --tls-key must be set together")
+	}
+	if cfg.requireMTLS {
+		if cfg.tlsCert == "" {
+			return config{}, errors.New("--require-mtls needs --tls-cert/--tls-key (a TLS listener) and --tls-client-ca")
+		}
+		if cfg.tlsClientCA == "" {
+			return config{}, errors.New("--require-mtls needs --tls-client-ca (the CA bundle for operator client certificates)")
+		}
+	}
+	if (cfg.coordinatorClientCert == "") != (cfg.coordinatorClientKey == "") {
+		return config{}, errors.New("--coordinator-client-cert and --coordinator-client-key must be set together")
+	}
+	if strings.HasPrefix(cfg.coordinator, "https://") {
+		if cfg.coordinatorCA == "" {
+			return config{}, errors.New("refusing to use an https:// coordinator without --coordinator-ca: " +
+				"set the CA bundle that verifies the coordinator certificate (FASS_CONSOLE_COORDINATOR_CA); " +
+				"plaintext http:// requires --coordinator-insecure and is dev-only")
+		}
+	} else if !cfg.coordinatorInsecure {
+		return config{}, errors.New("refusing a plaintext http:// coordinator without --coordinator-insecure: " +
+			"use https:// with --coordinator-ca, or pass --coordinator-insecure for a dev-only deployment " +
+			"(the console banner and /healthz will report it)")
 	}
 	return cfg, nil
 }

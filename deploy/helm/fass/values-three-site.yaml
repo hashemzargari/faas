@@ -60,6 +60,13 @@ console:
   readOnly: true
   auth:
     existingSecret: fass-console-auth
+  # Console serves HTTPS itself and presents a clientAuth identity to the
+  # coordinator (required when tls.requireMTLS=true).
+  tls:
+    enabled: true
+    existingSecret: fass-console-tls
+  coordinatorClient:
+    existingSecret: fass-console-client-tls
 
 agents:
   enabled: true

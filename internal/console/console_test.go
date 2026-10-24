@@ -672,3 +672,77 @@ fass_coordinator_other_total 9
 		t.Fatalf("countServerErrors = %d, want 5", got)
 	}
 }
+
+func TestHealthzReportsSecurityPosture(t *testing.T) {
+	fake := newFakeCoordinator()
+	coord := httptest.NewServer(fake.handler())
+	defer coord.Close()
+	srv, err := New(Config{
+		CoordinatorURL: coord.URL,
+		User:           "operator",
+		Password:       "s3cret",
+		ReadOnly:       true,
+		Version:        "test",
+		Security: SecurityInfo{
+			CoordinatorScheme:   "https",
+			CoordinatorInsecure: false,
+			ServeTLS:            true,
+			RequireMTLS:         true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("console.New: %v", err)
+	}
+	web := httptest.NewServer(srv.Handler())
+	defer web.Close()
+
+	resp, err := http.Get(web.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got struct {
+		Status   string       `json:"status"`
+		Security SecurityInfo `json:"security"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode healthz: %v", err)
+	}
+	if got.Status != "ok" {
+		t.Fatalf("status = %q", got.Status)
+	}
+	if got.Security.CoordinatorScheme != "https" || !got.Security.ServeTLS || !got.Security.RequireMTLS || got.Security.CoordinatorInsecure {
+		t.Fatalf("security = %+v", got.Security)
+	}
+}
+
+func TestInsecureCoordinatorBanner(t *testing.T) {
+	fake := newFakeCoordinator()
+	coord := httptest.NewServer(fake.handler())
+	defer coord.Close()
+	srv, err := New(Config{
+		CoordinatorURL: coord.URL,
+		User:           "operator",
+		Password:       "s3cret",
+		ReadOnly:       true,
+		Version:        "test",
+		Security:       SecurityInfo{CoordinatorScheme: "http", CoordinatorInsecure: true},
+	})
+	if err != nil {
+		t.Fatalf("console.New: %v", err)
+	}
+	web := httptest.NewServer(srv.Handler())
+	defer web.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, web.URL+"/", nil)
+	req.SetBasicAuth("operator", "s3cret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "Insecure configuration") || !strings.Contains(string(body), "PLAINTEXT") {
+		t.Fatalf("insecure banner missing: %s", body)
+	}
+}
