@@ -1,4 +1,8 @@
 {{- if .Values.gateway.enabled }}
+{{- if not .Values.tls.enabled }}
+# WARNING: tls.enabled=false — DEV ONLY. Data-plane and control-plane traffic
+# (agents, coordinator) is plaintext; the gateway reports security.insecure=true.
+{{- end }}
 {{- $g := .Values.gateway }}
 {{- $rc := .Values.redundancy }}
 {{- $name := printf "%s-gateway" (include "fass.fullname" .) }}
@@ -109,7 +113,7 @@ spec:
               value: {{ $rc.localN | quote }}
             - name: FASS_GATEWAY_LOCAL_K
               value: {{ $rc.localK | quote }}
-            - name: FASS_GATEWAY_OFFLOADER_WORKERS
+            - name: FASS_GATEWAY_WORKERS
               value: {{ $g.offloaderWorkers | quote }}
             - name: FASS_GATEWAY_SHARD_PARALLEL
               value: {{ $g.shardParallel | quote }}
@@ -117,25 +121,55 @@ spec:
               value: "info"
             - name: FASS_LOG_FORMAT
               value: "json"
+            {{- if .Values.tls.enabled }}
+            - name: FASS_GATEWAY_CA_CERT
+              value: {{ printf "/etc/fass/tls/ca/%s" .Values.tls.caKey | quote }}
+            - name: FASS_GATEWAY_AGENT_TLS
+              value: {{ $g.agentTLS | quote }}
+            {{- if $g.mtls.existingSecret }}
+            - name: FASS_GATEWAY_CLIENT_CERT
+              value: {{ printf "/etc/fass/tls/client/%s" $g.mtls.certKey | quote }}
+            - name: FASS_GATEWAY_CLIENT_KEY
+              value: {{ printf "/etc/fass/tls/client/%s" $g.mtls.keyKey | quote }}
+            {{- end }}
+            {{- if .Values.tls.requireMTLS }}
+            - name: FASS_GATEWAY_REQUIRE_MTLS
+              value: "true"
+            {{- end }}
+            - name: FASS_GATEWAY_COORDINATOR_CA
+              value: {{ printf "/etc/fass/tls/ca/%s" .Values.tls.caKey | quote }}
+            {{- else }}
+            # Explicit dev-only plaintext opt-in (validated by tls.allowInsecure).
+            - name: FASS_GATEWAY_DEV
+              value: "true"
+            - name: FASS_GATEWAY_INSECURE
+              value: "true"
+            - name: FASS_GATEWAY_AGENT_TLS
+              value: "off"
+            - name: FASS_GATEWAY_COORDINATOR_INSECURE
+              value: "true"
+            {{- end }}
+            {{- if and $g.tls.enabled .Values.tls.enabled }}
+            - name: FASS_GATEWAY_TLS_CERT
+              value: /etc/fass/tls/s3/{{ $g.tls.certKey }}
+            - name: FASS_GATEWAY_TLS_KEY
+              value: /etc/fass/tls/s3/{{ $g.tls.keyKey }}
+            {{- end }}
             {{- if $g.defaultRedundancyClass }}
             - name: FASS_GATEWAY_DEFAULT_RC
               value: {{ $g.defaultRedundancyClass | quote }}
             {{- end }}
+            {{- if or $g.devMode (not .Values.tls.enabled) }}
             {{- if $g.devMode }}
             - name: FASS_GATEWAY_DEV
               value: "true"
+            {{- end }}
             {{- else }}
             - name: FASS_GATEWAY_KEY_SEED
               valueFrom:
                 secretKeyRef:
                   name: {{ $g.keySeed.existingSecret }}
                   key: {{ $g.keySeed.secretKey }}
-            {{- end }}
-            {{- if $g.tls.enabled }}
-            - name: FASS_GATEWAY_TLS_CERT
-              value: /etc/fass/tls/{{ $g.tls.certKey }}
-            - name: FASS_GATEWAY_TLS_KEY
-              value: /etc/fass/tls/{{ $g.tls.keyKey }}
             {{- end }}
             {{- if $g.sdpPolicy.existingConfigMap }}
             - name: FASS_GATEWAY_SDP_POLICY
@@ -172,10 +206,21 @@ spec:
           resources:
             {{- toYaml $g.resources | nindent 12 }}
           volumeMounts:
-            {{- if $g.tls.enabled }}
-            - name: tls
-              mountPath: /etc/fass/tls
+            {{- if and $g.tls.enabled .Values.tls.enabled }}
+            - name: gateway-s3-tls
+              mountPath: /etc/fass/tls/s3
               readOnly: true
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls-ca
+              mountPath: {{ printf "/etc/fass/tls/ca/%s" .Values.tls.caKey }}
+              subPath: {{ .Values.tls.caKey }}
+              readOnly: true
+            {{- if $g.mtls.existingSecret }}
+            - name: tls-client
+              mountPath: /etc/fass/tls/client
+              readOnly: true
+            {{- end }}
             {{- end }}
             {{- if $g.sdpPolicy.existingConfigMap }}
             - name: sdp-policy
@@ -183,10 +228,21 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
-        {{- if $g.tls.enabled }}
-        - name: tls
+        {{- if and $g.tls.enabled .Values.tls.enabled }}
+        - name: gateway-s3-tls
           secret:
             secretName: {{ $g.tls.existingSecret }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: tls-ca
+          secret:
+            secretName: {{ .Values.tls.caSecret }}
+            defaultMode: 0440
+        - name: tls-client
+          secret:
+            secretName: {{ $g.mtls.existingSecret }}
+            defaultMode: 0400
         {{- end }}
         {{- if $g.sdpPolicy.existingConfigMap }}
         - name: sdp-policy

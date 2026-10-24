@@ -13,6 +13,13 @@ image:
   tag: dev
   pullPolicy: IfNotPresent
 
+# Dev-only plaintext opt-out. The rendered manifests carry a WARNING comment and
+# every component runs with its explicit insecure/dev switch; never copy this
+# to a production values file. See docs/09-deployment.md §TLS.
+tls:
+  enabled: false
+  allowInsecure: true
+
 redundancy:
   geoN: 2
   geoK: 1

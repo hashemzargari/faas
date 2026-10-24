@@ -50,6 +50,24 @@ serviceAccount:
   # -- Defaults to the release fullname.
   name: ""
 
+# -- Transport encryption. TLS is ON by default; every component fails closed
+# without certificate material on a current FASS release. Plaintext is an
+# explicit dev-only opt-out (`tls.enabled=false` + `tls.allowInsecure=true`),
+# never a silent default.
+tls:
+  enabled: true
+  # -- Extra guard: flipping tls.enabled=false requires allowInsecure=true, and
+  # the rendered manifests carry a plaintext warning comment + insecure flags.
+  allowInsecure: false
+  # -- Existing Secret with the cluster CA **public certificate only**
+  # (key tls.caKey). The CA private key must never be in the cluster; it is only
+  # needed by `fass-gateway pki issue-*` on an operator workstation.
+  caSecret: CHANGEME-fass-ca
+  caKey: ca.crt
+  # -- Require and verify client certificates everywhere (strict mTLS). Roll out
+  # with false, then flip to true after every agent/gateway has a client cert.
+  requireMTLS: false
+
 coordinator:
   enabled: true
   # -- 1 with the embedded store (single writer). With dbDriver=postgres you may
@@ -67,6 +85,14 @@ coordinator:
   # -- Apply PostgreSQL migrations on start. Production should leave this false:
   # a helm pre-install/pre-upgrade Job runs `fass-coordinator migrate` instead.
   dbMigrateOnStart: false
+  # -- Existing Secrets for the coordinator listener identity (PEM tls.crt/tls.key).
+  # The certificate SANs must include every name peers dial:
+  # <release>-coordinator, <release>-coordinator.<namespace>.svc, ...svc.cluster.local.
+  tls:
+    certSecret: CHANGEME-fass-coordinator-tls
+    certKey: tls.crt
+    keySecret: CHANGEME-fass-coordinator-tls
+    keyKey: tls.key
   listenPort: 7000
   dataDir: /var/lib/fass
   logLevel: info
@@ -117,12 +143,28 @@ gateway:
     existingSecret: "CHANGEME-fass-gateway-key-seed"
     secretKey: key-seed
   tls:
-    # -- Gateway terminates TLS itself when enabled; the Secret must contain a
-    # tls.crt/tls.key pair (or set certKey/keyKey).
+    # -- S3 edge listener. The Gateway terminates TLS itself when enabled; the
+    # Secret must contain a tls.crt/tls.key pair (or set certKey/keyKey).
+    # Keep this on unless an L4/L7 load balancer terminates TLS in front.
     enabled: true
     existingSecret: "CHANGEME-fass-gateway-tls"
     certKey: tls.crt
     keyKey: tls.key
+  # -- Data-plane / control-plane identity. The gateway verifies agents and the
+  # coordinator against the global CA (tls.caSecret) and presents this client
+  # certificate when mTLS is required. The certificate must carry the
+  # clientAuth EKU (`fass-gateway pki issue-client`).
+  mtls:
+    # -- Optional for server-auth-only TLS; required when tls.requireMTLS=true.
+    existingSecret: ""
+    certKey: tls.crt
+    keyKey: tls.key
+  # -- Data-plane mode: require (default) | auto (mixed-mode rollout) | off
+  # (only valid together with tls.enabled=false / --insecure).
+  agentTLS: require
+  # -- Explicit plaintext control-plane opt-in (dev/transition only); ignored
+  # when tls.enabled=true.
+  coordinatorInsecure: false
   # -- Optional Smart Data Placement policy (JSON) in an existing ConfigMap.
   sdpPolicy:
     existingConfigMap: ""
@@ -179,6 +221,18 @@ agents:
   # secrets), so the default values deploy none. Enable in a per-site values
   # file and fill agents.nodes; see values-three-site.yaml.
   enabled: false
+  # -- Existing Secrets for the agent shard-listener identity and the client
+  # identity used for agent-to-agent repair (clientAuth EKU). A server cert must
+  # contain a SAN for every name a peer dials: with hostNetwork=true the agent
+  # announces its node IP, so a shared cert needs every node IP; otherwise set a
+  # per-node `tlsSecret` in agents.nodes[]. See docs/09-deployment.md §TLS.
+  tls:
+    existingSecret: CHANGEME-fass-agent-tls
+    certKey: tls.crt
+    keyKey: tls.key
+    clientCertSecret: CHANGEME-fass-agent-client-tls
+    clientCertKey: tls.crt
+    clientKeyKey: tls.key
   # -- Coordinator URL the agents announce to. Empty = the in-chart coordinator
   # Service (single-cluster install). For a per-site release point this at the
   # site-A coordinator, e.g. https://coordinator.fass.internal:7000.
@@ -218,6 +272,8 @@ agents:
   #         diskId: ""                # optional operator-facing slot label
   #         existingSecret: fass-agent-node-a1-disk0
   #         secretKey: secret
+  #     # optional per-node server certificate (recommended: SAN = node IP/FQDN)
+  #     tlsSecret: fass-agent-node-a1-tls
   nodes: []
   # -- Escape hatch: allow more disks on a node than aag. Placement still caps
   # shards of one shard-set at aag per Node, so the extra disks only serve other

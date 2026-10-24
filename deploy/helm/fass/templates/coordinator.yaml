@@ -1,4 +1,8 @@
 {{- if .Values.coordinator.enabled }}
+{{- if not .Values.tls.enabled }}
+# WARNING: tls.enabled=false — DEV ONLY. The coordinator listens in plaintext
+# and the control plane is unauthenticated; do not use this shape outside dev.
+{{- end }}
 {{- $c := .Values.coordinator }}
 {{- $name := printf "%s-coordinator" (include "fass.fullname" .) }}
 {{- $labels := include "fass.labels" . }}
@@ -96,6 +100,25 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/usr/local/bin/fass-coordinator"]
           env:
+            {{- if .Values.tls.enabled }}
+            - name: FASS_COORDINATOR_TLS_CERT
+              value: {{ printf "/etc/fass/tls/server/%s" $c.tls.certKey | quote }}
+            - name: FASS_COORDINATOR_TLS_KEY
+              value: {{ printf "/etc/fass/tls/server/%s" $c.tls.keyKey | quote }}
+            - name: FASS_COORDINATOR_AGENT_SCHEME
+              value: "https"
+            {{- if .Values.tls.requireMTLS }}
+            - name: FASS_COORDINATOR_TLS_CLIENT_CA
+              value: {{ printf "/etc/fass/tls/ca/%s" .Values.tls.caKey | quote }}
+            - name: FASS_COORDINATOR_REQUIRE_MTLS
+              value: "true"
+            {{- end }}
+            {{- else }}
+            - name: FASS_COORDINATOR_DEV
+              value: "true"
+            - name: FASS_COORDINATOR_AGENT_SCHEME
+              value: "http"
+            {{- end }}
             - name: FASS_COORDINATOR_DB_DRIVER
               value: {{ $c.dbDriver | quote }}
             {{- if eq $c.dbDriver "postgres" }}
@@ -123,6 +146,26 @@ spec:
             - name: http
               containerPort: {{ $c.listenPort }}
               protocol: TCP
+          {{- if .Values.tls.enabled }}
+          # The listener is TLS-only and the certificate SANs are peer names, so
+          # the local probe verifies liveness, not the certificate (traffic
+          # security is enforced on the real peers). -insecure only skips probe
+          # certificate verification.
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/fass-dev-healthcheck", "-insecure", "https://127.0.0.1:{{ $c.listenPort }}/healthz"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/fass-dev-healthcheck", "-insecure", "https://127.0.0.1:{{ $c.listenPort }}/readyz"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          {{- else }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -139,6 +182,7 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
+          {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -146,13 +190,30 @@ spec:
               drop: ["ALL"]
           resources:
             {{- toYaml $c.resources | nindent 12 }}
-          {{- if eq $c.dbDriver "embedded" }}
+          {{- if or (eq $c.dbDriver "embedded") .Values.tls.enabled }}
           volumeMounts:
+            {{- if eq $c.dbDriver "embedded" }}
             - name: data
               mountPath: {{ $c.dataDir }}
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls-ca
+              mountPath: {{ printf "/etc/fass/tls/ca/%s" .Values.tls.caKey }}
+              subPath: {{ .Values.tls.caKey }}
+              readOnly: true
+            - name: tls-cert
+              mountPath: {{ printf "/etc/fass/tls/server/%s" $c.tls.certKey }}
+              subPath: {{ $c.tls.certKey }}
+              readOnly: true
+            - name: tls-key
+              mountPath: {{ printf "/etc/fass/tls/server/%s" $c.tls.keyKey }}
+              subPath: {{ $c.tls.keyKey }}
+              readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if eq $c.dbDriver "embedded" }}
+      {{- if or (eq $c.dbDriver "embedded") .Values.tls.enabled }}
       volumes:
+        {{- if eq $c.dbDriver "embedded" }}
         - name: data
           {{- if $c.persistence.enabled }}
           persistentVolumeClaim:
@@ -160,5 +221,20 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: tls-ca
+          secret:
+            secretName: {{ .Values.tls.caSecret }}
+            defaultMode: 0440
+        - name: tls-cert
+          secret:
+            secretName: {{ $c.tls.certSecret }}
+            defaultMode: 0440
+        - name: tls-key
+          secret:
+            secretName: {{ $c.tls.keySecret }}
+            defaultMode: 0400
+        {{- end }}
       {{- end }}
 {{- end }}

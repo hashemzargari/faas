@@ -1,53 +1,106 @@
 {{- $fullname := include "fass.fullname" . }}
+{{- $scheme := ternary "https" "http" .Values.tls.enabled }}
+{{- $coordURL := printf "%s://%s-coordinator:%v" $scheme $fullname .Values.coordinator.listenPort }}
 FASS {{ .Chart.AppVersion }} installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
 
 Components rendered:
 {{- if .Values.coordinator.enabled }}
-  * coordinator: {{ $fullname }}-coordinator:{{ .Values.coordinator.listenPort }} (replicas: {{ .Values.coordinator.replicas }}, store: {{ if eq .Values.coordinator.dbDriver "postgres" }}postgresql (migrate hook){{ else if .Values.coordinator.persistence.enabled }}PVC{{ else }}emptyDir (EPHEMERAL){{ end }})
+  * coordinator: {{ $fullname }}-coordinator:{{ .Values.coordinator.listenPort }} (replicas: {{ .Values.coordinator.replicas }}, store: {{ if eq .Values.coordinator.dbDriver "postgres" }}postgresql (migrate hook){{ else if .Values.coordinator.persistence.enabled }}PVC{{ else }}emptyDir (EPHEMERAL){{ end }}, TLS: {{ .Values.tls.enabled }})
 {{- end }}
 {{- if .Values.gateway.enabled }}
-  * gateway: {{ $fullname }}-gateway:{{ .Values.gateway.listenPort }} (replicas: {{ .Values.gateway.replicas }}, TLS: {{ .Values.gateway.tls.enabled }})
+  * gateway: {{ $fullname }}-gateway:{{ .Values.gateway.listenPort }} (replicas: {{ .Values.gateway.replicas }}, S3 TLS: {{ .Values.gateway.tls.enabled }}, data-plane TLS: {{ ternary "require" "plaintext (dev)" .Values.tls.enabled }})
 {{- end }}
 {{- if .Values.console.enabled }}
-  * console: {{ $fullname }}-console:{{ .Values.console.listenPort }} (read-only: {{ .Values.console.readOnly }})
+  * console: {{ $fullname }}-console:{{ .Values.console.listenPort }} (read-only: {{ .Values.console.readOnly }}, talks to {{ $coordURL }}; the console itself has no TLS — front it with a proxy)
 {{- end }}
 {{- if .Values.agents.enabled }}
-  * agents: {{ len .Values.agents.nodes }} pinned node deployment(s), one container per disk
+  * agents: {{ len .Values.agents.nodes }} pinned node deployment(s), one container per disk, shard TLS: {{ .Values.tls.enabled }}
 {{- else }}
   * agents: DISABLED (values.yaml defaults deploy none; use a per-site values file)
+{{- end }}
+
+{{- if not .Values.tls.enabled }}
+
+********************************************************************************
+WARNING: tls.enabled=false — THIS RELEASE IS PLAINTEXT AND DEV-ONLY.
+Every control-plane and data-plane hop is unencrypted; every component reports
+security.insecure=true. Never expose it outside a throwaway dev cluster.
+********************************************************************************
 {{- end }}
 
 Before this is usable:
 
  1. Replace every placeholder Secret name (CHANGEME-*). The chart never creates
-    Secrets. Required:
-      - gateway key seed      (gateway.keySeed.existingSecret; losing it makes existing data unreadable)
-      - gateway TLS cert/key  (gateway.tls.existingSecret, unless tls.enabled=false behind an LB)
-      - console basic auth    (console.auth.existingSecret: console-user / console-password)
+    Secrets and never inlines certificate material. Required:
+      - cluster CA public cert   (tls.caSecret, key tls.caKey; the CA *key* stays offline)
+      - coordinator listener     (coordinator.tls.certSecret/keySecret)
+      - gateway S3 listener      (gateway.tls.existingSecret, unless an L4/LB terminates S3 TLS)
+      - gateway client identity  (gateway.mtls.existingSecret; required when tls.requireMTLS=true)
+      - agent listener(s)        (agents.tls.existingSecret or per-node agents.nodes[].tlsSecret)
+      - agent repair identity    (agents.tls.clientCertSecret; clientAuth EKU)
+      - gateway key seed         (gateway.keySeed.existingSecret; losing it makes existing data unreadable)
+      - console basic auth       (console.auth.existingSecret: console-user / console-password)
       - one announce Secret per disk (agents.nodes[].disks[].existingSecret)
       - PostgreSQL DSN           (coordinator.db.existingSecret, when dbDriver=postgres)
-{{- if .Values.agents.enabled }}
 
- 2. Register each disk with the coordinator and store its one-time secret. The
+ 2. SANs (the rule that stalls TLS rollouts): every name a peer dials must be in
+    the certificate. With the default hostNetwork agents, an agent announces its
+    node IP, so a shared agent cert needs every node IP as an IP SAN; per-node
+    certs are cleaner. Typical generation (CA key stays on your workstation):
+
+      fass-gateway pki init --dir ./pki/ca --cn fass-cluster-ca
+
+      # coordinator — include service DNS names peers use
+      fass-gateway pki issue-server --ca-dir ./pki/ca --dir ./pki/coordinator \
+        --dns {{ $fullname }}-coordinator \
+        --dns {{ $fullname }}-coordinator.{{ .Release.Namespace }}.svc \
+        --dns {{ $fullname }}-coordinator.{{ .Release.Namespace }}.svc.cluster.local
+
+      # gateway S3 edge (clients dial this name) and gateway client identity
+      fass-gateway pki issue-server --ca-dir ./pki/ca --dir ./pki/gateway \
+        --dns s3.example.com --ip <load-balancer-ip>
+      fass-gateway pki issue-client --ca-dir ./pki/ca --dir ./pki/gateway-client \
+        --identity gateway-1
+
+      # agent on node-a1 (agent announces status.hostIP:port by default)
+      fass-gateway pki issue-server --ca-dir ./pki/ca --dir ./pki/agent-node-a1 \
+        --ip <node-a1-ip> --dns <node-a1-fqdn>
+      fass-gateway pki issue-client --ca-dir ./pki/ca --dir ./pki/agent-client \
+        --identity agent-client
+
+    Then load them into the referenced Secrets (cert+key in the same Secret for
+    `tls.crt`/`tls.key`), e.g.:
+      kubectl -n {{ .Release.Namespace }} create secret generic fass-coordinator-tls \
+        --from-file=tls.crt=./pki/coordinator/tls.crt --from-file=tls.key=./pki/coordinator/tls.key
+      kubectl -n {{ .Release.Namespace }} create secret generic fass-ca --from-file=ca.crt=./pki/ca/ca.crt
+    Full runbook (rotation, mixed-mode rollout, CA-loss consequences):
+    docs/08-operations.md §4 and docs/09-deployment.md §TLS.
+
+ 3. Register each disk with the coordinator and store its one-time secret. The
     node id MUST equal the Kubernetes node name (the chart passes it as
     --node-id):
-      curl -sS -X POST http://<coordinator>:{{ .Values.coordinator.listenPort }}/v1/agents/pending \
+      curl -sS{{ if .Values.tls.enabled }} --cacert ./pki/ca/ca.crt{{ end }} -X POST {{ $coordURL }}/v1/agents/pending \
         -H 'Content-Type: application/json' \
         -d '{"node_id":"<node-name>","disk_id":"disk0"}'
     then create the Secret from the returned "secret".
 
- 3. Prepare the host disk directories on every agent node (owned by uid 65532):
+ 4. Prepare the host disk directories on every agent node (owned by uid 65532):
       install -d -o 65532 -g 65532 -m 0750 /var/lib/fass/disks/disk0 ...
-{{- end }}
+{{- if .Values.agents.enabled }}
 
- 4. Create the Redundancy Class + Ring + buckets through the coordinator API
+ 5. Create the Redundancy Class + Ring + buckets through the coordinator API
     (the chart does not create cluster metadata). See docs/09-deployment.md.
+{{- end }}
 
 Verify:
   kubectl -n {{ .Release.Namespace }} get pods
-  fass --endpoint http://<gateway-host>:{{ .Values.gateway.listenPort }} health
-  fass cluster status
-  curl -fsS http://<coordinator>:{{ .Values.coordinator.listenPort }}/v1/repair/status
+  # probes use /usr/local/bin/fass-dev-healthcheck (shipped in the image) for TLS-only listeners
+{{- if .Values.tls.enabled }}
+  curl --cacert ./pki/ca/ca.crt -fsS {{ $coordURL }}/v1/repair/status
+  fass --coordinator {{ $coordURL }} health    # with SSL_CERT_FILE=./pki/ca/ca.crt
+{{- else }}
+  curl -fsS {{ $coordURL }}/v1/repair/status
+{{- end }}
 
-Upgrade order is coordinator -> gateways -> agents. Read
-docs/09-deployment.md before upgrading or changing the RC.
+Upgrade order is coordinator -> gateways -> agents (see docs/09-deployment.md §Upgrade).
+Strict mTLS: roll all components with tls.requireMTLS=false first, then set it true.

@@ -1,4 +1,8 @@
 {{- if .Values.console.enabled }}
+{{- if not .Values.tls.enabled }}
+# WARNING: tls.enabled=false — DEV ONLY. The console talks to a plaintext
+# coordinator; it has no TLS of its own in either mode (front it with a proxy).
+{{- end }}
 {{- $con := .Values.console }}
 {{- $name := printf "%s-console" (include "fass.fullname" .) }}
 {{- $coordURL := include "fass.effectiveCoordinatorURL" (dict "root" . "url" $con.coordinatorURL) }}
@@ -96,6 +100,12 @@ spec:
               value: "info"
             - name: FASS_LOG_FORMAT
               value: "json"
+            {{- if .Values.tls.enabled }}
+            # The console has no CA flag; Go honours SSL_CERT_FILE for its
+            # coordinator HTTP client, so mount the cluster CA and point at it.
+            - name: SSL_CERT_FILE
+              value: {{ printf "/etc/fass/tls/ca/%s" .Values.tls.caKey | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ $con.listenPort }}
@@ -123,4 +133,18 @@ spec:
               drop: ["ALL"]
           resources:
             {{- toYaml $con.resources | nindent 12 }}
+          {{- if .Values.tls.enabled }}
+          volumeMounts:
+            - name: tls-ca
+              mountPath: {{ printf "/etc/fass/tls/ca/%s" .Values.tls.caKey }}
+              subPath: {{ .Values.tls.caKey }}
+              readOnly: true
+          {{- end }}
+      {{- if .Values.tls.enabled }}
+      volumes:
+        - name: tls-ca
+          secret:
+            secretName: {{ .Values.tls.caSecret }}
+            defaultMode: 0440
+      {{- end }}
 {{- end }}

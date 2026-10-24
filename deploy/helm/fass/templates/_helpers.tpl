@@ -43,9 +43,10 @@ app.kubernetes.io/component: {{ .component }}
 {{- printf "%s:%s" $img.repository (default .Chart.AppVersion $img.tag) -}}
 {{- end -}}
 
-{{/* In-chart coordinator Service URL. */}}
+{{/* In-chart coordinator Service URL. TLS is the default; the port is the same. */}}
 {{- define "fass.coordinatorServiceURL" -}}
-{{- printf "http://%s-coordinator:%v" (include "fass.fullname" .) .Values.coordinator.listenPort -}}
+{{- $scheme := ternary "https" "http" .Values.tls.enabled -}}
+{{- printf "%s://%s-coordinator:%v" $scheme (include "fass.fullname" .) .Values.coordinator.listenPort -}}
 {{- end -}}
 
 {{/* Effective coordinator URL for a component: explicit value, else the in-chart Service. */}}
@@ -113,6 +114,45 @@ app.kubernetes.io/component: {{ .component }}
 {{- if and .Values.console.enabled (not .Values.console.auth.existingSecret) -}}
 {{- fail "console.auth.existingSecret is required (keys console-user/console-password); the console refuses to start unauthenticated" -}}
 {{- end -}}
+{{- $tls := .Values.tls -}}
+{{- if not $tls.enabled -}}
+{{- if not $tls.allowInsecure -}}
+{{- fail "tls.enabled=false is a dev-only plaintext opt-out: set tls.allowInsecure=true to acknowledge that all FASS traffic will be unencrypted. Production must keep tls.enabled=true (see docs/09-deployment.md §TLS)." -}}
+{{- end -}}
+{{- else -}}
+{{- if not $tls.caSecret -}}
+{{- fail "tls.caSecret is required when tls.enabled=true: create a Secret containing the cluster CA certificate (public cert only, key tls.caKey). See docs/09-deployment.md §TLS." -}}
+{{- end -}}
+{{- if .Values.coordinator.enabled -}}
+{{- if not .Values.coordinator.tls.certSecret -}}
+{{- fail "coordinator.tls.certSecret is required when tls.enabled=true: an existing Secret with the coordinator listener certificate (PEM). Generate it with `fass-gateway pki issue-server` and include every name peers dial (service DNS names) as SANs." -}}
+{{- end -}}
+{{- if not .Values.coordinator.tls.keySecret -}}
+{{- fail "coordinator.tls.keySecret is required when tls.enabled=true: an existing Secret with the coordinator listener private key (PEM)." -}}
+{{- end -}}
+{{- end -}}
+{{- if and $tls.requireMTLS .Values.console.enabled -}}
+{{- fail "tls.requireMTLS=true is not supported with console.enabled=true: fass-console has no client-certificate/TLS-client flags yet, so strict mTLS would make the console unable to reach the coordinator. Set console.enabled=false or keep tls.requireMTLS=false (documented gap in docs/09-deployment.md §Known product gaps)." -}}
+{{- end -}}
+{{- if .Values.gateway.enabled -}}
+{{- if and .Values.gateway.tls.enabled (not .Values.gateway.tls.existingSecret) -}}
+{{- fail "gateway.tls.existingSecret is required when gateway.tls.enabled=true: an existing Secret with the S3 listener certificate/key." -}}
+{{- end -}}
+{{- if and $tls.requireMTLS (not .Values.gateway.mtls.existingSecret) -}}
+{{- fail "gateway.mtls.existingSecret is required when tls.requireMTLS=true: an existing Secret with a clientAuth certificate for agent/coordinator mTLS (`fass-gateway pki issue-client`)." -}}
+{{- end -}}
+{{- if .Values.gateway.coordinatorURL -}}
+{{- if not (hasPrefix "https://" .Values.gateway.coordinatorURL) -}}
+{{- fail "gateway.coordinatorURL must be https:// when tls.enabled=true (plaintext control plane requires tls.enabled=false + allowInsecure)" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.agents.enabled -}}
+{{- if and .Values.agents.repair .Values.tls.enabled (not .Values.agents.tls.clientCertSecret) -}}
+{{- fail "agents.tls.clientCertSecret is required when tls.enabled=true and agents.repair=true: agent-to-agent repair needs a clientAuth certificate (`fass-gateway pki issue-client`). Set agents.repair=false or provide the Secret." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if .Values.agents.enabled -}}
 {{- $a := .Values.agents -}}
 {{- $nodeNames := dict -}}
@@ -134,6 +174,9 @@ app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 {{- if not $node.disks -}}
 {{- fail (printf "agents.nodes[%s].disks must list at least one disk (one agent per disk)" $node.name) -}}
+{{- end -}}
+{{- if and $.Values.tls.enabled (not $.Values.agents.tls.existingSecret) (not $node.tlsSecret) -}}
+{{- fail (printf "agents.nodes[%s] needs a shard-listener certificate: set agents.tls.existingSecret (one shared cert whose SANs cover every dialed name, including each node's announced IP) or agents.nodes[%s].tlsSecret (per-node cert; recommended with hostNetwork=true)." $node.name $node.name) -}}
 {{- end -}}
 {{- if and (gt (len $node.disks) $aag) (not $a.allowAgentsPerNodeExceedingAAG) -}}
 {{- fail (printf "agents.nodes[%s] has %d disks but redundancy.aag=%d. AAG is the coordinator's per-Node cap for a shard set; the chart refuses this by default because capacity sizing then depends on a rule most operators miss. Raise redundancy.aag (<= local_n+local_k) or set agents.allowAgentsPerNodeExceedingAAG=true after reading docs/09-deployment.md 'AAG is a per-Node rule'." $node.name (len $node.disks) $aag) -}}

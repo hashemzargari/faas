@@ -58,6 +58,8 @@ RestrictSUIDSGID=true
 LockPersonality=true
 RemoveIPC=true
 ReadWritePaths=/var/lib/fass/disks/%i
+# TLS material is read-only to the service; reload happens in-process.
+ReadOnlyPaths=/etc/fass/tls
 
 [Install]
 WantedBy=multi-user.target

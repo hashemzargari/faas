@@ -14,6 +14,15 @@ image:
   tag: "0.1.0"
   pullPolicy: IfNotPresent
 
+# TLS is the default and fails closed; certificates are existing Secrets, never
+# generated or inlined by the chart. SANs must include every name a peer dials
+# (see docs/09-deployment.md §TLS and deploy/helm/fass/README.md).
+tls:
+  enabled: true
+  caSecret: fass-ca
+  caKey: ca.crt
+  requireMTLS: false   # flip to true after every component has a client cert
+
 redundancy:
   geoN: 2
   geoK: 1
@@ -22,6 +31,11 @@ redundancy:
   aag: 2
 
 coordinator:
+  tls:
+    certSecret: fass-coordinator-tls
+    certKey: tls.crt
+    keySecret: fass-coordinator-tls
+    keyKey: tls.key
   # Production control plane: PostgreSQL (HA-capable) + 2 replicas. The chart's
   # pre-install/pre-upgrade Job runs `fass-coordinator migrate`; create the DSN
   # Secret before installing.
@@ -37,6 +51,8 @@ gateway:
   tls:
     enabled: true
     existingSecret: fass-gateway-tls
+  mtls:
+    existingSecret: fass-gateway-client-tls
   keySeed:
     existingSecret: fass-gateway-key-seed
 
@@ -47,10 +63,19 @@ console:
 
 agents:
   enabled: true
+  # Per-node certificates: each agent announces its node IP/FQDN, so the cert
+  # for that node must carry that SAN. Keep the shared fields empty and set
+  # nodes[].tlsSecret below.
+  tls:
+    existingSecret: ""
+    clientCertSecret: fass-agent-client-tls
+    clientCertKey: tls.crt
+    clientKeyKey: tls.key
   # One pinned Deployment per node; one container per disk.
   nodes:
     - name: node-a1
       nexus: nexus-a
+      tlsSecret: fass-agent-node-a1-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -62,6 +87,7 @@ agents:
           existingSecret: fass-agent-node-a1-disk1
     - name: node-a2
       nexus: nexus-a
+      tlsSecret: fass-agent-node-a2-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -73,6 +99,7 @@ agents:
           existingSecret: fass-agent-node-a2-disk1
     - name: node-a3
       nexus: nexus-a
+      tlsSecret: fass-agent-node-a3-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -84,6 +111,7 @@ agents:
           existingSecret: fass-agent-node-a3-disk1
     - name: node-a4
       nexus: nexus-a
+      tlsSecret: fass-agent-node-a4-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -95,6 +123,7 @@ agents:
           existingSecret: fass-agent-node-a4-disk1
     - name: node-a5
       nexus: nexus-a
+      tlsSecret: fass-agent-node-a5-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -106,6 +135,7 @@ agents:
           existingSecret: fass-agent-node-a5-disk1
     - name: node-a6
       nexus: nexus-a
+      tlsSecret: fass-agent-node-a6-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -117,6 +147,7 @@ agents:
           existingSecret: fass-agent-node-a6-disk1
     - name: node-a7
       nexus: nexus-a
+      tlsSecret: fass-agent-node-a7-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -128,6 +159,7 @@ agents:
           existingSecret: fass-agent-node-a7-disk1
     - name: node-a8
       nexus: nexus-a
+      tlsSecret: fass-agent-node-a8-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -139,6 +171,7 @@ agents:
           existingSecret: fass-agent-node-a8-disk1
     - name: node-a9
       nexus: nexus-a
+      tlsSecret: fass-agent-node-a9-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -150,6 +183,7 @@ agents:
           existingSecret: fass-agent-node-a9-disk1
     - name: node-a10
       nexus: nexus-a
+      tlsSecret: fass-agent-node-a10-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -161,6 +195,7 @@ agents:
           existingSecret: fass-agent-node-a10-disk1
     - name: node-b1
       nexus: nexus-b
+      tlsSecret: fass-agent-node-b1-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -172,6 +207,7 @@ agents:
           existingSecret: fass-agent-node-b1-disk1
     - name: node-b2
       nexus: nexus-b
+      tlsSecret: fass-agent-node-b2-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -183,6 +219,7 @@ agents:
           existingSecret: fass-agent-node-b2-disk1
     - name: node-b3
       nexus: nexus-b
+      tlsSecret: fass-agent-node-b3-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -194,6 +231,7 @@ agents:
           existingSecret: fass-agent-node-b3-disk1
     - name: node-b4
       nexus: nexus-b
+      tlsSecret: fass-agent-node-b4-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -205,6 +243,7 @@ agents:
           existingSecret: fass-agent-node-b4-disk1
     - name: node-b5
       nexus: nexus-b
+      tlsSecret: fass-agent-node-b5-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -216,6 +255,7 @@ agents:
           existingSecret: fass-agent-node-b5-disk1
     - name: node-b6
       nexus: nexus-b
+      tlsSecret: fass-agent-node-b6-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -227,6 +267,7 @@ agents:
           existingSecret: fass-agent-node-b6-disk1
     - name: node-b7
       nexus: nexus-b
+      tlsSecret: fass-agent-node-b7-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -238,6 +279,7 @@ agents:
           existingSecret: fass-agent-node-b7-disk1
     - name: node-b8
       nexus: nexus-b
+      tlsSecret: fass-agent-node-b8-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -249,6 +291,7 @@ agents:
           existingSecret: fass-agent-node-b8-disk1
     - name: node-b9
       nexus: nexus-b
+      tlsSecret: fass-agent-node-b9-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -260,6 +303,7 @@ agents:
           existingSecret: fass-agent-node-b9-disk1
     - name: node-b10
       nexus: nexus-b
+      tlsSecret: fass-agent-node-b10-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -271,6 +315,7 @@ agents:
           existingSecret: fass-agent-node-b10-disk1
     - name: node-c1
       nexus: nexus-c
+      tlsSecret: fass-agent-node-c1-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -282,6 +327,7 @@ agents:
           existingSecret: fass-agent-node-c1-disk1
     - name: node-c2
       nexus: nexus-c
+      tlsSecret: fass-agent-node-c2-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -293,6 +339,7 @@ agents:
           existingSecret: fass-agent-node-c2-disk1
     - name: node-c3
       nexus: nexus-c
+      tlsSecret: fass-agent-node-c3-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -304,6 +351,7 @@ agents:
           existingSecret: fass-agent-node-c3-disk1
     - name: node-c4
       nexus: nexus-c
+      tlsSecret: fass-agent-node-c4-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -315,6 +363,7 @@ agents:
           existingSecret: fass-agent-node-c4-disk1
     - name: node-c5
       nexus: nexus-c
+      tlsSecret: fass-agent-node-c5-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -326,6 +375,7 @@ agents:
           existingSecret: fass-agent-node-c5-disk1
     - name: node-c6
       nexus: nexus-c
+      tlsSecret: fass-agent-node-c6-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -337,6 +387,7 @@ agents:
           existingSecret: fass-agent-node-c6-disk1
     - name: node-c7
       nexus: nexus-c
+      tlsSecret: fass-agent-node-c7-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -348,6 +399,7 @@ agents:
           existingSecret: fass-agent-node-c7-disk1
     - name: node-c8
       nexus: nexus-c
+      tlsSecret: fass-agent-node-c8-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -359,6 +411,7 @@ agents:
           existingSecret: fass-agent-node-c8-disk1
     - name: node-c9
       nexus: nexus-c
+      tlsSecret: fass-agent-node-c9-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0
@@ -370,6 +423,7 @@ agents:
           existingSecret: fass-agent-node-c9-disk1
     - name: node-c10
       nexus: nexus-c
+      tlsSecret: fass-agent-node-c10-tls
       disks:
         - name: disk0
           hostPath: /var/lib/fass/disks/disk0

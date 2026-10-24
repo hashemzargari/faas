@@ -37,5 +37,8 @@ RestrictSUIDSGID=true
 LockPersonality=true
 RemoveIPC=true
 
+# Certificate material is read-only to the service.
+ReadOnlyPaths=/etc/fass/tls
+
 [Install]
 WantedBy=multi-user.target
