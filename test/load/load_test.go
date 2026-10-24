@@ -657,6 +657,7 @@ func TestMixedWorkloadLoad(t *testing.T) {
 		t.Fatalf("CORRECTNESS: %d/%d sampled PUT->GET verifications mismatched", mismatches, verified)
 	}
 	if summary.Errors.NonRetryable5xx > 0 {
+		s.preserveLogs(t, "5xx")
 		t.Fatalf("CORRECTNESS: %d non-retryable 5xx responses (every 500 is a defect)", summary.Errors.NonRetryable5xx)
 	}
 	if summary.Contention.Deadlocks > 10 {
@@ -957,6 +958,49 @@ func (s *stack) coordMetricsText() string {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	return string(raw)
+}
+
+// preserveLogs copies service logs into the repo so a failed gate stays
+// diagnosable after the run (the harness works in os.TempDir, which does not
+// survive the process). It also prints the error-bearing lines from the
+// gateway and coordinator logs, because "1 non-retryable 5xx" without the
+// underlying error is a failure nobody can act on.
+func (s *stack) preserveLogs(t *testing.T, tag string) {
+	t.Helper()
+	dst := filepath.Join(root, "test", "load", "results",
+		fmt.Sprintf("logs-%s-%s", tag, time.Now().UTC().Format("20060102T150405Z")))
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Logf("preserve logs: %v", err)
+		return
+	}
+	ents, err := os.ReadDir(s.logDir)
+	if err != nil {
+		t.Logf("preserve logs: %v", err)
+		return
+	}
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(s.logDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(dst, e.Name()), raw, 0o644); err != nil {
+			t.Logf("preserve %s: %v", e.Name(), err)
+			continue
+		}
+		if e.Name() != "gateway.log" && e.Name() != "coordinator.log" {
+			continue
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			low := strings.ToLower(line)
+			if strings.Contains(low, "error") || strings.Contains(low, "aborted") || strings.Contains(low, "failed") {
+				t.Logf("%s: %s", e.Name(), strings.TrimSpace(line))
+			}
+		}
+	}
+	t.Logf("logs preserved in %s", dst)
 }
 
 func (s *stack) dumpOnFailure(err error) {

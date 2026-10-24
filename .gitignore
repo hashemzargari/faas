@@ -30,3 +30,6 @@ coverage.out
 /fass-console
 /fass-bridge
 /fass-operator
+
+# load-test service logs preserved on a failed gate (large, machine-specific)
+test/load/results/logs-*/
