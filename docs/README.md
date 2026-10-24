@@ -2,7 +2,11 @@
 
 > Geo-distributed, S3-compatible object storage: objects are encrypted, split into chunks, encoded with **two-tier Reed–Solomon**, and scattered across Nexuses (sites/AZs) and disks — so no single site, server, or disk can lose your data.
 
-**Status: design phase — no code yet.** This is the plan you asked to review before implementation.
+**Status: implemented and verified.** The design below was approved before coding and then built;
+see the root [`README.md`](../README.md) for the current state, quick start and verification gates.
+The documents in this directory are kept as the design record — including the decisions that were
+later revised (ADR-3b on the metadata store shape, the dev topology arithmetic) — because the
+reasoning is part of the deliverable.
 
 ---
 
