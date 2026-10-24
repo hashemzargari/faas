@@ -75,9 +75,6 @@ type config struct {
 	clientCert    string
 	clientKey     string
 	coordinatorCA string
-	// coordinatorInsecure explicitly allows plaintext control-plane traffic
-	// (dev/transitional), independent of data-plane TLS.
-	coordinatorInsecure bool
 
 	region            string
 	virtualHostDomain string
@@ -174,7 +171,8 @@ func run(args []string) error {
 	// Coordination. The control-plane TLS client uses the same CA and identity;
 	// its ServerName is the coordinator's URL host.
 	coordHTTP := &http.Client{Timeout: 10 * time.Second}
-	coordinatorTLS := !insecure && !cfg.coordinatorInsecure
+	devPlaintextCoordinator := cfg.dev && strings.HasPrefix(cfg.coordinator, "http://")
+	coordinatorTLS := !insecure && !devPlaintextCoordinator
 	if coordinatorTLS {
 		caFile := cfg.coordinatorCA
 		if caFile == "" {
@@ -191,8 +189,10 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("coordinator TLS: %w", err)
 		}
-	} else if cfg.coordinatorInsecure && !insecure {
-		logger.Warn("CONTROL PLANE IS PLAINTEXT (--coordinator-insecure) while the data plane uses TLS; /healthz reports security.coordinator_insecure=true")
+	} else if devPlaintextCoordinator && !insecure {
+		// --dev with an http:// coordinator: allowed for the dev cluster, but loud
+		// and visible. Non-dev deployments still fail closed in validation.
+		logger.Warn("DEV MODE: control plane is PLAINTEXT (http:// coordinator) while the data plane uses TLS; /healthz reports security.coordinator_tls=false. Use an https:// coordinator with --coordinator-ca outside dev.")
 	}
 	coord, err := coordclient.New(coordclient.Options{
 		BaseURL:    cfg.coordinator,
@@ -498,6 +498,8 @@ func formatNotAfter(t time.Time) string {
 
 // validateSecurityConfig enforces fail-closed defaults: outside dev/--insecure
 // the data plane must have TLS material and the coordinator must be https.
+// --dev may use a plaintext coordinator (warned, visible in /healthz); this is
+// the dev-cluster escape hatch, never a production posture.
 func validateSecurityConfig(cfg config, insecure bool, agentMode agenttls.Mode) error {
 	if insecure {
 		return nil
@@ -515,11 +517,12 @@ func validateSecurityConfig(cfg config, insecure bool, agentMode agenttls.Mode) 
 	if err != nil {
 		return fmt.Errorf("invalid --coordinator URL: %w", err)
 	}
-	if u.Scheme != "https" && !cfg.coordinatorInsecure {
-		return fmt.Errorf("refusing to start: coordinator control plane must use https when TLS is enforced (got %q); pass --coordinator-insecure only for explicit dev/transitional mode", cfg.coordinator)
+	if u.Scheme == "http" && cfg.dev {
+		// Dev cluster: allowed, warned in run(), reported as coordinator_tls=false.
+		return nil
 	}
-	if u.Scheme == "https" && cfg.coordinatorInsecure {
-		return fmt.Errorf("--coordinator-insecure conflicts with an https --coordinator URL")
+	if u.Scheme != "https" {
+		return fmt.Errorf("refusing to start: coordinator control plane must use https when TLS is enforced (got %q); an http:// coordinator is only permitted with --dev (dev cluster) or --insecure", cfg.coordinator)
 	}
 	return nil
 }
@@ -588,7 +591,6 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.tlsKey, "tls-key", envOr("FASS_GATEWAY_TLS_KEY", ""), "TLS key file for the S3 listener")
 	fs.StringVar(&cfg.clientKey, "client-key", envOr("FASS_GATEWAY_CLIENT_KEY", ""), "gateway client key for mTLS")
 	fs.StringVar(&cfg.coordinatorCA, "coordinator-ca", envOr("FASS_GATEWAY_COORDINATOR_CA", ""), "CA bundle for the coordinator (defaults to --ca-cert)")
-	fs.BoolVar(&cfg.coordinatorInsecure, "coordinator-insecure", envBool("FASS_GATEWAY_COORDINATOR_INSECURE", false), "explicitly allow plaintext control-plane traffic (dev/transitional; logged and visible in /healthz)")
 	fs.BoolVar(&cfg.dev, "dev", envBool("FASS_GATEWAY_DEV", false), "dev mode: allow an ephemeral key seed when none is configured")
 	fs.StringVar(&cfg.agentTLS, "agent-tls", envOr("FASS_GATEWAY_AGENT_TLS", "require"), "data-plane TLS mode: off|auto|require (auto = mixed-mode rollout)")
 	fs.BoolVar(&cfg.requireMTLS, "require-mtls", envBool("FASS_GATEWAY_REQUIRE_MTLS", false), "reject plaintext peers and require client certificates (strict mode)")

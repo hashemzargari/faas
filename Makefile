@@ -39,6 +39,15 @@ compat-clients-tls: build
 compat-clients-tls-edge: build
 	COMPAT_TLS=1 COMPAT_EDGE_TLS=1 bash scripts/compat.sh
 
+# Control-plane mTLS (coordinator listener + agent/gateway clients); implies
+# data-plane mTLS.
+compat-clients-control-tls: build
+	COMPAT_CONTROL_TLS=1 bash scripts/compat.sh
+
+# End state: every hop encrypted (shard, control, S3 edge).
+compat-clients-full-tls: build
+	COMPAT_CONTROL_TLS=1 COMPAT_EDGE_TLS=1 bash scripts/compat.sh
+
 chaos: build
 	$(GOENV) go test -count=1 -tags=chaos ./test/chaos/...
 

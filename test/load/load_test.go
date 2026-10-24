@@ -57,6 +57,7 @@ type meter struct {
 	raw     []float64 // all client latencies (ms), for the report percentiles
 	phase   map[string]string
 	windows map[string][2]time.Time
+	errText map[string]int64
 }
 
 func newMeter() *meter {
@@ -76,6 +77,10 @@ func (m *meter) record(kind string, d time.Duration, nbytes int64, err error) {
 	m.lat[kind] = append(m.lat[kind], d)
 	if err != nil {
 		st.Errors++
+		if m.errText == nil {
+			m.errText = map[string]int64{}
+		}
+		m.errText[kind+" | "+err.Error()]++
 		var se *sdk.Error
 		switch {
 		case errors.As(err, &se):
@@ -628,6 +633,15 @@ func TestMixedWorkloadLoad(t *testing.T) {
 	summary := buildReport(s, mixed, readonly, phases, diag, contentionP99, int64(len(contention)), contentionErrs, contentionDur, atomic.LoadInt64(&maxLockWaiters), deadlocksBefore, deadlocksAfterContention, deadlocksAfterRO, len(ver.m), verified, mismatches, pgBase, pgPeak, bloatFinal, baseMem, peakMemLow, minMem, repairOK, metricsBefore, s.coordMetricsText())
 
 	summary.DBStats, summary.DBStatsCounts = dbTimingDelta(dbBefore, dbAfter)
+	summary.ErrorStrings = m.errText
+	if mRO2 := mRO2ErrStrings(mRO); mRO2 != nil {
+		for k, v := range mRO2 {
+			if summary.ErrorStrings == nil {
+				summary.ErrorStrings = map[string]int64{}
+			}
+			summary.ErrorStrings[k] += v
+		}
+	}
 	summary.CPUProfileTop = pprofTop
 	path, err := writeReport(summary)
 	if err != nil {
@@ -720,6 +734,7 @@ type report struct {
 	DBStats       map[string]float64    `json:"db_statement_avg_ms"`
 	DBStatsCounts map[string]int64      `json:"db_statement_counts"`
 	CPUProfileTop []string              `json:"cpu_profile_top"`
+	ErrorStrings  map[string]int64      `json:"error_strings"`
 	PhaseNotes    []string              `json:"phase_notes"`
 }
 
@@ -1124,4 +1139,14 @@ func runPProf(t *testing.T, profile string) []string {
 		lines = append(lines, line)
 	}
 	return lines
+}
+
+func mRO2ErrStrings(m *meter) map[string]int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]int64{}
+	for k, v := range m.errText {
+		out[k] += v
+	}
+	return out
 }

@@ -58,8 +58,8 @@ func TestValidateSecurityConfigFailsClosed(t *testing.T) {
 		{name: "agent tls off without insecure", mutate: func(c *config) {}, mode: agenttls.ModeOff, wantErr: "requires --insecure"},
 		{name: "mtls without client cert", mutate: func(c *config) { c.requireMTLS = true }, mode: agenttls.ModeRequire, wantErr: "needs --tls-cert"},
 		{name: "http coordinator with TLS enforced", mutate: func(c *config) { c.coordinator = "http://coord:7001" }, mode: agenttls.ModeRequire, wantErr: "must use https"},
-		{name: "explicit plaintext control plane", mutate: func(c *config) { c.coordinator = "http://coord:7001"; c.coordinatorInsecure = true }, mode: agenttls.ModeRequire},
-		{name: "contradictory control plane flags", mutate: func(c *config) { c.coordinatorInsecure = true }, mode: agenttls.ModeRequire, wantErr: "conflicts"},
+		{name: "dev cluster may use a plaintext coordinator", mutate: func(c *config) { c.coordinator = "http://coord:7001"; c.dev = true }, mode: agenttls.ModeRequire},
+		{name: "non-dev plaintext coordinator is refused", mutate: func(c *config) { c.coordinator = "http://coord:7001" }, mode: agenttls.ModeRequire, wantErr: "must use https"},
 		{name: "unparsable coordinator", mutate: func(c *config) { c.coordinator = "://bad" }, mode: agenttls.ModeRequire, wantErr: "invalid --coordinator"},
 	}
 	for _, tc := range tests {
