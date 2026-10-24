@@ -33,3 +33,4 @@ coverage.out
 
 # load-test service logs preserved on a failed gate (large, machine-specific)
 test/load/results/logs-*/
+.dev/loadtmp/

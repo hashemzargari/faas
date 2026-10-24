@@ -645,6 +645,10 @@ func TestMixedWorkloadLoad(t *testing.T) {
 		}
 	}
 	summary.CPUProfileTop = pprofTop
+	// Attach the gateway shard-fetch counters: without this assignment the
+	// size/checksum rejection gate below always read a nil map and could never
+	// fire, which is worse than not having the gate at all.
+	summary.GatewayShards = s.gatewayShardStats()
 	path, err := writeReport(summary)
 	if err != nil {
 		t.Fatalf("write report: %v", err)
