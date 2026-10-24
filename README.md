@@ -1,11 +1,19 @@
 # FASS
 
-**Geo-distributed, S3-compatible object storage in Go.** A from-scratch reimplementation of the
-architecture behind [Cubbit DS3 Composer](https://docs.cubbit.io/composer/getting-started/what-is-ds3-composer),
-reverse-engineered from public documentation and built to the same behavioural contract.
+FASS is an independently developed, open-source, geo-distributed S3-compatible object storage
+system written in Go.
 
-Objects are encrypted, split into chunks, encoded with **two-tier Reed–Solomon**, and scattered
-across sites (Nexuses) and disks — so no single site, server, or disk can lose your data.
+It features two-tier erasure coding, geographically aware placement, encrypted storage, automated
+repair, S3-compatible APIs, and migration tooling. Objects are encrypted, split into chunks,
+encoded with **two-tier Reed–Solomon**, and scattered across sites (Nexuses) and disks — so no
+single site, server, or disk can lose your data.
+
+**Origins.** The design work drew on publicly available third-party documentation (published
+architecture material and an S3 API compatibility matrix); the implementation itself is
+independent — no proprietary source code, binaries or internal protocols were used or
+decompiled. Those public observations are recorded, with sources and inference markers, in
+[docs/01](docs/01-reverse-engineering.md). FASS is not a copy of another product's code, and no
+claim of architectural identity or behavioural equivalence is made.
 
 > ### Maturity: stable development release — **not production-validated**
 >
@@ -33,7 +41,7 @@ across sites (Nexuses) and disks — so no single site, server, or disk can lose
 ## Quick start
 
 ```bash
-git clone <repo> && cd fass
+git clone https://github.com/hashemzargari/faas.git && cd faas
 source scripts/env.sh        # workspace-local Go caches; dependencies are vendored
 make build                   # bin/fass-{gateway,coordinator,agent,cli,console,bridge}
 
@@ -136,7 +144,7 @@ Measured on a single shared dev box — **order-of-magnitude evidence, not capac
 
 | Doc | Contents |
 |---|---|
-| [01 — Reverse-engineering Cubbit](docs/01-reverse-engineering.md) | What Cubbit built, with sources; what we replicate and what is unknowable |
+| [01 — Reverse-engineering Cubbit](docs/01-reverse-engineering.md) | Design input: an evidence-based reading of publicly documented third-party architecture, with sources and explicit INFERRED markers |
 | [02 — Architecture](docs/02-architecture.md) | Control vs data plane, flows, consistency, failure domains, ADRs |
 | [03 — Data plane](docs/03-data-plane.md) | Chunking, two-tier Reed–Solomon, key hierarchy, placement, repair, durability math |
 | [04 — Services](docs/04-services.md) | Per-service contracts, ports, config, failure modes |
@@ -160,6 +168,29 @@ Measured on a single shared dev box — **order-of-magnitude evidence, not capac
 
 Full detail, including the defects found and how, is in [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
 
+## Repository
+
+- Upstream: **https://github.com/hashemzargari/faas** (the GitHub repository is named `faas`; the
+  software is called **FASS**)
+- Issues and contributions: https://github.com/hashemzargari/faas/issues
+- Go module path: `github.com/fass-storage/fass`. It intentionally remains unchanged: changing it
+  would rewrite every internal import for no functional gain and there are no published downstream
+  consumers. Treat the module path as an internal identifier, not as the repository location.
+
+**Independence and non-affiliation**
+
+FASS is an independent open-source project. It is not affiliated with, endorsed by, sponsored by,
+or officially associated with Cubbit or any other object storage provider.
+
+References to third-party products and trademarks are provided solely for technical documentation,
+attribution, research, or compatibility discussion. All third-party trademarks remain the property
+of their respective owners.
+
+This notice describes project independence; it is not a legal opinion and does not by itself
+resolve every conceivable intellectual-property question. See
+[docs/IP-AUDIT.md](docs/IP-AUDIT.md) for the limited audit that was performed, what it verified,
+and what it explicitly leaves for human or professional review.
+
 ## Licence
 
-MIT.
+MIT — see [LICENSE](LICENSE).

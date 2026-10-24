@@ -10,7 +10,7 @@ Disposable topology per run: `postgres:16` (`shared_buffers=256MB`,
 key seed. Workload: 20 s warmup + **60 s measured** mixed phase (32 PUT /
 16 GET / 8 list / 4 version-churn workers), then a 200-way single-key contention
 storm, a 10 s read-only phase, and three 4 KiB PUT diagnostic phases. Artifacts:
-[`results/run-20261024T133436Z.json`](results/run-20261024T133436Z.json) (latest,
+[`results/run-20261024T152146Z.json`](results/run-20261024T152146Z.json) (final verified run,
 with commit attribution), plus the earlier run without diagnostics.
 
 Reference machine: shared dev box, 20 CPUs, 16 GB RAM (~6 GB free at boot, min

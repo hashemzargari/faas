@@ -3,8 +3,8 @@
 One **agent per disk**, one gateway (or more) per site, one coordinator for the
 cluster. The complete operational story (sizing, TLS/certificate lifecycle,
 upgrade order, rollback, day-2 checks, known gaps) is
-[docs/09-deployment.md](../../../docs/09-deployment.md); the CA/cert runbook is
-[docs/08-operations.md §4](../../../docs/08-operations.md).
+[docs/09-deployment.md](../../docs/09-deployment.md); the CA/cert runbook is
+[docs/08-operations.md §4](../../docs/08-operations.md).
 
 TLS is the default and **fails closed**: coordinator, gateway and agents refuse
 to start without certificate material. Plaintext exists only behind the

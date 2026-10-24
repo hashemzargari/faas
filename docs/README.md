@@ -1,6 +1,12 @@
-# FASS — a Go reimplementation of Cubbit DS3 Composer
+# FASS — design record
 
 > Geo-distributed, S3-compatible object storage: objects are encrypted, split into chunks, encoded with **two-tier Reed–Solomon**, and scattered across Nexuses (sites/AZs) and disks — so no single site, server, or disk can lose your data.
+
+This directory is FASS's design record. It begins with an evidence-based reading of publicly
+available third-party documentation (document 01) and continues with the architecture and
+specifications we designed independently. FASS is not affiliated with any of the products
+discussed; see the non-affiliation notice in the root [README](../README.md) and the limited
+[IP audit](IP-AUDIT.md).
 
 **Status: implemented and verified.** The design below was approved before coding and then built;
 see the root [`README.md`](../README.md) for the current state, quick start and verification gates.
@@ -14,7 +20,7 @@ reasoning is part of the deliverable.
 
 | Doc | What it answers |
 |---|---|
-| [01 — Reverse-engineering Cubbit](01-reverse-engineering.md) | What Cubbit DS3 actually is (two products, two redundancy models), the published entity model (Swarm/Nexus/Node/Agent/Ring/Redundancy Class), the encryption and placement facts, and exactly what we replicate vs. what is unknowable |
+| [01 — Reverse-engineering Cubbit](01-reverse-engineering.md) | Design input: what is publicly documented about a third-party product (two products, two redundancy models), the published entity model (Swarm/Nexus/Node/Agent/Ring/Redundancy Class), encryption and placement facts, and what was independently chosen where the public record is silent |
 | [02 — High-level architecture](02-architecture.md) | Control plane vs data plane, component inventory, write/read/repair sequence diagrams, consistency model, failure domains, ADRs, tech choices |
 | [03 — Data plane specification](03-data-plane.md) | Chunking, hierarchical erasure coding, key hierarchy and AES-256-GCM framing, the placement engine, repair/scrub/GC/rebalance, and the durability math |
 | [04 — Service specifications](04-services.md) | Every service: contracts, ports, config, state, failure modes, SLOs — Gateway, Coordinator (6 sub-services), Agent, Cache, Key service, Console, CLI, Bridge, Operator |
@@ -25,6 +31,7 @@ reasoning is part of the deliverable.
 | [09 — Deployment](09-deployment.md) | Sizing a Redundancy Class, install/upgrade/rollback order, measured HA and load numbers, known operational gaps |
 | [10 — Record codec](10-record-codec.md) | Proposal only, deliberately not implemented: versioned binary metadata records with a measured do-not-ship-unless bar |
 | [Known issues](KNOWN_ISSUES.md) | The confidence record: fixed defects with evidence, open issues, and what is explicitly **not** validated |
+| [IP audit](IP-AUDIT.md) | A limited, evidence-based audit: what was verified, what needs human review, and what this audit does **not** establish |
 
 Supporting research: [Cubbit DS3 API report](research/cubbit-ds3-api-report.md) · [Cubbit DS3 Composer architecture report](research/cubbit-ds3-composer-report.md)
 

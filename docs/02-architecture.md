@@ -1,6 +1,6 @@
 # 02 — High-Level Architecture (HLD)
 
-**Project:** FASS — Federated Adaptive Storage Service, a Go clone of the Cubbit DS3 Composer architecture.
+**Project:** FASS — Federated Adaptive Storage Service. An independent, geo-distributed S3-compatible object storage system in Go, designed from our own architecture decisions; publicly documented third-party design was used as design input only (see [01](01-reverse-engineering.md)).
 **Read after:** `01-reverse-engineering.md`.
 
 ---

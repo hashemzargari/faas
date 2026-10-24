@@ -1,6 +1,10 @@
 # 01 — Reverse-Engineering Cubbit DS3
 
-**Status:** design input, evidence-based.
+**Status:** design input, evidence-based — a record of publicly available third-party
+documentation, produced to inform our own independent design. FASS is not affiliated with,
+endorsed by or sponsored by any product discussed here; see the non-affiliation notice in the
+root [README](../README.md). Nothing in this document is a claim that FASS reproduces another
+product's implementation, and no proprietary code, binaries or internal protocols were used.
 **Method:** black-box behavioural analysis from public material only — `cubbit.io`, `docs.cubbit.io`, and their published product/pricing pages. No proprietary source code, binaries, or internal protocols were used or decompiled. Where the public record is silent, this document says *INFERRED* and we specify our own equivalent.
 
 **Correction to a common misconception:** "Cubbit" is not one system. It is two products built on one storage fabric, and they use *different* redundancy models. Getting this right is the single most important input to our design.
