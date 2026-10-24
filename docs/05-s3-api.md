@@ -1,6 +1,6 @@
 # 05 — S3 API Specification & Compatibility Matrix
 
-The gateway's external contract. Cubbit publishes an explicit matrix (41 supported / 54 unsupported operations); we reproduce it, then document exactly where we deliberately do better.
+The gateway's external contract. Cubbit publishes an explicit matrix (42 supported / 55 unsupported operations, counted row by row from their table); we reproduce it, then document exactly where we deliberately do better.
 
 ---
 
@@ -49,7 +49,7 @@ Preset roles: `Owner`, `Admin`, `Member`, `ReadOnly`. Policy JSON uses `syntax_v
 
 ## 3. Operations compatibility matrix
 
-**Supported (41)** — we implement all of them.
+**Supported (42)** — we implement all of them. (Earlier drafts of this document said 41; Cubbit's table has 42 `Yes` rows, and our supported set matches theirs exactly, operation for operation.)
 
 | Family | Operations |
 |---|---|
@@ -64,7 +64,7 @@ Preset roles: `Owner`, `Admin`, `Member`, `ReadOnly`. Policy JSON uses `syntax_v
 | Lifecycle | `GetBucketLifecycleConfiguration`, `PutBucketLifecycleConfiguration`, `DeleteBucketLifecycle` |
 | Ownership | `GetBucketOwnershipControls`, `PutBucketOwnershipControls`, `DeleteBucketOwnershipControls` |
 
-**Unsupported (54)** — we return `501 NotImplemented`, exactly like Cubbit.
+**Unsupported (55)** — we return `501 NotImplemented`, exactly like Cubbit.
 
 | Family | Unsupported operations |
 |---|---|

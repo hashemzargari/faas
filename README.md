@@ -50,7 +50,7 @@ aws --endpoint-url http://127.0.0.1:7000 s3 ls
 | **Two-tier erasure coding** | `geo(n,k) × local(n,k)` across Nexuses and disks. Recommended `geo 2+1 / local 16+4` = 1.875× overhead, survives an entire site loss. Flat coding is `geo(1,0)`. |
 | **Redundancy Classes, Rings, Nexuses** | Policy objects with `aag` anti-affinity; agents are per-disk; rings scale out without reshuffling. |
 | **Geo-fencing & placement** | Hard constraints (Nexus diversity, AAG, capacity headroom) then a weighted scorer on uptime/load/bandwidth/reputation/latency. Deterministic and replayable. |
-| **S3 API** | 41 operations: bucket/object CRUD, multipart, versioning (UUIDv4 + S3 `null` for suspended), object lock (GOVERNANCE/COMPLIANCE/legal hold), tagging, lifecycle, ACLs, presigned URLs, conditional writes, verified checksums. Unsupported operations answer `501`, matching Cubbit's published matrix. |
+| **S3 API** | 42 operations (exactly Cubbit's published supported set): bucket/object CRUD, multipart, versioning (UUIDv4 + S3 `null` for suspended), object lock (GOVERNANCE/COMPLIANCE/legal hold), tagging, lifecycle, ACLs, presigned URLs, conditional writes, verified checksums. Unsupported operations answer `501`, matching Cubbit's published matrix. |
 | **Encryption** | AES-256-GCM per chunk, per-object file keys wrapped by a tenant KEK; encrypt-then-code so repair never needs a key. The coordinator is cryptographically blind. |
 | **Self-healing** | Local repair inside a Nexus, geo repair across Nexuses, scrubbing, GC by authoritative shard-set id, rebalance. |
 | **Operations** | `fass` CLI, HTMX console, Prometheus/OTel, Helm chart, systemd units, dev bootstrap. |

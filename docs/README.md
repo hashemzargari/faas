@@ -18,7 +18,7 @@ reasoning is part of the deliverable.
 | [02 — High-level architecture](02-architecture.md) | Control plane vs data plane, component inventory, write/read/repair sequence diagrams, consistency model, failure domains, ADRs, tech choices |
 | [03 — Data plane specification](03-data-plane.md) | Chunking, hierarchical erasure coding, key hierarchy and AES-256-GCM framing, the placement engine, repair/scrub/GC/rebalance, and the durability math |
 | [04 — Service specifications](04-services.md) | Every service: contracts, ports, config, state, failure modes, SLOs — Gateway, Coordinator (6 sub-services), Agent, Cache, Key service, Console, CLI, Bridge, Operator |
-| [05 — S3 API specification](05-s3-api.md) | The full compatibility matrix (41 supported / 54 not), header-by-header behaviour, versioning/object-lock/ACL/tagging/lifecycle semantics, limits, errors, and the seven deliberate divergences |
+| [05 — S3 API specification](05-s3-api.md) | The full compatibility matrix (42 supported / 55 not), header-by-header behaviour, versioning/object-lock/ACL/tagging/lifecycle semantics, limits, errors, and the seven deliberate divergences |
 | [06 — Delivery plan](06-delivery-plan.md) | Repo layout, milestones M0–M8 with exit criteria, parallel workstreams, test strategy, performance targets, risks, and the questions I need answered |
 
 Supporting research: [Cubbit DS3 API report](research/cubbit-ds3-api-report.md) · [Cubbit DS3 Composer architecture report](research/cubbit-ds3-composer-report.md)
@@ -60,7 +60,7 @@ Supporting research: [Cubbit DS3 API report](research/cubbit-ds3-api-report.md) 
 | Metadata | PostgreSQL primary + sync standby (SQLite for dev mode) |
 | Encryption | AES-256-GCM framed at 1 MiB, HKDF per-chunk keys, envelope-wrapped file keys, KMIP 1.4 |
 | Default redundancy | `geo 2+1`, `local 16+4`, `aag 2` ⇒ 1.875× overhead, survives 1 site |
-| S3 surface | 41 operations supported, 54 explicitly `501` — the Cubbit-published matrix |
+| S3 surface | 42 operations supported, 55 explicitly `501` — the Cubbit-published matrix |
 | Durability target | 11 nines **given** repair MTTR ≤ 4 h (the code alone doesn't give you this — the ops loop does) |
 
 ---
