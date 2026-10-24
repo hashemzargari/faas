@@ -273,6 +273,16 @@ Assembled by a gateway (which has key-service access but *does not need it*): fe
 
 **Deliberate divergence from Cubbit:** Cubbit's docs are silent on consistency; we publish a stronger contract. Where Cubbit documents *inconsistency* (unverified checksums, no conditional writes) we choose correctness — see `05 §9` for the exact list and rationale.
 
+### 5.0 Metadata backend contract (revised 2026-10-24)
+
+Both backends implement one interface: point get, ordered prefix scan, and an
+atomic multi-key read/write transaction. That is deliberately *less* than a
+relational schema, and it is the full set of operations the metadata layer
+actually performs (verified by enumerating the call sites). The parity suite
+runs the same behaviour tests against both backends, and the S3 conformance
+suite is the acceptance bar for either — semantics are decided by the tests,
+never by which database happens to be underneath.
+
 ### 5.1 Why shards are written before metadata commits
 Shards are immutable and content-addressed by `(shard_set_id, shard_index)`. Writing them first and committing metadata last means a crash leaves *orphan shards* (garbage) but never a *dangling reference* (data loss). Orphan GC is a background sweep keyed on `upload_session` expiry — never on the read path. The invariant: **metadata is the only source of truth; unreferenced shards are always safe to delete.**
 
@@ -354,7 +364,7 @@ Usable capacity = raw / ratio. Shard size per chunk = `chunk / (geo_n × local_n
 | Shard transport | **QUIC** (`quic-go`) with mTLS | gRPC/HTTP2 head-of-line blocking on many parallel shard streams; QUIC has per-stream flow control, 0-RTT resumption, connection migration |
 | Control transport | **gRPC + protobuf** | typed contracts, streaming for inventory/repair |
 | Erasure coding | `klauspost/reedsolomon` (GF(2⁸), SIMD, GFNI where available) | mature, handles up to 256 shards, `n+k=60` fits comfortably |
-| Metadata store | **PostgreSQL 16** (primary + standby) | prefix/ordered listing, real transactions for atomic version flips, PITR; matches Cubbit's "master-slave + DB dump" HA model but stronger |
+| Metadata store | **PostgreSQL 16** used as a **transactional KV store** (jsonb entity records, `(space,key)` primary key, row locks in transactions); typed relational projection deferred | delivers the things we actually need now — multi-writer, MVCC, WAL, replication, PITR, atomic multi-key commits — without rewriting 152 call sites of proven entity logic. See ADR-3 (revised) |
 | Embedded/dev DB | SQLite (WAL) behind the same repository interface | zero-dependency `fass all` mode; not for production |
 | Shard index (agent) | **Pebble** + raw files on disk | shard bytes are immutable: write-temp → fsync → rename; no WAL needed for payload |
 | Config | YAML + env + flags, single `Config` struct, validated at boot | |
@@ -371,6 +381,7 @@ Usable capacity = raw / ratio. Shard size per chunk = `chunk / (geo_n × local_n
 | ADR-1 | **Two-tier EC is first-class**; flat coding is `geo(1,0)` | one code path; DS3-Cloud-style flat 20/60 is expressible |
 | ADR-2 | **Encrypt-then-code** always | repair is blind; Coordinator and Agents never hold keys |
 | ADR-3 | **Coordinator is centralised and stateless w.r.t. payload** | simple, auditable placement; Postgres HA bounds availability; documented degraded mode |
+| ADR-3b (revised 2026-10-24) | **PostgreSQL is used as a transactional KV store, not a normalised relational schema.** The embedded store and Postgres implement one `storage` interface (point get, ordered prefix scan, atomic multi-key write); entity records stay as the JSON the drift test already pins. | What Postgres buys us *today* is concurrency, durability, WAL replication and PITR — not queryability. Rewriting the metadata layer into relational SQL risks semantic drift in versioning/lock/lifecycle, which is precisely where every bug in this project has been. The KV key layout already gives ordered iteration, which is all listing needs. **Consequence, stated plainly:** the DDL in `docs/schema.sql` is the *adapter's layout appendix*, not a queryable domain model; ad-hoc SQL reporting is not available in v1. Promotion path: identity columns can be lifted out of the jsonb into indexed columns (or typed tables) later behind the same interfaces, guarded by the parity suite. |
 | ADR-4 | **Gateway does the crypto** (client-side at the edge) | zero-knowledge mode moves crypto into the SDK and the gateway becomes a pure proxy |
 | ADR-5 | **Shards are immutable; metadata is the sole source of truth** | crash-safe commits; garbage-only failure mode |
 | ADR-6 | **Deterministic placement + displacement log** | tiny metadata; rebalance becomes a planning problem, not a data rewrite |
