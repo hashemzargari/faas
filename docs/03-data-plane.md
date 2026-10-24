@@ -87,7 +87,7 @@ Read is the exact inverse, in reverse (inner decode per geo group in parallel �
 ### 2.3 Shard identity and on-disk layout (Agent)
 
 ```
-shard_id = base32( BLAKE2b-256( shard_set_id ‖ geo_group ‖ local_index )[:16] )
+shard_id = base32_nopad( SHA-256( shard_set_id ‖ BE32(geo_group) ‖ BE32(local_index) )[:16] )
 
 /data/
   shards/ab/cd/<shardid>.shard      # header + payload, immutable
@@ -95,9 +95,15 @@ shard_id = base32( BLAKE2b-256( shard_set_id ‖ geo_group ‖ local_index )[:16
   incoming/<uuid>.partial           # write temp; fsync; rename → shards/
 ```
 
-Shard header (little-endian, ~128 B): `magic "FASSSHD1" | version | codec_params(geo_n,geo_k,local_n,local_k) | chunk_index | geo_group | local_index | shard_set_id(16) | plaintext_len | payload_len | checksum(32) | created_at`.
+Shard header (~128 B, little-endian, followed by an exact shard-set-id extension so a
+crashed agent can rebuild its index from orphan `.shard` files): `magic "FASSSHD1" |
+version | params(geo_n,geo_k,local_n,local_k) | chunk_index | geo_group | local_index |
+shard_set_id(16) | plaintext_len | payload_len | checksum(8) | created_at`.
 
 Design consequences:
+* **Checksums are SHA-256 truncated to 64 bits, big-endian.** No BLAKE2 dependency: a
+  hand-rolled BLAKE2b would be a liability and the stdlib SHA-256 (SHA-NI) is faster than a
+  naive BLAKE2 anyway. 64 bits is a corruption detector, not a MAC.
 * **Self-describing shards.** A repairer can decode a chunk from 20 shards plus one header — it does not need the object manifest. This is what makes blind repair and disaster recovery tractable.
 * **Immutable payload.** No WAL for shard bytes. A crash leaves `.partial` files, which are swept on boot.
 * **Per-disk agent.** One agent owns one disk; the disk is the failure and the accounting unit (matches Cubbit's per-disk agent model, 1 thread + 1–2 GB RSS per disk).
@@ -210,7 +216,7 @@ At 16 MiB chunks, 1 TiB = 65 536 chunks × 60 slots = 3.9 M placement rows per T
 * `shard_sets(id, rc_id, ring_id, generation, placement_hash, displacement_blob)` — one row per chunk.
 * The *base* placement is recomputed deterministically from `(ring_id, epoch, shard_set_id)` rather than stored.
 * `displacement_blob` (varint delta-encoded, usually empty) stores only repairs/replacements.
-Per-TiB metadata ≈ 65 536 rows + a few hundred bytes of checksums each (truncated BLAKE2b-64: 60×8 = 480 B ⇒ ~31 MiB/TiB). Documented as the scale-out path; v1 may store explicit placements behind the same interface (`PlacementStore`) for simplicity.
+Per-TiB metadata ≈ 65 536 rows + a few hundred bytes of checksums each (SHA-256 truncated to 64 bits: 60×8 = 480 B ⇒ ~31 MiB/TiB). Documented as the scale-out path; v1 may store explicit placements behind the same interface (`PlacementStore`) for simplicity.
 
 ### 4.6 Rings and capacity
 A Ring is a bounded set of Agents implementing one RC. When a Ring's used capacity exceeds **85%**, the Coordinator stops placing into it and (if new Nodes were registered) creates a new Ring for the same RC — matching Cubbit's "when a Ring nears capacity, a new Ring can be created for the same Redundancy Class". Agents may belong to multiple Rings (multi-tenancy / tiering / isolation), which is how a single disk serves a hot RC and a cold RC.

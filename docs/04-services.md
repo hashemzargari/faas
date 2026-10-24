@@ -309,10 +309,10 @@ Execute a `RepairJob`: fetch sources, RS-decode, re-encode, write targets, repor
 ```json
 { "job_id": "uuid", "type": "local|geo|corruption|rebalance",
   "shard_set_id": "uuid", "chunk_index": 42, "generation": 7,
-  "codec": {"geo_n":2,"geo_k":1,"local_n":16,"local_k":4},
-  "sources": [{"slot":3,"agent_id":"...","endpoint":"10.0.0.7:7101"}],
-  "targets": [{"slot":3,"agent_id":"...","endpoint":"10.0.0.9:7101"}],
-  "budget": {"max_mbps": 200, "deadline": "2026-10-24T18:00:00Z"} }
+  "params": {"geo_n":2,"geo_k":1,"local_n":16,"local_k":4},
+  "sources": [{"geo_group":0,"local_index":3,"agent_id":"...","endpoint":"10.0.0.7:7101"}],
+  "targets": [{"geo_group":0,"local_index":3,"agent_id":"...","endpoint":"10.0.0.9:7101"}],
+  "max_mbps": 200, "deadline": "2026-10-24T18:00:00Z" }
 ```
 Idempotent: re-running produces identical shard bytes (RS is deterministic given inputs) and `PUT_SHARD` is content-addressed.
 
