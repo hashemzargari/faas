@@ -166,6 +166,28 @@ func freePort(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
+// freePorts reserves n ports simultaneously so two agents cannot race onto the
+// same port between reservation and bind (the 11/12-announced boot flake).
+func freePorts(t *testing.T, n int) []int {
+	t.Helper()
+	lns := make([]net.Listener, 0, n)
+	ports := make([]int, 0, n)
+	defer func() {
+		for _, ln := range lns {
+			_ = ln.Close()
+		}
+	}()
+	for i := 0; i < n; i++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve port: %v", err)
+		}
+		lns = append(lns, ln)
+		ports = append(ports, ln.Addr().(*net.TCPAddr).Port)
+	}
+	return ports
+}
+
 func waitHTTP(t *testing.T, what, url string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

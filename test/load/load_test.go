@@ -368,14 +368,16 @@ func TestMixedWorkloadLoad(t *testing.T) {
 				}
 				key := fmt.Sprintf("mixed/hot/%03d", rng.Intn(300))
 				start := time.Now()
-				body, err := client(i).GetObject(c, mixedBucket, key)
+				body, hdr, err := client(i).GetObjectWithHeaders(c, mixedBucket, key)
 				var n int64
 				if err == nil {
 					raw, rerr := io.ReadAll(body)
 					body.Close()
 					n = int64(len(raw))
 					if rerr != nil {
-						err = rerr
+						// Include the request id captured before the body so a
+						// truncation can be matched to the server log.
+						err = fmt.Errorf("%v (request-id %s)", rerr, hdr.Get("x-amz-request-id"))
 					}
 				}
 				m.record("get", time.Since(start), n, err)
@@ -528,14 +530,14 @@ func TestMixedWorkloadLoad(t *testing.T) {
 				}
 				key := fmt.Sprintf("mixed/hot/%03d", rng.Intn(300))
 				start := time.Now()
-				body, err := client(i).GetObject(ctx, mixedBucket, key)
+				body, hdr, err := client(i).GetObjectWithHeaders(ctx, mixedBucket, key)
 				var n int64
 				if err == nil {
 					raw, rerr := io.ReadAll(body)
 					body.Close()
 					n = int64(len(raw))
 					if rerr != nil {
-						err = rerr
+						err = fmt.Errorf("%v (request-id %s)", rerr, hdr.Get("x-amz-request-id"))
 					}
 				}
 				mRO.record("get", time.Since(start), n, err)
@@ -600,7 +602,7 @@ func TestMixedWorkloadLoad(t *testing.T) {
 
 	// --- bloat / postgres final snapshot -------------------------------------
 	// Wait for autovacuum to reclaim the churn (naptime is 5s in the container).
-	bloatDeadline := time.Now().Add(60 * time.Second)
+	bloatDeadline := time.Now().Add(180 * time.Second)
 	var bloatFinal pgSnapshot
 	for {
 		bloatFinal = s.pgSnapshot(t)

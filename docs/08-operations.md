@@ -764,12 +764,26 @@ fass pki issue-server --ca-dir /etc/fass/pki/ca --dir /etc/fass/pki/agent.new ..
 
 ### 4.3 Mixed-mode rollout (upgrading live agents)
 
-1. Roll out TLS listeners with `--insecure` still present on the not-yet-updated agents.
+An agent is **all-or-nothing**: a TLS shard listener forbids a plaintext
+`http://` coordinator URL (that URL requires `--insecure`, and `--insecure`
+forbids TLS listener flags), so each agent moves from fully plaintext to fully
+encrypted in one restart. The fleet can still be mixed, because old and new
+agents coexist while the gateway bridges them:
+
+1. Roll out new agents with listener TLS (`--tls-cert/--tls-key/--tls-ca`),
+   coordinator TLS (`--coordinator https://… --coordinator-ca` + client certs),
+   and old agents left plaintext (`--insecure`).
 2. Run gateways with `--agent-tls auto --ca-cert ...`: TLS peers are verified,
-   plaintext peers are used with a warning per endpoint. `/healthz` stays
-   `insecure=false` but the warnings make the remaining plaintext list visible.
-3. When every agent has TLS, flip gateways to `--agent-tls require --require-mtls`.
-   From then on a plaintext agent is a hard failure, not a quiet downgrade.
+   plaintext peers are used only after their `/v1/healthz` confirms
+   `tls:false,insecure:true`, with a warning per endpoint. `/healthz` stays
+   `insecure=false`; the warnings name the remaining plaintext endpoints.
+3. When every agent is TLS, flip gateways to
+   `--agent-tls require --require-mtls`. From then on a plaintext agent is a hard
+   failure, not a quiet downgrade.
+
+The coordinator listener can be switched to TLS+mTLS once every agent has the
+coordinator TLS flags; the gateway's `--coordinator-insecure` escape hatch was
+removed when that hop landed.
 
 The transition is a state, not an option: compat/tests assert that strict mode
 rejects a plaintext peer, and an expired certificate fails with an actionable
@@ -790,10 +804,8 @@ Each mode mints a throwaway CA under the run's temp directory with
 | Mode | Environment | What is encrypted |
 |---|---|---|
 | plaintext | (none) | nothing — dev cluster, `--insecure` everywhere, warned and visible |
-| data plane | `COMPAT_TLS=1` | agent shard transport mTLS (12 agents `--require-mtls`, gateway `--agent-tls=require --require-mtls`) |
-| control plane | `COMPAT_CONTROL_TLS=1` | + coordinator listener mTLS, agents `--coordinator-ca`/client certs, gateway `https://` + `--coordinator-ca`; implies `COMPAT_TLS=1` |
-| edge | `COMPAT_EDGE_TLS=1` | + S3 edge HTTPS (`--tls-cert/--tls-key` from the same CA) |
-| end state | `COMPAT_CONTROL_TLS=1 COMPAT_EDGE_TLS=1` | **every hop**: shard, control, S3 edge (repair uses the same CA/identity) |
+| fleet mTLS | `COMPAT_TLS=1` or `COMPAT_CONTROL_TLS=1` | shard **and** control plane: 12 agents with listener mTLS + coordinator client TLS, coordinator listener mTLS, gateway mTLS to both. Agents are all-or-nothing, so a data-plane-only fleet is not a valid configuration (the script says so explicitly). |
+| end state | `COMPAT_CONTROL_TLS=1 COMPAT_EDGE_TLS=1` | **every hop**: shard, control, S3 edge (repair uses the same CA/identity). `COMPAT_TLS=1` may be used instead of `COMPAT_CONTROL_TLS=1`. |
 
 The script asserts each `/healthz` posture it claims: gateway
 `security.{insecure,agent_mode,require_mtls,s3_tls,coordinator_tls,…}`,
@@ -817,3 +829,53 @@ A mode that has never been executed is not coverage; all four are run as part of
 the release check.
 Nothing is written to the repository and the temp directory is removed on
 success (`COMPAT_KEEP=1` keeps the logs).
+
+### 4.5 Posture reference: verify a deployment is encrypted end to end
+
+Every component answers "what is actually encrypted on this process?" from its
+own `/healthz`; no config file needs to be trusted. The table below is the
+contract ops should check.
+
+| Component | Endpoint | Secure posture fields |
+|---|---|---|
+| Gateway (operator surface) | `GET :9000/healthz` | `security.insecure=false`, `security.agent_mode="require"`, `security.require_mtls=true`, `security.s3_tls=true`, `security.coordinator_tls=true`; `security.cert_not_after` / `cert_fingerprint` describe the gateway identity |
+| Agent (shard listener) | `GET :<agent-port>/v1/healthz` | `tls=true`, `insecure=false`, `tls_not_after` set (mTLS client required when the listener runs `--require-mtls`, so curl needs the gateway client certificate) |
+| Agent (rich stats) | `GET :<agent-port>/v1/stats` | `tls:{enabled:true, mutual:true, insecure:false, not_after, renewal_due:false, issuer, subject}`; heartbeats carry the same `tls_enabled`/`insecure`/`cert_not_after` so `fass cluster status` aggregates it |
+| Coordinator | `GET :7001/healthz` | `tls=true`, `mtls=true`, `insecure=false` |
+| Console | `GET :8081/healthz` | `security.coordinator_scheme="https"`, `security.insecure=false`, `security.tls=true` (console listener), `security.require_mtls` per deployment |
+| S3 edge | `GET :9000/healthz` (same gateway admin) | `security.s3_tls=true`; clients must trust the cluster CA (see the client table in §4.4) |
+
+Captured from the compat matrix, plaintext dev cluster vs **every-hop TLS**
+(`COMPAT_CONTROL_TLS=1 COMPAT_EDGE_TLS=1`):
+
+```jsonc
+// plaintext (dev only): every posture field says so
+coordinator: {"insecure":true, "mtls":false, "tls":false}
+agent:       {"insecure":true, "tls":false,  "tls_not_after":null}
+gateway:     {"insecure":true, "agent_mode":"off", "require_mtls":false,
+              "s3_tls":false, "coordinator_tls":false}
+
+// every hop TLS: no field says insecure, and each hop names its encryption
+coordinator: {"insecure":false, "mtls":true, "tls":true}
+agent:       {"insecure":false, "tls":true, "tls_not_after":"2026-10-25T13:54:45Z"}
+gateway:     {"agent_mode":"require", "cert_fingerprint":"1054451111cfd49a",
+              "cert_not_after":"2026-10-25T13:54:45Z", "coordinator_tls":true,
+              "insecure":false, "require_mtls":true, "s3_tls":true}
+```
+
+Quick verification (replace paths/ports; mTLS endpoints need the client
+certificate the component trusts):
+
+```console
+# 1. No posture field claims plaintext anywhere.
+curl -sk https://gateway:9000/healthz | jq '.security | select(.insecure or .coordinator_tls|not or .s3_tls|not)'
+curl -sk --cert client.crt --key client.key https://coordinator:7001/healthz | jq 'select(.insecure or (.tls and .mtls)|not)'
+curl -sk --cert client.crt --key client.key https://agent:7101/v1/healthz | jq 'select(.insecure or (.tls)|not)'
+# 2. Any output above means a hop is plaintext; the JSON names it.
+```
+
+The gateway's admin/metrics listener (`:9000`) is an operator surface, not a
+data hop: it is plaintext by design so probes need no certificate. Bind it to
+loopback or front it with TLS; the S3 edge (`:8080`) is the client-facing TLS
+hop. Everything carrying object data or control metadata — shard transport,
+repair fetches, coordinator API, S3 edge — is TLS and reports it above.

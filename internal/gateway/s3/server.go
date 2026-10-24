@@ -250,6 +250,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(context.WithValue(r.Context(), ctxKey{}, st))
 
 	rec := &statusRecorder{ResponseWriter: w}
+	rec.onAbort = func() {
+		s.metrics.Inc("fass_gateway_response_aborted_after_headers_total", nil)
+		s.log.Error("response aborted after headers", "request_id", st.requestID, "bytes_written", rec.written)
+	}
 	defer s.recoverPanic(rec, r)
 
 	target, err := s.parseTarget(r)
@@ -568,6 +572,10 @@ type statusRecorder struct {
 	status      int
 	written     int64
 	wroteHeader bool
+	// onAbort fires when a Write fails after headers were committed: the client
+	// will see a truncated 200 unless it checks Content-Length, so this must be a
+	// visible server-side signal rather than a silently ignored error.
+	onAbort func()
 }
 
 func (w *statusRecorder) WriteHeader(code int) {
@@ -585,6 +593,9 @@ func (w *statusRecorder) Write(b []byte) (int, error) {
 	}
 	n, err := w.ResponseWriter.Write(b)
 	w.written += int64(n)
+	if err != nil && w.wroteHeader && w.onAbort != nil {
+		w.onAbort()
+	}
 	return n, err
 }
 

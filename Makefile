@@ -28,7 +28,8 @@ compat: build
 
 # Third-party client matrix against a live cluster. `compat-clients` is
 # plaintext dev; `compat-clients-tls` runs the same 16 checks with mTLS on the
-# shard transport (throwaway CA minted into a temp dir, never in the repo).
+# shard + control plane (throwaway CA minted into a temp dir, never in the repo;
+# agents are all-or-nothing, so data-plane TLS implies control-plane TLS).
 compat-clients: build
 	bash scripts/compat.sh
 

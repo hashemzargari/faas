@@ -225,15 +225,23 @@ func (c *Client) hashAndReplay(r io.Reader, size int64) (string, io.Reader) {
 
 // GetObject returns the object body; the caller closes it.
 func (c *Client) GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
+	body, _, err := c.GetObjectWithHeaders(ctx, bucket, key)
+	return body, err
+}
+
+// GetObjectWithHeaders is GetObject but returns the response headers (notably the
+// request id) *before* the body is read, so a mid-body failure can be correlated
+// with the server-side request log.
+func (c *Client) GetObjectWithHeaders(ctx context.Context, bucket, key string) (io.ReadCloser, http.Header, error) {
 	resp, err := c.do(ctx, http.MethodGet, objectPath(bucket, key), nil, nil, 0, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := check(resp); err != nil {
 		resp.Body.Close()
-		return nil, err
+		return nil, resp.Header.Clone(), err
 	}
-	return resp.Body, nil
+	return resp.Body, resp.Header.Clone(), nil
 }
 
 // HeadObject returns size and ETag without transferring the body.

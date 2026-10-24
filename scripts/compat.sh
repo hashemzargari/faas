@@ -75,6 +75,14 @@ TLS_MODE=${COMPAT_TLS:-0}
 EDGE_TLS=${COMPAT_EDGE_TLS:-0}
 CONTROL_TLS=${COMPAT_CONTROL_TLS:-0}
 if [[ "$CONTROL_TLS" == "1" ]]; then TLS_MODE=1; fi
+if [[ "$TLS_MODE" == "1" && "$CONTROL_TLS" != "1" ]]; then
+  # Since task-19 an agent is all-or-nothing: a TLS shard listener forbids a
+  # plaintext coordinator URL (http:// requires --insecure, and --insecure
+  # forbids TLS listener flags). A fleet with data-plane TLS therefore also has
+  # control-plane TLS.
+  CONTROL_TLS=1
+  echo "   note: data-plane mTLS implies control-plane mTLS (agents are all-or-nothing)"
+fi
 AGENT_SEC_ARGS=(--insecure)
 AGENT_COORD_ARGS=()
 GW_SEC_ARGS=()
@@ -188,12 +196,18 @@ if [[ "$CONTROL_TLS" == "1" ]]; then
     || { echo "coordinator healthz does not report control-plane mTLS: $CSEC"; exit 1; }
 fi
 echo "   coordinator security: $(echo "$CSEC" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(json.dumps({k:d.get(k) for k in ("tls","mtls","insecure")},sort_keys=True))')"
+if [[ "$TLS_MODE" == "1" ]]; then
+  AHEALTH=$(curl -sS --cacert "$CA_FILE" --cert "$T/gw/tls.crt" --key "$T/gw/tls.key" "https://127.0.0.1:$AGENT/v1/healthz")
+else
+  AHEALTH=$(curl -sS "http://127.0.0.1:$AGENT/v1/healthz")
+fi
+echo "   agent security: $(echo "$AHEALTH" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(json.dumps({k:d.get(k) for k in ("tls","insecure","tls_not_after")},sort_keys=True))')"
 SEC=$(curl -sS "http://127.0.0.1:$GWADMIN/healthz")
+echo "   gateway security: $(echo "$SEC" | python3 -c 'import sys,json;d=json.load(sys.stdin)["security"];print(json.dumps(d,sort_keys=True))')"
 if [[ "$TLS_MODE" == "1" ]]; then
   echo "$SEC" | grep -q '"insecure":false' && echo "$SEC" | grep -q '"agent_mode":"require"' \
     || { echo "gateway healthz does not report TLS mode: $SEC"; exit 1; }
   [[ "$EDGE_TLS" == "1" ]] && { echo "$SEC" | grep -q '"s3_tls":true' || { echo "healthz does not report s3_tls: $SEC"; exit 1; }; }
-  echo "   gateway security: $(echo "$SEC" | python3 -c 'import sys,json;print(json.dumps(json.load(sys.stdin)["security"],sort_keys=True))')"
 else
   echo "$SEC" | grep -q '"insecure":true' || { echo "plaintext gateway healthz is not explicit: $SEC"; exit 1; }
 fi
