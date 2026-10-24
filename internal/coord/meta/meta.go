@@ -61,12 +61,12 @@ var (
 
 // Service implements the metadata service over a storage.DB.
 type Service struct {
-	db  *storage.DB
+	db  storage.Store
 	now func() time.Time
 }
 
 // New creates a metadata service. The caller owns the DB lifetime.
-func New(db *storage.DB) *Service {
+func New(db storage.Store) *Service {
 	return &Service{db: db, now: time.Now}
 }
 
@@ -79,7 +79,7 @@ func (s *Service) SetClock(now func() time.Time) {
 
 // DB exposes the underlying store for the sibling coordinator services. It is
 // deliberately not part of the public data path.
-func (s *Service) DB() *storage.DB { return s.db }
+func (s *Service) DB() storage.Store { return s.db }
 
 // ---------------------------------------------------------------------------
 // Buckets
@@ -107,7 +107,7 @@ func (s *Service) normalizeBucketCreatedAt(ctx context.Context, cfg contract.Buc
 		return cfg, nil
 	}
 	var out contract.BucketConfig
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		rec, err := storage.GetJSON[Bucket](tx, spaceBuckets, []byte(cfg.Name))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrNoSuchBucket
@@ -158,7 +158,7 @@ func (s *Service) CreateBucket(ctx context.Context, cfg contract.BucketConfig) e
 		cfg.CreatedAt = s.now().UTC()
 	}
 
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		key := []byte(cfg.Name)
 		rec, getErr := storage.GetJSON[Bucket](tx, spaceBuckets, key)
 		switch {
@@ -190,7 +190,7 @@ func (s *Service) GetBucket(ctx context.Context, name string) (contract.BucketCo
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		rec, err := storage.GetJSON[Bucket](tx, spaceBuckets, []byte(name))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrNoSuchBucket
@@ -213,7 +213,7 @@ func (s *Service) GetBucketByID(ctx context.Context, id contract.BucketID) (cont
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		name, err := tx.Get(spaceBucketIDs, []byte(id))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrNoSuchBucket
@@ -243,7 +243,7 @@ func (s *Service) ListBuckets(ctx context.Context, p contract.Principal) ([]cont
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		return storage.ScanJSON[Bucket](tx, spaceBuckets, nil, func(_ []byte, rec Bucket) error {
 			if !p.IsRoot && (rec.TenantID != p.TenantID || rec.ProjectID != p.ProjectID) {
 				return nil
@@ -283,7 +283,7 @@ func (s *Service) UpdateBucket(ctx context.Context, cfg contract.BucketConfig) e
 	default:
 		return coerr.Invalidf("invalid versioning state %q", cfg.Versioning)
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		rec, err := storage.GetJSON[Bucket](tx, spaceBuckets, []byte(cfg.Name))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrNoSuchBucket
@@ -321,7 +321,7 @@ func (s *Service) DeleteBucket(ctx context.Context, name string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		rec, err := storage.GetJSON[Bucket](tx, spaceBuckets, []byte(name))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrNoSuchBucket
@@ -398,7 +398,7 @@ func (s *Service) PutTenant(ctx context.Context, t Tenant) error {
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = s.now().UTC()
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		return storage.PutJSON(tx, spaceTenants, []byte(t.ID), t)
 	})
 }
@@ -409,7 +409,7 @@ func (s *Service) GetTenant(ctx context.Context, id contract.TenantID) (Tenant, 
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		rec, err := storage.GetJSON[Tenant](tx, spaceTenants, []byte(id))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchTenant", "The specified tenant does not exist")
@@ -429,7 +429,7 @@ func (s *Service) ListTenants(ctx context.Context) ([]Tenant, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		return storage.ScanJSON[Tenant](tx, spaceTenants, nil, func(_ []byte, t Tenant) error {
 			out = append(out, t)
 			return nil
@@ -487,7 +487,7 @@ func ValidateKey(key string) error {
 var newID = func() string { return id.New() }
 
 // nextSeq allocates the next value of a named monotonic counter inside tx.
-func nextSeq(tx *storage.WriteTx, name string) (uint64, error) {
+func nextSeq(tx storage.Writer, name string) (uint64, error) {
 	raw, err := tx.Get(spaceCounters, []byte(name))
 	switch {
 	case errors.Is(err, storage.ErrNotFound):

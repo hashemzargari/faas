@@ -1,11 +1,13 @@
 package console
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/fass-storage/fass/internal/contract"
 )
@@ -34,6 +36,23 @@ type OverviewData struct {
 	Attention       []AttentionItem
 	Coordinator5xx  int
 	MetricsError    string
+	// Repair is nil when the coordinator does not expose /v1/repair/status
+	// (older release). Unknown (null) sub-fields render as "unknown".
+	Repair *RepairStatus
+	// Pre-formatted repair fields: null => "unknown", never 0/"no".
+	RepairPresent       bool
+	RepairCritical      bool
+	RepairBacklog       string
+	RepairRunning       string
+	RepairFailed        string
+	RepairOldest        string
+	RepairBytes         string
+	RepairThrottled     string
+	RepairBudget        string
+	RepairLastError     string
+	RepairUnrecoverable string
+	RepairBelowThresh   string
+	RepairBelowWater    string
 }
 
 type RingView struct {
@@ -197,6 +216,31 @@ func (s *Server) buildOverview(w http.ResponseWriter, r *http.Request, common Co
 		}
 	}
 
+	if rs, rerr := s.client.RepairStatus(ctx); rerr == nil {
+		d.Repair = &rs
+		d.RepairPresent = true
+		d.RepairBacklog = unknownOrInt(ptrSum(rs.QueueField("pending"), rs.QueueField("running")))
+		d.RepairRunning = unknownOrInt(rs.QueueField("running"))
+		d.RepairFailed = unknownOrInt(rs.QueueField("failed"))
+		d.RepairOldest = unknownOrSeconds(rs.OldestPendingAgeSeconds)
+		d.RepairBytes = unknownOrBytes(rs.BytesRepairedLast24h)
+		d.RepairThrottled = unknownOrBool(rs.Throttled)
+		d.RepairBudget = unknownOrInt64(rs.PerSiteBudgetMbps)
+		d.RepairLastError = unknownOrText(rs.LastError)
+		d.RepairUnrecoverable = unknownOrInt(rs.ShardSetField("unrecoverable"))
+		d.RepairBelowThresh = unknownOrInt(rs.ShardSetField("below_threshold"))
+		d.RepairBelowWater = unknownOrInt(rs.ShardSetField("below_repair_watermark"))
+		if unrecoverable, ok := rs.Unrecoverable(); ok && unrecoverable > 0 {
+			d.RepairCritical = true
+			// The only number that means data loss has already happened.
+			d.Attention = append([]AttentionItem{{Severity: "bad", Text: fmt.Sprintf("DATA LOSS: %d shard set(s) are UNRECOVERABLE (fewer than geo_n reachable groups) — escalate immediately", unrecoverable), Link: "/agents"}}, d.Attention...)
+		} else if backlog, ok := rs.Backlog(); ok && backlog > 0 {
+			d.Attention = append(d.Attention, AttentionItem{Severity: "warn", Text: fmt.Sprintf("Repair backlog: %d job(s) pending or running", backlog), Link: "/agents"})
+		}
+		if rs.Queue != nil && rs.Queue.Failed != nil && *rs.Queue.Failed > 0 {
+			d.Attention = append(d.Attention, AttentionItem{Severity: "warn", Text: fmt.Sprintf("%d repair job(s) failed", *rs.Queue.Failed), Link: "/agents"})
+		}
+	}
 	if raw, merr := s.client.Metrics(ctx); merr != nil {
 		d.MetricsError = merr.Error()
 	} else {
@@ -206,6 +250,11 @@ func (s *Server) buildOverview(w http.ResponseWriter, r *http.Request, common Co
 	d.Status = "ok"
 	if d.Offline > 0 || d.Suspect > 0 || len(d.Attention) > 0 {
 		d.Status = "degraded"
+	}
+	if d.Repair != nil {
+		if unrecoverable, ok := d.Repair.Unrecoverable(); ok && unrecoverable > 0 {
+			d.Status = "critical"
+		}
 	}
 	return d
 }
@@ -430,4 +479,63 @@ func (s *Server) decommissionAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("agent decommission changed from console", "agent_id", id, "on", on, "user", s.cfg.User)
 	http.Redirect(w, r, "/agents?flash="+url.QueryEscape(action+id), http.StatusSeeOther)
+}
+
+// ---------------------------------------------------------------------------
+// Repair-status formatting helpers: nil means "unknown", never zero.
+// ---------------------------------------------------------------------------
+
+// QueueField exists on RepairStatus as a small accessor for templates? No:
+// handlers format from the struct directly below.
+func ptrSum(a, b *int) *int {
+	if a == nil || b == nil {
+		return nil
+	}
+	v := *a + *b
+	return &v
+}
+
+func unknownOrInt(v *int) string {
+	if v == nil {
+		return "unknown"
+	}
+	return strconv.Itoa(*v)
+}
+
+func unknownOrInt64(v *int64) string {
+	if v == nil {
+		return "unknown"
+	}
+	return strconv.FormatInt(*v, 10)
+}
+
+func unknownOrBool(v *bool) string {
+	if v == nil {
+		return "unknown"
+	}
+	if *v {
+		return "yes"
+	}
+	return "no"
+}
+
+func unknownOrSeconds(v *float64) string {
+	if v == nil {
+		return "unknown"
+	}
+	return (time.Duration(*v * float64(time.Second))).Round(time.Second).String()
+}
+
+func unknownOrBytes(v *int64) string {
+	if v == nil {
+		return "unknown"
+	}
+	return humanBytes(*v)
+}
+
+func unknownOrText(v *string) string {
+	if v == nil || strings.TrimSpace(*v) == "" {
+		return "-"
+	}
+	return *v
 }

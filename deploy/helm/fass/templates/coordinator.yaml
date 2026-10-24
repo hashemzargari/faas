@@ -19,7 +19,7 @@ spec:
       targetPort: http
       protocol: TCP
 ---
-{{- if and $c.persistence.enabled (not $c.persistence.existingClaim) }}
+{{- if and (eq $c.dbDriver "embedded") $c.persistence.enabled (not $c.persistence.existingClaim) }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -46,10 +46,18 @@ metadata:
     {{- $labels | nindent 4 }}
     app.kubernetes.io/component: coordinator
 spec:
-  # The coordinator's store is single-writer: never run two pods on one volume.
-  replicas: 1
+  replicas: {{ $c.replicas }}
   strategy:
+    {{- if eq $c.dbDriver "postgres" }}
+    # PostgreSQL makes the coordinator horizontally scalable; roll safely.
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- else }}
+    # The embedded store is single-writer: never run two pods on one volume.
     type: Recreate
+    {{- end }}
   selector:
     matchLabels:
       {{- include "fass.selectorLabels" (dict "root" . "component" "coordinator") | nindent 6 }}
@@ -88,6 +96,17 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/usr/local/bin/fass-coordinator"]
           env:
+            - name: FASS_COORDINATOR_DB_DRIVER
+              value: {{ $c.dbDriver | quote }}
+            {{- if eq $c.dbDriver "postgres" }}
+            - name: FASS_COORDINATOR_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $c.db.existingSecret }}
+                  key: {{ $c.db.dsnKey }}
+            - name: FASS_COORDINATOR_DB_MIGRATE_ON_START
+              value: {{ $c.dbMigrateOnStart | quote }}
+            {{- end }}
             - name: FASS_COORDINATOR_LISTEN
               value: ":{{ $c.listenPort }}"
             - name: FASS_COORDINATOR_DATA_DIR
@@ -127,9 +146,12 @@ spec:
               drop: ["ALL"]
           resources:
             {{- toYaml $c.resources | nindent 12 }}
+          {{- if eq $c.dbDriver "embedded" }}
           volumeMounts:
             - name: data
               mountPath: {{ $c.dataDir }}
+          {{- end }}
+      {{- if eq $c.dbDriver "embedded" }}
       volumes:
         - name: data
           {{- if $c.persistence.enabled }}
@@ -138,4 +160,5 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+      {{- end }}
 {{- end }}

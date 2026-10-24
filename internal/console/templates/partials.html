@@ -3,7 +3,7 @@
   <section class="page-head">
     <h1>Cluster overview</h1>
     <div class="head-meta">
-      <span class="pill {{if eq .Status "ok"}}ok{{else if eq .Status "unreachable"}}bad{{else}}warn{{end}}">{{.Status}}</span>
+      <span class="pill {{if eq .Status "ok"}}ok{{else if or (eq .Status "critical") (eq .Status "unreachable")}}bad{{else}}warn{{end}}">{{.Status}}</span>
       <span class="muted">snapshot {{.SnapshotAt}}</span>
     </div>
   </section>
@@ -27,6 +27,27 @@
       <div class="card-label">Rings</div>
       <div class="card-value">{{len .Rings}}</div>
       <div class="card-detail">{{len .RCs}} redundancy class(es) · {{len .Nexuses}} nexuses</div>
+    </div>
+    <div class="card {{if .RepairCritical}}critical{{end}}">
+      <div class="card-label">Repair queue</div>
+      {{if .RepairPresent}}
+        <div class="card-value {{if .RepairCritical}}bad{{end}}">{{.RepairBacklog}} backlog</div>
+        <div class="card-detail">
+          running {{.RepairRunning}} · failed {{.RepairFailed}} · oldest {{.RepairOldest}}
+        </div>
+        <div class="card-detail">
+          repaired 24h {{.RepairBytes}} · throttled {{.RepairThrottled}} · budget {{.RepairBudget}} Mbps
+        </div>
+        <div class="card-detail {{if .RepairCritical}}bad{{end}}">
+          shard sets: below threshold {{.RepairBelowThresh}} · below repair watermark {{.RepairBelowWater}} · <strong>unrecoverable {{.RepairUnrecoverable}}</strong>
+          {{if .RepairCritical}}<br><strong>DATA LOSS — unrecoverable shard sets exist; escalate immediately.</strong>{{end}}
+        </div>
+        {{if .RepairLastError}}<div class="card-detail muted">last error: {{.RepairLastError}}</div>{{end}}
+      {{else}}
+        <div class="card-value">unknown</div>
+        <div class="card-detail muted">coordinator does not expose /v1/repair/status (older release or unreachable)</div>
+      {{end}}
+      <a href="/agents" class="card-link">agents →</a>
     </div>
     <div class="card">
       <div class="card-label">Coordinator</div>

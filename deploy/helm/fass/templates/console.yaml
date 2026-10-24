@@ -1,0 +1,126 @@
+{{- if .Values.console.enabled }}
+{{- $con := .Values.console }}
+{{- $name := printf "%s-console" (include "fass.fullname" .) }}
+{{- $coordURL := include "fass.effectiveCoordinatorURL" (dict "root" . "url" $con.coordinatorURL) }}
+{{- $labels := include "fass.labels" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- $labels | nindent 4 }}
+    app.kubernetes.io/component: console
+  {{- with $con.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $con.service.type }}
+  selector:
+    {{- include "fass.selectorLabels" (dict "root" . "component" "console") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $con.listenPort }}
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- $labels | nindent 4 }}
+    app.kubernetes.io/component: console
+spec:
+  replicas: {{ $con.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "fass.selectorLabels" (dict "root" . "component" "console") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "fass.selectorLabels" (dict "root" . "component" "console") | nindent 8 }}
+        {{- with $con.podLabels }}{{ toYaml . | nindent 8 }}{{ end }}
+      {{- with $con.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ default (include "fass.fullname" .) .Values.serviceAccount.name }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with $con.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $con.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $con.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: console
+          image: {{ include "fass.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/fass-console"]
+          env:
+            - name: FASS_CONSOLE_LISTEN
+              value: ":{{ $con.listenPort }}"
+            - name: FASS_COORDINATOR_URL
+              value: {{ $coordURL | quote }}
+            - name: FASS_CONSOLE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $con.auth.existingSecret }}
+                  key: {{ $con.auth.userKey }}
+            - name: FASS_CONSOLE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $con.auth.existingSecret }}
+                  key: {{ $con.auth.passwordKey }}
+            - name: FASS_CONSOLE_READ_ONLY
+              value: {{ $con.readOnly | quote }}
+            - name: FASS_LOG_LEVEL
+              value: "info"
+            - name: FASS_LOG_FORMAT
+              value: "json"
+          ports:
+            - name: http
+              containerPort: {{ $con.listenPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml $con.resources | nindent 12 }}
+{{- end }}

@@ -1,0 +1,67 @@
+compat: coordinator on PostgreSQL
+=== RUN   TestNoncurrentVersionExpirationAndLockedVersions
+--- PASS: TestNoncurrentVersionExpirationAndLockedVersions (0.98s)
+=== RUN   TestLifecycleConfigurationRoundTrip
+--- PASS: TestLifecycleConfigurationRoundTrip (0.01s)
+=== RUN   TestListObjectsV2PrefixDelimiterRules
+=== RUN   TestListObjectsV2PrefixDelimiterRules/delimiter-in-middle-groups-and-dedupes
+=== RUN   TestListObjectsV2PrefixDelimiterRules/delimiter-at-start-of-key
+=== RUN   TestListObjectsV2PrefixDelimiterRules/delimiter-at-end-of-key
+=== RUN   TestListObjectsV2PrefixDelimiterRules/prefix-equals-a-key-exactly
+=== RUN   TestListObjectsV2PrefixDelimiterRules/prefix-longer-than-anykey
+=== RUN   TestListObjectsV2PrefixDelimiterRules/delimiter-grouping-counts-against-maxkeys
+--- PASS: TestListObjectsV2PrefixDelimiterRules (0.06s)
+    --- PASS: TestListObjectsV2PrefixDelimiterRules/delimiter-in-middle-groups-and-dedupes (0.00s)
+    --- PASS: TestListObjectsV2PrefixDelimiterRules/delimiter-at-start-of-key (0.00s)
+    --- PASS: TestListObjectsV2PrefixDelimiterRules/delimiter-at-end-of-key (0.00s)
+    --- PASS: TestListObjectsV2PrefixDelimiterRules/prefix-equals-a-key-exactly (0.00s)
+    --- PASS: TestListObjectsV2PrefixDelimiterRules/prefix-longer-than-anykey (0.00s)
+    --- PASS: TestListObjectsV2PrefixDelimiterRules/delimiter-grouping-counts-against-maxkeys (0.00s)
+=== RUN   TestListObjectsV2MaxKeysRules
+=== RUN   TestListObjectsV2MaxKeysRules/max-keys-zero-returns-empty-not-truncated
+=== RUN   TestListObjectsV2MaxKeysRules/max-keys-one-sets-token
+=== RUN   TestListObjectsV2MaxKeysRules/max-keys-exactly-page-size-not-truncated
+=== RUN   TestListObjectsV2MaxKeysRules/malformed-continuation-token-is-invalid-argument
+=== RUN   TestListObjectsV2MaxKeysRules/startafter-and-continuation-token-interplay
+--- PASS: TestListObjectsV2MaxKeysRules (0.03s)
+    --- PASS: TestListObjectsV2MaxKeysRules/max-keys-zero-returns-empty-not-truncated (0.00s)
+    --- PASS: TestListObjectsV2MaxKeysRules/max-keys-one-sets-token (0.00s)
+    --- PASS: TestListObjectsV2MaxKeysRules/max-keys-exactly-page-size-not-truncated (0.00s)
+    --- PASS: TestListObjectsV2MaxKeysRules/malformed-continuation-token-is-invalid-argument (0.00s)
+    --- PASS: TestListObjectsV2MaxKeysRules/startafter-and-continuation-token-interplay (0.00s)
+=== RUN   TestListObjectsEncodingTypeURL
+--- PASS: TestListObjectsEncodingTypeURL (0.04s)
+=== RUN   TestListEmptyAndAllDeletedBuckets
+--- PASS: TestListEmptyAndAllDeletedBuckets (0.01s)
+=== RUN   TestListObjectsV1DelimiterAndMarker
+--- PASS: TestListObjectsV1DelimiterAndMarker (0.02s)
+=== RUN   TestComplianceRetentionCannotBeShortenedOrDeleted
+--- PASS: TestComplianceRetentionCannotBeShortenedOrDeleted (0.02s)
+=== RUN   TestGovernanceRetentionRules
+--- PASS: TestGovernanceRetentionRules (0.02s)
+=== RUN   TestLegalHoldBlocksDeleteRegardlessOfBypass
+--- PASS: TestLegalHoldBlocksDeleteRegardlessOfBypass (0.01s)
+=== RUN   TestRetentionOnDeleteMarkerIsSane
+--- PASS: TestRetentionOnDeleteMarkerIsSane (0.01s)
+=== RUN   TestObjectTaggingRoundTripRules
+--- PASS: TestObjectTaggingRoundTripRules (0.01s)
+=== RUN   TestCopyObjectPreservesTags
+--- PASS: TestCopyObjectPreservesTags (0.02s)
+=== RUN   TestInlineTaggingAtUpload
+--- PASS: TestInlineTaggingAtUpload (0.01s)
+=== RUN   TestBucketOwnerEnforcedRejectsACLWrites
+--- PASS: TestBucketOwnerEnforcedRejectsACLWrites (0.00s)
+=== RUN   TestEnablingBucketOwnerEnforcedWithForeignGrantsIsRejected
+--- PASS: TestEnablingBucketOwnerEnforcedWithForeignGrantsIsRejected (0.00s)
+=== RUN   TestCannedACLVisibility
+--- PASS: TestCannedACLVisibility (0.01s)
+=== RUN   TestListObjectVersionsOrderingRules
+--- PASS: TestListObjectVersionsOrderingRules (0.03s)
+=== RUN   TestDeleteMarkerReplacementAndVersionDeletionRules
+--- PASS: TestDeleteMarkerReplacementAndVersionDeletionRules (0.03s)
+=== RUN   TestSuspendedVersioningNullVersionSemantics
+--- PASS: TestSuspendedVersioningNullVersionSemantics (0.03s)
+=== RUN   TestVersionListingMarkerPaginationOverS3
+--- PASS: TestVersionListingMarkerPaginationOverS3 (0.03s)
+PASS
+ok  	github.com/fass-storage/fass/test/compat	2.968s

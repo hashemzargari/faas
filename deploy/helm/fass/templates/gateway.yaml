@@ -1,0 +1,196 @@
+{{- if .Values.gateway.enabled }}
+{{- $g := .Values.gateway }}
+{{- $rc := .Values.redundancy }}
+{{- $name := printf "%s-gateway" (include "fass.fullname" .) }}
+{{- $coordURL := include "fass.effectiveCoordinatorURL" (dict "root" . "url" $g.coordinatorURL) }}
+{{- $labels := include "fass.labels" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- $labels | nindent 4 }}
+    app.kubernetes.io/component: gateway
+  {{- with $g.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $g.service.type }}
+  selector:
+    {{- include "fass.selectorLabels" (dict "root" . "component" "gateway") | nindent 4 }}
+  ports:
+    - name: s3
+      port: {{ $g.listenPort }}
+      targetPort: s3
+      protocol: TCP
+    - name: admin
+      port: {{ $g.adminPort }}
+      targetPort: admin
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- $labels | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: {{ $g.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "fass.selectorLabels" (dict "root" . "component" "gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "fass.selectorLabels" (dict "root" . "component" "gateway") | nindent 8 }}
+        {{- with $g.podLabels }}{{ toYaml . | nindent 8 }}{{ end }}
+      {{- with $g.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ default (include "fass.fullname" .) .Values.serviceAccount.name }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with $g.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $g.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $g.affinity }}
+      affinity:
+        {{- toYaml $g.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "fass.selectorLabels" (dict "root" . "component" "gateway") | nindent 20 }}
+      {{- end }}
+      containers:
+        - name: gateway
+          image: {{ include "fass.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/fass-gateway"]
+          env:
+            - name: FASS_GATEWAY_LISTEN
+              value: ":{{ $g.listenPort }}"
+            - name: FASS_GATEWAY_ADMIN_LISTEN
+              value: ":{{ $g.adminPort }}"
+            - name: FASS_COORDINATOR_URL
+              value: {{ $coordURL | quote }}
+            - name: FASS_GATEWAY_REGION
+              value: {{ $g.region | quote }}
+            - name: FASS_GATEWAY_CHUNK_SIZE
+              value: {{ $g.chunkSize | int64 | quote }}
+            - name: FASS_GATEWAY_GEO_N
+              value: {{ $rc.geoN | quote }}
+            - name: FASS_GATEWAY_GEO_K
+              value: {{ $rc.geoK | quote }}
+            - name: FASS_GATEWAY_LOCAL_N
+              value: {{ $rc.localN | quote }}
+            - name: FASS_GATEWAY_LOCAL_K
+              value: {{ $rc.localK | quote }}
+            - name: FASS_GATEWAY_OFFLOADER_WORKERS
+              value: {{ $g.offloaderWorkers | quote }}
+            - name: FASS_GATEWAY_SHARD_PARALLEL
+              value: {{ $g.shardParallel | quote }}
+            - name: FASS_LOG_LEVEL
+              value: "info"
+            - name: FASS_LOG_FORMAT
+              value: "json"
+            {{- if $g.defaultRedundancyClass }}
+            - name: FASS_GATEWAY_DEFAULT_RC
+              value: {{ $g.defaultRedundancyClass | quote }}
+            {{- end }}
+            {{- if $g.devMode }}
+            - name: FASS_GATEWAY_DEV
+              value: "true"
+            {{- else }}
+            - name: FASS_GATEWAY_KEY_SEED
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $g.keySeed.existingSecret }}
+                  key: {{ $g.keySeed.secretKey }}
+            {{- end }}
+            {{- if $g.tls.enabled }}
+            - name: FASS_GATEWAY_TLS_CERT
+              value: /etc/fass/tls/{{ $g.tls.certKey }}
+            - name: FASS_GATEWAY_TLS_KEY
+              value: /etc/fass/tls/{{ $g.tls.keyKey }}
+            {{- end }}
+            {{- if $g.sdpPolicy.existingConfigMap }}
+            - name: FASS_GATEWAY_SDP_POLICY
+              value: /etc/fass/sdp/{{ $g.sdpPolicy.configMapKey }}
+            {{- end }}
+          ports:
+            - name: s3
+              containerPort: {{ $g.listenPort }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ $g.adminPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml $g.resources | nindent 12 }}
+          volumeMounts:
+            {{- if $g.tls.enabled }}
+            - name: tls
+              mountPath: /etc/fass/tls
+              readOnly: true
+            {{- end }}
+            {{- if $g.sdpPolicy.existingConfigMap }}
+            - name: sdp-policy
+              mountPath: /etc/fass/sdp
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if $g.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ $g.tls.existingSecret }}
+        {{- end }}
+        {{- if $g.sdpPolicy.existingConfigMap }}
+        - name: sdp-policy
+          configMap:
+            name: {{ $g.sdpPolicy.existingConfigMap }}
+        {{- end }}
+{{- end }}

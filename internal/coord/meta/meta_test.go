@@ -555,7 +555,7 @@ func TestManifestBlobsAreContentAddressedAndCompressed(t *testing.T) {
 	// Two different objects share one blob because the chunk table (and therefore
 	// its content hash) is identical.
 	var blobCount int
-	if err := m.DB().View(ctx, func(tx *storage.ReadTx) error {
+	if err := m.DB().View(ctx, func(tx storage.Reader) error {
 		var err error
 		blobCount, err = tx.Count([]byte("manifest_blobs"), nil)
 		return err
@@ -869,7 +869,7 @@ func TestLegacyBucketCreatedAtBackfillIsStableAndPersisted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal legacy record: %v", err)
 	}
-	if err := m.DB().Update(ctx, func(tx *storage.WriteTx) error {
+	if err := m.DB().Update(ctx, func(tx storage.Writer) error {
 		if err := tx.Put([]byte("buckets"), []byte(name), raw); err != nil {
 			return err
 		}
@@ -898,7 +898,7 @@ func TestLegacyBucketCreatedAtBackfillIsStableAndPersisted(t *testing.T) {
 		t.Fatalf("fallback = %v, want Unix epoch", first.CreatedAt)
 	}
 	var stored map[string]any
-	if err := m.DB().View(ctx, func(tx *storage.ReadTx) error {
+	if err := m.DB().View(ctx, func(tx storage.Reader) error {
 		rec, err := tx.Get([]byte("buckets"), []byte(name))
 		if err != nil {
 			return err

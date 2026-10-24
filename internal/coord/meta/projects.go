@@ -34,7 +34,7 @@ func (s *Service) PutProject(ctx context.Context, p Project) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		if existing, err := storage.GetJSON[Project](tx, spaceProjects, []byte(p.ProjectID)); err == nil {
 			p.CreatedAt = existing.CreatedAt
 		} else if !errors.Is(err, storage.ErrNotFound) {
@@ -53,7 +53,7 @@ func (s *Service) GetProject(ctx context.Context, projectID contract.ProjectID) 
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		rec, err := storage.GetJSON[Project](tx, spaceProjects, []byte(projectID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchProject", "project %q does not exist", projectID)
@@ -73,7 +73,7 @@ func (s *Service) ListProjects(ctx context.Context, tenant contract.TenantID) ([
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		return storage.ScanJSON[Project](tx, spaceProjects, nil, func(_ []byte, p Project) error {
 			if tenant != "" && p.TenantID != tenant {
 				return nil

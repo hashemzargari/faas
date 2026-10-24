@@ -14,11 +14,13 @@ package compat
 import (
 	"bytes"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +29,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 const (
@@ -72,6 +76,10 @@ type cluster struct {
 	payload  bootstrapPayload
 	client   *s3client
 	seq      int
+	// dbArgs select the persistence backend for the coordinator (empty means the
+	// embedded dev store). With a PostgreSQL DSN the suite runs against a fresh
+	// database created for this run, then drops it.
+	dbArgs []string
 }
 
 var live *cluster
@@ -88,6 +96,14 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	c := &cluster{root: root, bin: filepath.Join(dir, "bin"), dir: dir, logDir: filepath.Join(dir, "logs")}
+	if dsn, cleanup, err := compatPostgresDSN(); err != nil {
+		fmt.Fprintln(os.Stderr, "compat: postgres:", err)
+		os.Exit(1)
+	} else if dsn != "" {
+		defer cleanup()
+		c.dbArgs = []string{"--db-driver=postgres", "--db-dsn=" + dsn, "--db-migrate-on-start=true"}
+		fmt.Fprintln(os.Stderr, "compat: coordinator on PostgreSQL")
+	}
 	code := func() int {
 		if err := c.boot(); err != nil {
 			c.dumpLogs("", 60)
@@ -294,6 +310,7 @@ func (c *cluster) startCoordinatorAt(addr string, clockOffset time.Duration) err
 		"--lifecycle-interval", "200ms",
 		"--log-format", "text",
 	}
+	args = append(args, c.dbArgs...)
 	if clockOffset != 0 {
 		args = append(args, "--dev-clock-offset", clockOffset.String())
 	}
@@ -554,4 +571,42 @@ func (c *cluster) mustErr(resp *s3response, wantStatus int, wantCode, rule strin
 	var e xmlError
 	_ = xmlDecode(resp.Body, &e)
 	c.failS3(resp, "%s: expected %d %s, got %d %s", rule, wantStatus, wantCode, resp.Status, e.Code)
+}
+
+// compatPostgresDSN returns a DSN for a fresh database when the operator asked
+// for the PostgreSQL backend (FASS_TEST_POSTGRES_DSN / FASS_COMPAT_POSTGRES_DSN).
+// A fresh database per run prevents stale agents/rings from a previous run from
+// polluting the topology, and is dropped afterwards.
+func compatPostgresDSN() (dsn string, cleanup func(), err error) {
+	base := os.Getenv("FASS_TEST_POSTGRES_DSN")
+	if base == "" {
+		base = os.Getenv("FASS_COMPAT_POSTGRES_DSN")
+	}
+	if base == "" {
+		return "", func() {}, nil
+	}
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", nil, fmt.Errorf("invalid PostgreSQL DSN %q", base)
+	}
+	admin := *u
+	admin.Path = "/postgres"
+	adminDB, err := sql.Open("pgx", admin.String())
+	if err != nil {
+		return "", nil, fmt.Errorf("connect admin database: %w", err)
+	}
+	defer adminDB.Close()
+	name := fmt.Sprintf("fass_compat_%d", time.Now().UnixNano())
+	if _, err := adminDB.Exec("CREATE DATABASE " + name); err != nil {
+		return "", nil, fmt.Errorf("create database %s: %w", name, err)
+	}
+	cleanup = func() {
+		if db, err := sql.Open("pgx", admin.String()); err == nil {
+			defer db.Close()
+			_, _ = db.Exec("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)")
+		}
+	}
+	fresh := *u
+	fresh.Path = "/" + name
+	return fresh.String(), cleanup, nil
 }

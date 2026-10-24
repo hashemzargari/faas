@@ -227,7 +227,7 @@ What each reads:
 | `cluster status` | `GET /v1/topology`, `GET /healthz` |
 | `node ls` | `GET /v1/topology` |
 | `rc ls` | `GET /v1/redundancy-classes` |
-| `repair status` | `GET /v1/repair/status` (`pending`, `running`, `failed`, `oldest_pending_age`, `bytes_repaired_last_24h`, `throttled`); falls back to a `/v1/topology`-derived risk summary on `404` or an empty response |
+| `repair status` | `GET /v1/repair/status`: `queue.{pending,running,failed}` (pending and running disjoint), `oldest_pending_age_seconds`, `bytes_repaired_last_24h`, `throttled`, `per_site_budget_mbps`, `last_error`, `shardsets.{below_threshold,below_repair_watermark,unrecoverable}`. `null` means *unknown* and is rendered `unknown`/`-`, never `0`/`no`. A non-zero `shardsets.unrecoverable` prints a DATA LOSS warning. Falls back to a `/v1/topology`-derived risk summary on `404`/`405`/`501` or an empty response; real 5xx errors are surfaced. |
 | `gc status` | `GET /metrics` (lines prefixed `fass_coordinator_gc_`) |
 
 ### 3.5 Output and exit codes
@@ -401,10 +401,12 @@ These are deliberate for the MVP; each is a candidate follow-up task.
 * S3→S3 copies stream through the CLI (GET+PUT); the gateway's `CopyObject` is
   not exposed by the SDK yet.
 * `repair status` consumes `GET /v1/repair/status` when the coordinator
-  provides it; against an older coordinator it falls back to a topology-derived
-  risk summary (offline/suspect agents, write-degraded nexuses, rings ≥ 80%
-  full) and labels the source. `gc status` reports only counters exported on
-  `/metrics`.
+  provides it (current release). It renders tri-state fields as `unknown` when
+  the coordinator says `null` — "we don't know" must not look like "all good" —
+  and prints a prominent `DATA LOSS` line when `shardsets.unrecoverable > 0`.
+  Against an older coordinator it falls back to a topology-derived risk summary
+  (offline/suspect agents, write-degraded nexuses, rings ≥ 80% full) and labels
+  the source. `gc status` reports only counters exported on `/metrics`.
 
 ---
 

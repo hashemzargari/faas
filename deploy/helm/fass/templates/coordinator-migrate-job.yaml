@@ -1,0 +1,48 @@
+{{- if and .Values.coordinator.enabled (eq .Values.coordinator.dbDriver "postgres") }}
+{{- $c := .Values.coordinator }}
+# Production schema migration: run explicitly before the coordinator rollout.
+# A restarting process never mutates the schema (db-migrate-on-start defaults to
+# false), so this hook is the only place migrations are applied.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "fass.fullname" . }}-coordinator-migrate
+  labels:
+    {{- include "fass.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator-migrate
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        {{- include "fass.selectorLabels" (dict "root" . "component" "coordinator-migrate") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ default (include "fass.fullname" .) .Values.serviceAccount.name }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "fass.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/fass-coordinator", "migrate"]
+          env:
+            - name: FASS_COORDINATOR_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $c.db.existingSecret }}
+                  key: {{ $c.db.dsnKey }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+{{- end }}

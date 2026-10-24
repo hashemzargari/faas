@@ -28,6 +28,8 @@ type fakeCoordinator struct {
 	manifest contract.Manifest
 	actions  []string
 	metrics  string
+	// repair is served as GET /v1/repair/status; nil = 404 (older coordinator).
+	repair any
 }
 
 func newFakeCoordinator() *fakeCoordinator {
@@ -173,6 +175,17 @@ func (f *fakeCoordinator) handler() http.Handler {
 		f.actions = append(f.actions, fmt.Sprintf("decommission:%s:%v", r.PathValue("agentID"), body.On))
 		f.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("GET /v1/repair/status", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		repair := f.repair
+		f.mu.Unlock()
+		if repair == nil {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"error":{"code":"NotFound","message":"no repair status endpoint"}}`)
+			return
+		}
+		writeJSON(w, repair)
 	})
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
@@ -358,6 +371,67 @@ func TestPartialsRender(t *testing.T) {
 	}
 	if _, body := f.get(t, "/partials/agents", true); !strings.Contains(body, "agents-body") {
 		t.Error("agents partial root id missing")
+	}
+}
+
+func TestOverviewRepairStatusCritical(t *testing.T) {
+	f := newFixture(t, true)
+	f.fake.mu.Lock()
+	f.fake.repair = map[string]any{
+		"queue":                      map[string]any{"pending": 4, "running": 2, "failed": 1},
+		"oldest_pending_age_seconds": nil,
+		"bytes_repaired_last_24h":    3 << 20,
+		"throttled":                  nil,
+		"per_site_budget_mbps":       200,
+		"last_error":                 nil,
+		"shardsets":                  map[string]any{"below_threshold": 9, "below_repair_watermark": 3, "unrecoverable": 2},
+	}
+	f.fake.mu.Unlock()
+
+	resp, body := f.get(t, "/", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	for _, want := range []string{
+		"Repair queue", "6 backlog", "running 2", "failed 1",
+		"unrecoverable 2", "DATA LOSS", "critical", "card critical",
+	} {
+		mustContain(t, body, want, "overview repair card")
+	}
+	// null must render as unknown, never as 0/"no".
+	if strings.Contains(body, "throttled no") {
+		t.Errorf("null throttled rendered as 'no':\n%s", body)
+	}
+	mustContain(t, body, "throttled unknown", "overview repair card")
+	mustContain(t, body, "oldest unknown", "overview repair card")
+	if !strings.Contains(body, "3.0 MiB") {
+		t.Error("bytes_repaired_last_24h not rendered")
+	}
+}
+
+func TestOverviewRepairStatusUnknownIsNotZero(t *testing.T) {
+	f := newFixture(t, true)
+	f.fake.mu.Lock()
+	f.fake.repair = map[string]any{
+		"queue":                      map[string]any{"pending": nil, "running": nil, "failed": 0},
+		"oldest_pending_age_seconds": nil,
+		"bytes_repaired_last_24h":    nil,
+		"throttled":                  nil,
+		"per_site_budget_mbps":       nil,
+		"last_error":                 nil,
+		"shardsets":                  nil,
+	}
+	f.fake.mu.Unlock()
+
+	_, body := f.get(t, "/", true)
+	for _, want := range []string{"unknown backlog", "running unknown", "unrecoverable unknown", "throttled unknown"} {
+		mustContain(t, body, want, "unknown repair fields")
+	}
+	if strings.Contains(body, "DATA LOSS") {
+		t.Error("no data-loss banner expected when unrecoverable is unknown")
+	}
+	if strings.Contains(body, "critical") {
+		t.Error("unknown repair fields must not mark the cluster critical")
 	}
 }
 

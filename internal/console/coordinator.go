@@ -180,6 +180,99 @@ func (t Topology) Capacity() (used, total int64) {
 	return used, total
 }
 
+// ---------------------------------------------------------------------------
+// Repair status (coordinator task-9 endpoint)
+// ---------------------------------------------------------------------------
+
+// RepairQueue counts are disjoint: pending = not started, running = claimed.
+type RepairQueue struct {
+	Pending *int `json:"pending"`
+	Running *int `json:"running"`
+	Failed  *int `json:"failed"`
+}
+
+// RepairStatus mirrors GET /v1/repair/status. Every field is a pointer because
+// the coordinator distinguishes "unknown" (null) from zero — the console must
+// render that distinction instead of pretending "all good".
+type RepairStatus struct {
+	Queue                   *RepairQueue     `json:"queue"`
+	OldestPendingAgeSeconds *float64         `json:"oldest_pending_age_seconds"`
+	BytesRepairedLast24h    *int64           `json:"bytes_repaired_last_24h"`
+	Throttled               *bool            `json:"throttled"`
+	PerSiteBudgetMbps       *int64           `json:"per_site_budget_mbps"`
+	LastError               *string          `json:"last_error"`
+	ShardSets               *ShardSetDeficit `json:"shardsets"`
+}
+
+// ShardSetDeficit is the redundancy deficit that drives repair. Unrecoverable
+// is the only field that means data loss has already happened.
+type ShardSetDeficit struct {
+	BelowThreshold       *int `json:"below_threshold"`
+	BelowRepairWatermark *int `json:"below_repair_watermark"`
+	Unrecoverable        *int `json:"unrecoverable"`
+}
+
+// RepairStatus fetches the coordinator's repair view. Older coordinators answer
+// 404; callers treat that as "not exposed", not as an error page.
+func (c *CoordinatorClient) RepairStatus(ctx context.Context) (RepairStatus, error) {
+	var rs RepairStatus
+	if err := c.getJSON(ctx, "/v1/repair/status", &rs); err != nil {
+		return RepairStatus{}, err
+	}
+	return rs, nil
+}
+
+// Backlog returns pending+running when both are known ("unknown" otherwise).
+func (rs RepairStatus) Backlog() (int, bool) {
+	if rs.Queue == nil || rs.Queue.Pending == nil || rs.Queue.Running == nil {
+		return 0, false
+	}
+	return *rs.Queue.Pending + *rs.Queue.Running, true
+}
+
+// QueueField returns a queue counter by name (pending/running/failed), or nil
+// when the queue object is absent.
+func (rs RepairStatus) QueueField(name string) *int {
+	if rs.Queue == nil {
+		return nil
+	}
+	switch name {
+	case "pending":
+		return rs.Queue.Pending
+	case "running":
+		return rs.Queue.Running
+	case "failed":
+		return rs.Queue.Failed
+	default:
+		return nil
+	}
+}
+
+// ShardSetField returns a redundancy-deficit counter by name, or nil.
+func (rs RepairStatus) ShardSetField(name string) *int {
+	if rs.ShardSets == nil {
+		return nil
+	}
+	switch name {
+	case "below_threshold":
+		return rs.ShardSets.BelowThreshold
+	case "below_repair_watermark":
+		return rs.ShardSets.BelowRepairWatermark
+	case "unrecoverable":
+		return rs.ShardSets.Unrecoverable
+	default:
+		return nil
+	}
+}
+
+// Unrecoverable reports the number of shard sets past the point of repair.
+func (rs RepairStatus) Unrecoverable() (int, bool) {
+	if rs.ShardSets == nil || rs.ShardSets.Unrecoverable == nil {
+		return 0, false
+	}
+	return *rs.ShardSets.Unrecoverable, true
+}
+
 // Agent returns one agent from the additive admin endpoint.
 func (c *CoordinatorClient) Agent(ctx context.Context, id string) (Agent, error) {
 	var ag Agent

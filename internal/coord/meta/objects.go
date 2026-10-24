@@ -174,7 +174,7 @@ func (s *Service) CommitObject(ctx context.Context, req contract.CommitRequest) 
 		req.StorageClass = "STANDARD"
 	}
 
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		bucket, err := bucketInTx(tx, req.BucketID)
 		if err != nil {
 			return err
@@ -357,7 +357,7 @@ func trimQuotes(s string) string {
 // tombstoneVersion marks a version row deleted and queues its shards for GC.
 // Tombstones are kept (not hard-deleted) so the deletion queue can reference the
 // exact manifest until the GC worker has run.
-func (s *Service) tombstoneVersion(tx *storage.WriteTx, bucket Bucket, latest *latestRecord, now time.Time, reason string) error {
+func (s *Service) tombstoneVersion(tx storage.Writer, bucket Bucket, latest *latestRecord, now time.Time, reason string) error {
 	rec, err := storage.GetJSON[versionRecord](tx, spaceVersionIDs, versionIDKey(bucket.BucketID, latest.Key, latest.VersionID))
 	if err != nil {
 		return fmt.Errorf("meta: load version for tombstone: %w", err)
@@ -367,7 +367,7 @@ func (s *Service) tombstoneVersion(tx *storage.WriteTx, bucket Bucket, latest *l
 
 // tombstoneRecord marks one version deleted, persists both indexes and queues its
 // shards for GC (metadata-first deletion).
-func (s *Service) tombstoneRecord(tx *storage.WriteTx, rec versionRecord, now time.Time, reason string) error {
+func (s *Service) tombstoneRecord(tx storage.Writer, rec versionRecord, now time.Time, reason string) error {
 	rec.Deleted = true
 	rec.DeletedAt = &now
 	if err := storage.PutJSON(tx, spaceVersionIDs, versionIDKey(rec.BucketID, rec.Key, rec.VersionID), rec); err != nil {
@@ -399,7 +399,7 @@ func (s *Service) GetManifest(ctx context.Context, bucket, key string, version c
 	if err := ValidateKey(key); err != nil {
 		return out, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		cfg, err := s.bucketConfigTx(tx, bucket)
 		if err != nil {
 			return err
@@ -437,7 +437,7 @@ func (s *Service) DeleteObject(ctx context.Context, bucket, key string, version 
 		outVersion contract.VersionID
 		marker     bool
 	)
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		cfg, err := s.bucketConfigTx(tx, bucket)
 		if err != nil {
 			return err
@@ -589,7 +589,7 @@ func (s *Service) DeleteObject(ctx context.Context, bucket, key string, version 
 // existing null delete marker restores the previous version; otherwise the null
 // object version (if any) is replaced by a null delete marker and every non-null
 // version is retained.
-func (s *Service) suspendedDelete(tx *storage.WriteTx, cfg contract.BucketConfig, key string, latest *latestRecord, now time.Time, bypass bool, outVersion *contract.VersionID, marker *bool) error {
+func (s *Service) suspendedDelete(tx storage.Writer, cfg contract.BucketConfig, key string, latest *latestRecord, now time.Time, bypass bool, outVersion *contract.VersionID, marker *bool) error {
 	if latest != nil && latest.DeleteMarker && latest.VersionID == "null" {
 		rec, err := resolveVersion(tx, cfg.BucketID, key, "null")
 		if err != nil {
@@ -644,7 +644,7 @@ func (s *Service) suspendedDelete(tx *storage.WriteTx, cfg contract.BucketConfig
 
 // recomputeLatest flips (bucket, key)'s latest pointer to the highest-sequence
 // non-deleted version, or removes it when no live version remains.
-func (s *Service) recomputeLatest(tx *storage.WriteTx, bucketID contract.BucketID, key string, now time.Time) error {
+func (s *Service) recomputeLatest(tx storage.Writer, bucketID contract.BucketID, key string, now time.Time) error {
 	prefix := versionPrefix(bucketID, key)
 	var best *versionRecord
 	err := tx.Scan(spaceVersions, prefix, func(_, raw []byte) error {

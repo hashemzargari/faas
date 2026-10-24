@@ -61,6 +61,8 @@ footer { text-align: center; color: var(--muted); font-size: 12px; padding: 24px
 .card-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
 .card-value { font-size: 24px; font-weight: 600; margin: 6px 0; }
 .card-value.bad { color: var(--bad); }
+.card.critical { border-color: rgba(255,107,107,.65); box-shadow: 0 0 0 1px rgba(255,107,107,.25), 0 0 24px rgba(255,107,107,.08); }
+.card.critical .card-label { color: var(--bad); }
 .card-detail { color: var(--muted); font-size: 12px; }
 .card-link { position: absolute; top: 14px; right: 16px; font-size: 12px; }
 

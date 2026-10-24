@@ -88,11 +88,18 @@ app.kubernetes.io/component: {{ .component }}
 {{- fail (printf "redundancy.aag must be in 1..local_n+local_k (%d)" $perGroup) -}}
 {{- end -}}
 {{- if .Values.coordinator.enabled -}}
-{{- if gt (int .Values.coordinator.replicas) 1 -}}
-{{- fail "coordinator.replicas > 1 is not supported: the coordinator's storage backend is an embedded single-writer store (SQLite); there is no PostgreSQL backend yet. Keep coordinator.replicas=1 and restore from the PVC/backup on failure. See docs/09-deployment.md 'Known product gaps'." -}}
+{{- $driver := .Values.coordinator.dbDriver -}}
+{{- if and (ne $driver "embedded") (ne $driver "postgres") -}}
+{{- fail (printf "coordinator.dbDriver must be \"embedded\" or \"postgres\", got %q" $driver) -}}
 {{- end -}}
-{{- if .Values.coordinator.postgres.enabled -}}
-{{- fail "coordinator.postgres is not implemented by this FASS release: the coordinator has no DSN flag or PostgreSQL backend. Leave coordinator.postgres.enabled=false (see docs/09-deployment.md 'Known product gaps')." -}}
+{{- if eq $driver "postgres" -}}
+{{- if not .Values.coordinator.db.existingSecret -}}
+{{- fail "coordinator.db.existingSecret is required when coordinator.dbDriver=postgres: create a Secret with the PostgreSQL DSN (key coordinator.db.dsnKey). See docs/09-deployment.md §4.3." -}}
+{{- end -}}
+{{- else -}}
+{{- if gt (int .Values.coordinator.replicas) 1 -}}
+{{- fail "coordinator.replicas > 1 requires coordinator.dbDriver=postgres: the embedded store is single-writer. Either keep replicas=1 or point the coordinator at PostgreSQL. See docs/09-deployment.md §6." -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.gateway.enabled -}}

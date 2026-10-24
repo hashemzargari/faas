@@ -38,7 +38,7 @@ type Config struct {
 
 // Service is the coordinator: it implements contract.Coordinator.
 type Service struct {
-	DB      *storage.DB
+	DB      storage.Store
 	Meta    *meta.Service
 	Auth    *auth.Service
 	Members *membership.Service
@@ -50,8 +50,16 @@ type Service struct {
 
 var _ contract.Coordinator = (*Service)(nil)
 
+// NewWithStore wires a coordinator over an already-open store (embedded or
+// PostgreSQL); owns controls whether Close closes the store.
+func NewWithStore(db storage.Store, owns bool, cfg Config) *Service {
+	svc := New(db, cfg)
+	svc.ownsDB = owns
+	return svc
+}
+
 // New wires a coordinator over an already-open store. The caller owns the DB.
-func New(db *storage.DB, cfg Config) *Service {
+func New(db storage.Store, cfg Config) *Service {
 	now := cfg.Now
 	if now == nil {
 		now = time.Now

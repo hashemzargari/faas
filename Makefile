@@ -1,4 +1,4 @@
-.PHONY: all build test race vet lint fmt e2e compat chaos bench dev image clean cli console
+.PHONY: all build test race vet lint fmt e2e compat chaos bench dev image clean cli console deploy-lint
 
 SHELL := /bin/bash
 GOENV := source scripts/env.sh &&
@@ -43,6 +43,36 @@ cli:
 
 console:
 	$(GOENV) go build -trimpath -o bin/fass-console ./cmd/fass-console
+
+# Lint the deployment artifacts. Optional tooling is skipped cleanly: this is a
+# convenience gate, not a reason for CI to fail on a host without Helm.
+deploy-lint:
+	@set -euo pipefail; \
+	if command -v helm >/dev/null 2>&1; then \
+		echo "deploy-lint: helm $$(helm version --short)"; \
+		helm lint deploy/helm/fass; \
+		for v in deploy/helm/fass/values-*.yaml; do \
+			echo "deploy-lint: helm template -f $$v"; \
+			helm template fass deploy/helm/fass -f "$$v" >/dev/null; \
+		done; \
+	else \
+		echo "deploy-lint: helm not found — skipping Helm lint/template"; \
+	fi; \
+	if command -v systemd-analyze >/dev/null 2>&1; then \
+		echo "deploy-lint: systemd-analyze verify"; \
+		out=$$(mktemp); \
+		if systemd-analyze verify deploy/systemd/*.service 2>"$$out"; then \
+			cat "$$out"; echo "deploy-lint: systemd units ok"; \
+		else \
+			if grep -v 'is not executable' "$$out" | grep -q .; then \
+				cat "$$out" >&2; rm -f "$$out"; exit 1; \
+			fi; \
+			echo "deploy-lint: systemd units syntactically ok (binaries not installed on this host)"; \
+		fi; \
+		rm -f "$$out"; \
+	else \
+		echo "deploy-lint: systemd-analyze not found — skipping unit verification"; \
+	fi
 
 image:
 	docker build -f deploy/docker/Dockerfile -t fass:dev .

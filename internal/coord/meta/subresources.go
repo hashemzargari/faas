@@ -40,7 +40,7 @@ func (s *Service) GetBucketACL(ctx context.Context, bucket string) (contract.ACL
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		rec, err := storage.GetJSON[Bucket](tx, spaceBuckets, []byte(bucket))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrNoSuchBucket
@@ -63,7 +63,7 @@ func (s *Service) PutBucketACL(ctx context.Context, bucket string, acl contract.
 	if err := validateACL(acl); err != nil {
 		return err
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		rec, err := storage.GetJSON[Bucket](tx, spaceBuckets, []byte(bucket))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrNoSuchBucket
@@ -88,7 +88,7 @@ func (s *Service) GetBucketLifecycle(ctx context.Context, bucket string) ([]byte
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		rec, err := storage.GetJSON[Bucket](tx, spaceBuckets, []byte(bucket))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrNoSuchBucket
@@ -114,7 +114,7 @@ func (s *Service) PutBucketLifecycle(ctx context.Context, bucket string, xml []b
 	if len(xml) > 1<<20 {
 		return coerr.Invalidf("lifecycle document exceeds 1 MiB")
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		rec, err := storage.GetJSON[Bucket](tx, spaceBuckets, []byte(bucket))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrNoSuchBucket
@@ -129,7 +129,7 @@ func (s *Service) PutBucketLifecycle(ctx context.Context, bucket string, xml []b
 
 // DeleteBucketLifecycle removes a lifecycle document (idempotent).
 func (s *Service) DeleteBucketLifecycle(ctx context.Context, bucket string) error {
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		rec, err := storage.GetJSON[Bucket](tx, spaceBuckets, []byte(bucket))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrNoSuchBucket
@@ -152,7 +152,7 @@ func (s *Service) GetObjectTags(ctx context.Context, bucket, key string, v contr
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		cfg, err := s.bucketConfigTx(tx, bucket)
 		if err != nil {
 			return err
@@ -180,7 +180,7 @@ func (s *Service) PutObjectTags(ctx context.Context, bucket, key string, v contr
 			return coerr.Invalidf("invalid tag %q", k)
 		}
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		cfg, err := s.bucketConfigTx(tx, bucket)
 		if err != nil {
 			return err
@@ -200,7 +200,7 @@ func (s *Service) GetObjectRetention(ctx context.Context, bucket, key string, v 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		cfg, err := s.bucketConfigTx(tx, bucket)
 		if err != nil {
 			return err
@@ -227,7 +227,7 @@ func (s *Service) PutObjectRetention(ctx context.Context, bucket, key string, v 
 	if r.Mode != "" && r.Mode != "GOVERNANCE" && r.Mode != "COMPLIANCE" {
 		return coerr.Invalidf("retention mode must be GOVERNANCE or COMPLIANCE")
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		cfg, err := s.bucketConfigTx(tx, bucket)
 		if err != nil {
 			return err
@@ -253,7 +253,7 @@ func (s *Service) PutObjectRetention(ctx context.Context, bucket, key string, v 
 // PutObjectLegalHold toggles the legal hold independently of the retention mode
 // (S3 treats them as separate operations).
 func (s *Service) PutObjectLegalHold(ctx context.Context, bucket, key string, v contract.VersionID, hold bool) error {
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		cfg, err := s.bucketConfigTx(tx, bucket)
 		if err != nil {
 			return err
@@ -279,7 +279,7 @@ func (s *Service) GetObjectACL(ctx context.Context, bucket, key string, v contra
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		cfg, err := s.bucketConfigTx(tx, bucket)
 		if err != nil {
 			return err
@@ -303,7 +303,7 @@ func (s *Service) PutObjectACL(ctx context.Context, bucket, key string, v contra
 	if err := validateACL(acl); err != nil {
 		return err
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		cfg, err := s.bucketConfigTx(tx, bucket)
 		if err != nil {
 			return err
@@ -335,7 +335,7 @@ func (s *Service) bucketConfigTx(tx storage.Reader, bucket string) (contract.Buc
 	return rec.BucketConfig, nil
 }
 
-func (s *Service) putVersionRecord(tx *storage.WriteTx, rec versionRecord) error {
+func (s *Service) putVersionRecord(tx storage.Writer, rec versionRecord) error {
 	if err := storage.PutJSON(tx, spaceVersions, versionKey(rec.BucketID, rec.Key, rec.Seq), rec); err != nil {
 		return err
 	}
@@ -397,7 +397,7 @@ func (d DeletionItem) Acks(endpoint string) bool {
 	return false
 }
 
-func (s *Service) enqueueDeletion(tx *storage.WriteTx, item DeletionItem) error {
+func (s *Service) enqueueDeletion(tx storage.Writer, item DeletionItem) error {
 	seq, err := nextSeq(tx, "deletion")
 	if err != nil {
 		return err
@@ -421,7 +421,7 @@ func (s *Service) DrainDeletions(ctx context.Context, now time.Time, limit int) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		return storage.ScanJSON[DeletionItem](tx, spaceDeletions, nil, func(_ []byte, item DeletionItem) error {
 			if now.Before(item.DueAt) {
 				return nil
@@ -445,7 +445,7 @@ func (s *Service) BeginDeletion(ctx context.Context, deletionID uint64, now time
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		rec, err := storage.GetJSON[DeletionItem](tx, spaceDeletions, seqKey(nil, deletionID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchDeletion", "deletion entry %d does not exist", deletionID)
@@ -472,7 +472,7 @@ func (s *Service) AckDeletionEndpoint(ctx context.Context, deletionID uint64, en
 	if endpoint == "" {
 		return coerr.Invalidf("endpoint is required")
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		rec, err := storage.GetJSON[DeletionItem](tx, spaceDeletions, seqKey(nil, deletionID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchDeletion", "deletion entry %d does not exist", deletionID)
@@ -496,7 +496,7 @@ func (s *Service) AckDeletionEndpoint(ctx context.Context, deletionID uint64, en
 
 // CompleteDeletion removes a drained entry.
 func (s *Service) CompleteDeletion(ctx context.Context, deletionID uint64) error {
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		return tx.Delete(spaceDeletions, seqKey(nil, deletionID))
 	})
 }
@@ -507,7 +507,7 @@ func (s *Service) DeletionBacklog(ctx context.Context) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		var err error
 		n, err = tx.Count(spaceDeletions, nil)
 		return err

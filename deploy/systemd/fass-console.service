@@ -1,0 +1,41 @@
+[Unit]
+Description=FASS web console
+Documentation=file:/usr/local/share/doc/fass/09-deployment.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=fass
+Group=fass
+EnvironmentFile=/etc/fass/console.env
+# Configuration comes from /etc/fass/console.env. The Basic-auth password and
+# the read-only switch are environment variables; mode 0600.
+ExecStart=/usr/local/bin/fass-console
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+LimitNOFILE=65536
+UMask=0077
+
+# The console is a read-only UI; it binds loopback by default and should be
+# reached through a TLS reverse proxy (it has no TLS of its own).
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+
+[Install]
+WantedBy=multi-user.target

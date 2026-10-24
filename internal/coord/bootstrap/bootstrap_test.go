@@ -18,7 +18,7 @@ import (
 )
 
 type fixture struct {
-	db  *storage.DB
+	db  storage.Store
 	m   *meta.Service
 	a   *auth.Service
 	mem *membership.Service

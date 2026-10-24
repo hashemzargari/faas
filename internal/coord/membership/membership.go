@@ -283,12 +283,12 @@ var (
 
 // Service is the membership registry over a storage.DB.
 type Service struct {
-	db  *storage.DB
+	db  storage.Store
 	cfg Config
 }
 
 // New creates the membership service.
-func New(db *storage.DB, cfg Config) *Service {
+func New(db storage.Store, cfg Config) *Service {
 	return &Service{db: db, cfg: cfg.withDefaults()}
 }
 
@@ -314,7 +314,7 @@ func (s *Service) CreateSwarm(ctx context.Context, sw Swarm) (Swarm, error) {
 		sw.ID = id.New()
 	}
 	sw.CreatedAt = s.now()
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		if tx.Has(spaceSwarms, []byte(sw.ID)) {
 			return coerr.E(409, coerr.CodeConflict, "swarm %q already exists", sw.ID)
 		}
@@ -335,7 +335,7 @@ func (s *Service) CreateNexus(ctx context.Context, n Nexus) (Nexus, error) {
 		n.ID = contract.NexusID(id.New())
 	}
 	n.CreatedAt = s.now()
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		if !tx.Has(spaceSwarms, []byte(n.SwarmID)) {
 			return coerr.E(404, "NoSuchSwarm", "swarm %q does not exist", n.SwarmID)
 		}
@@ -359,7 +359,7 @@ func (s *Service) CreateNode(ctx context.Context, n Node) (Node, error) {
 		n.ID = contract.NodeID(id.New())
 	}
 	n.CreatedAt = s.now()
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		if !tx.Has(spaceNexuses, []byte(n.NexusID)) {
 			return coerr.E(404, "NoSuchNexus", "nexus %q does not exist", n.NexusID)
 		}
@@ -374,7 +374,7 @@ func (s *Service) CreateNode(ctx context.Context, n Node) (Node, error) {
 // SetNexusWriteDegraded flags a Nexus as DEGRADED for writes (placement excludes
 // it without failing over existing data).
 func (s *Service) SetNexusWriteDegraded(ctx context.Context, nexus contract.NexusID, degraded bool) error {
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		n, err := storage.GetJSON[Nexus](tx, spaceNexuses, []byte(nexus))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchNexus", "nexus %q does not exist", nexus)
@@ -400,7 +400,7 @@ func (s *Service) EnsureSwarm(ctx context.Context, sw Swarm) (Swarm, error) {
 		sw.ID = id.New()
 	}
 	now := s.now()
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		existing, err := storage.GetJSON[Swarm](tx, spaceSwarms, []byte(sw.ID))
 		if err == nil {
 			if existing.Name != sw.Name {
@@ -427,7 +427,7 @@ func (s *Service) EnsureNexus(ctx context.Context, n Nexus) (Nexus, error) {
 		return Nexus{}, coerr.Invalidf("swarm_id and name are required")
 	}
 	now := s.now()
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		existing, err := storage.GetJSON[Nexus](tx, spaceNexuses, []byte(n.ID))
 		if err == nil {
 			if existing.SwarmID != n.SwarmID {
@@ -457,7 +457,7 @@ func (s *Service) EnsureNode(ctx context.Context, n Node) (Node, error) {
 		return Node{}, coerr.Invalidf("nexus_id and hostname are required")
 	}
 	now := s.now()
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		existing, err := storage.GetJSON[Node](tx, spaceNodes, []byte(n.ID))
 		if err == nil {
 			if existing.NexusID != n.NexusID {
@@ -485,7 +485,7 @@ func (s *Service) EnsureRingAgents(ctx context.Context, ringID contract.RingID, 
 	var out Ring
 	now := s.now()
 	_ = now
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		ring, err := storage.GetJSON[Ring](tx, spaceRings, []byte(ringID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchRing", "ring %q does not exist", ringID)
@@ -590,7 +590,7 @@ func (s *Service) RegisterPending(ctx context.Context, reg PendingRegistration) 
 		secret  string
 	)
 	now := s.now()
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		var err error
 		agentID, secret, err = s.registerPendingTx(tx, reg, now)
 		return err
@@ -603,7 +603,7 @@ func (s *Service) RegisterPending(ctx context.Context, reg PendingRegistration) 
 
 // registerPendingTx is RegisterPending inside an existing transaction (used by
 // idempotent bootstrap reconciliation and by RegisterPending itself).
-func (s *Service) registerPendingTx(tx *storage.WriteTx, reg PendingRegistration, now time.Time) (contract.AgentID, string, error) {
+func (s *Service) registerPendingTx(tx storage.Writer, reg PendingRegistration, now time.Time) (contract.AgentID, string, error) {
 	if reg.NodeID == "" {
 		return "", "", coerr.Invalidf("node_id is required")
 	}
@@ -683,7 +683,7 @@ func (s *Service) EnsurePending(ctx context.Context, reg PendingRegistration) (a
 		return "", "", false, coerr.Invalidf("node_id is required")
 	}
 	now := s.now()
-	err = s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err = s.db.Update(ctx, func(tx storage.Writer) error {
 		var ag Agent
 		found := false
 		lookupKeys := [][]byte{}
@@ -769,7 +769,7 @@ func (s *Service) Announce(ctx context.Context, req contract.AnnounceRequest) (c
 	}
 	now := s.now()
 	var result contract.AnnounceResult
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		pubKey := base64.StdEncoding.EncodeToString(req.PublicKey)
 
 		// Resolution order:
@@ -890,7 +890,7 @@ func (s *Service) Announce(ctx context.Context, req contract.AnnounceRequest) (c
 // the ring ids it joined.
 func (s *Service) Activate(ctx context.Context, agentID contract.AgentID) ([]contract.RingID, error) {
 	var joined []contract.RingID
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		ag, err := storage.GetJSON[Agent](tx, spaceAgents, []byte(agentID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "AgentNotFound", "agent %q does not exist", agentID)
@@ -951,7 +951,7 @@ func (s *Service) Activate(ctx context.Context, agentID contract.AgentID) ([]con
 // SetDecommissioning marks an agent as draining: placement stops sending it new
 // shards, but it keeps serving until repair/rebalance moves the data.
 func (s *Service) SetDecommissioning(ctx context.Context, agentID contract.AgentID, on bool) error {
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		ag, err := storage.GetJSON[Agent](tx, spaceAgents, []byte(agentID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "AgentNotFound", "agent %q does not exist", agentID)
@@ -979,7 +979,7 @@ func (s *Service) Heartbeat(ctx context.Context, hb contract.Heartbeat) error {
 	// LastSeen is the coordinator's clock: an agent clock must never be able to
 	// keep itself "fresh" (docs/03 §5.1 detects loss on the coordinator side).
 	now := s.now()
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		ag, err := storage.GetJSON[Agent](tx, spaceAgents, []byte(hb.AgentID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "AgentNotFound", "agent %q is not registered", hb.AgentID)
@@ -1023,7 +1023,7 @@ func (s *Service) Heartbeat(ctx context.Context, hb contract.Heartbeat) error {
 func (s *Service) Sweep(ctx context.Context) (suspect, offline int, err error) {
 	now := s.now()
 	var suspects, offlines int
-	err = s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err = s.db.Update(ctx, func(tx storage.Writer) error {
 		suspects, offlines = 0, 0
 		var updates []Agent
 		err := storage.ScanJSON[Agent](tx, spaceAgents, nil, func(_ []byte, ag Agent) error {
@@ -1071,7 +1071,7 @@ func (s *Service) TransitionTo(ctx context.Context, agentID contract.AgentID, st
 	default:
 		return coerr.Invalidf("unknown agent state %q", st)
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		ag, err := storage.GetJSON[Agent](tx, spaceAgents, []byte(agentID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "AgentNotFound", "agent %q does not exist", agentID)
@@ -1104,7 +1104,7 @@ func (s *Service) CreateRC(ctx context.Context, rc RedundancyClass) (RedundancyC
 		return RedundancyClass{}, err
 	}
 	rc.CreatedAt = s.now()
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		if tx.Has(spaceRCs, []byte(rc.ID)) {
 			return coerr.E(409, coerr.CodeConflict, "redundancy class %q already exists", rc.ID)
 		}
@@ -1148,7 +1148,7 @@ func (s *Service) GetRC(ctx context.Context, rcID string) (RedundancyClass, erro
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		rc, err := storage.GetJSON[RedundancyClass](tx, spaceRCs, []byte(rcID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchRedundancyClass", "redundancy class %q does not exist", rcID)
@@ -1168,7 +1168,7 @@ func (s *Service) ListRCs(ctx context.Context) ([]RedundancyClass, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		return storage.ScanJSON[RedundancyClass](tx, spaceRCs, nil, func(_ []byte, rc RedundancyClass) error {
 			out = append(out, rc)
 			return nil
@@ -1180,7 +1180,7 @@ func (s *Service) ListRCs(ctx context.Context) ([]RedundancyClass, error) {
 // DeleteRC removes an unreferenced redundancy class. RCs are immutable, so an
 // in-use RC can never be changed out from under an object.
 func (s *Service) DeleteRC(ctx context.Context, rcID string) error {
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		if !tx.Has(spaceRCs, []byte(rcID)) {
 			return coerr.E(404, "NoSuchRedundancyClass", "redundancy class %q does not exist", rcID)
 		}
@@ -1218,7 +1218,7 @@ func (s *Service) CreateRing(ctx context.Context, ring Ring) (Ring, error) {
 		return Ring{}, coerr.Invalidf("nexus_ids is required")
 	}
 	now := s.now()
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		rc, err := storage.GetJSON[RedundancyClass](tx, spaceRCs, []byte(ring.RCID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchRedundancyClass", "redundancy class %q does not exist", ring.RCID)
@@ -1299,7 +1299,7 @@ func (s *Service) GetRing(ctx context.Context, ringID contract.RingID) (Ring, er
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		r, err := storage.GetJSON[Ring](tx, spaceRings, []byte(ringID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchRing", "ring %q does not exist", ringID)
@@ -1319,7 +1319,7 @@ func (s *Service) ListRings(ctx context.Context) ([]Ring, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		return storage.ScanJSON[Ring](tx, spaceRings, nil, func(_ []byte, r Ring) error {
 			out = append(out, r)
 			return nil
@@ -1334,7 +1334,7 @@ func (s *Service) SetRingUsage(ctx context.Context, ringID contract.RingID, used
 	if used < 0 {
 		return coerr.Invalidf("used bytes must be >= 0")
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		r, err := storage.GetJSON[Ring](tx, spaceRings, []byte(ringID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchRing", "ring %q does not exist", ringID)
@@ -1352,7 +1352,7 @@ func (s *Service) SetRingUsage(ctx context.Context, ringID contract.RingID, used
 // ring_full_pct placement gate, never correctness, so callers log rather than
 // fail a commit on error.
 func (s *Service) AddRingUsage(ctx context.Context, ringID contract.RingID, delta int64) error {
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		r, err := storage.GetJSON[Ring](tx, spaceRings, []byte(ringID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchRing", "ring %q does not exist", ringID)
@@ -1370,7 +1370,7 @@ func (s *Service) AddRingUsage(ctx context.Context, ringID contract.RingID, delt
 
 // DeleteRing removes an empty ring and unbinds it from its agents.
 func (s *Service) DeleteRing(ctx context.Context, ringID contract.RingID) error {
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		r, err := storage.GetJSON[Ring](tx, spaceRings, []byte(ringID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchRing", "ring %q does not exist", ringID)
@@ -1405,7 +1405,7 @@ func (s *Service) GetAgent(ctx context.Context, agentID contract.AgentID) (Agent
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		ag, err := storage.GetJSON[Agent](tx, spaceAgents, []byte(agentID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "AgentNotFound", "agent %q does not exist", agentID)
@@ -1426,7 +1426,7 @@ func (s *Service) Snapshot(ctx context.Context, geoFence map[string][]contract.N
 	if err := ctx.Err(); err != nil {
 		return snap, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		if err := storage.ScanJSON[Swarm](tx, spaceSwarms, nil, func(_ []byte, v Swarm) error {
 			snap.Swarms = append(snap.Swarms, v)
 			return nil
@@ -1498,7 +1498,7 @@ func nodeSlotKey(node contract.NodeID, slot string) []byte {
 // one-time secret matches. Matching by secret (constant-time) is what allows
 // several pending disks on the same node: the secret identifies the slot the
 // operator provisioned, not merely the node.
-func findNodeScopedPending(tx *storage.WriteTx, node contract.NodeID, secret string) (Agent, bool, error) {
+func findNodeScopedPending(tx storage.Writer, node contract.NodeID, secret string) (Agent, bool, error) {
 	sum := sha256.Sum256([]byte(secret))
 	prefix := []byte(string(node) + "\x00")
 	var (
@@ -1608,7 +1608,7 @@ func (s *Service) RecordShardStatus(ctx context.Context, items []contract.ShardS
 		return nil
 	}
 	now := s.now()
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		for _, it := range items {
 			switch it.State {
 			case "OK", "MISSING", "CORRUPT":

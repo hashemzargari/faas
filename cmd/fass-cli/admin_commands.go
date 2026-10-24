@@ -432,12 +432,16 @@ func runRepair(ctx context.Context, g *globalOpts, args []string, stdout, stderr
 // gc status
 // ---------------------------------------------------------------------------
 
-// repairStatusKeys is the documented shape of GET /v1/repair/status, in display
-// order. Unknown keys from a newer coordinator are appended after these.
-var repairStatusKeys = []string{
-	"pending", "running", "failed", "oldest_pending_age",
-	"bytes_repaired_last_24h", "throttled",
-}
+// The coordinator's live shape (task-9) is:
+//
+//	{"queue":{"pending":0,"running":0,"failed":0},
+//	 "oldest_pending_age_seconds":null,"bytes_repaired_last_24h":0,
+//	 "throttled":null,"per_site_budget_mbps":200,"last_error":null,
+//	 "shardsets":{"below_threshold":0,"below_repair_watermark":0,"unrecoverable":0}}
+//
+// pending and running are disjoint. Several fields are legitimately null
+// ("unknown"), which must never be rendered as 0 or "no": during an incident
+// "we don't know" and "all good" must not look the same.
 
 // parseRepairStatus decodes the coordinator response into a generic map so an
 // additive field from a newer coordinator is still shown, not dropped.
@@ -456,16 +460,48 @@ func printRepairStatus(w io.Writer, g *globalOpts, status map[string]any) error 
 	if g.jsonOut {
 		return writeJSON(w, status)
 	}
+
 	t := newTable("METRIC", "VALUE")
 	shown := map[string]bool{}
-	for _, key := range repairStatusKeys {
-		v, ok := status[key]
-		if !ok {
-			continue
-		}
-		t.add(key, formatRepairValue(key, v))
-		shown[key] = true
+
+	queue, _ := mapValue(status["queue"])
+	shown["queue"] = true
+	pending := queueField(queue, "pending")
+	running := queueField(queue, "running")
+	failed := queueField(queue, "failed")
+	t.add("queue pending", fmtCount(pending))
+	t.add("queue running", fmtCount(running))
+	t.add("queue failed", fmtCount(failed))
+	if n, ok := countSum(pending, running); ok {
+		t.add("queue backlog (pending+running)", strconv.FormatInt(n, 10))
+	} else {
+		t.add("queue backlog (pending+running)", "unknown")
 	}
+
+	top := []struct {
+		key   string
+		label string
+		fmt   func(any) string
+	}{
+		{"oldest_pending_age_seconds", "oldest_pending_age_seconds", fmtAgeSeconds},
+		{"bytes_repaired_last_24h", "bytes_repaired_last_24h", fmtBytes},
+		{"throttled", "throttled", fmtBool},
+		{"per_site_budget_mbps", "per_site_budget_mbps", fmtCount},
+		{"last_error", "last_error", fmtTextDash},
+	}
+	for _, f := range top {
+		t.add(f.label, f.fmt(status[f.key]))
+		shown[f.key] = true
+	}
+
+	shardsets, _ := mapValue(status["shardsets"])
+	shown["shardsets"] = true
+	unrecoverable := queueField(shardsets, "unrecoverable")
+	t.add("shardsets.below_threshold", fmtCount(queueField(shardsets, "below_threshold")))
+	t.add("shardsets.below_repair_watermark", fmtCount(queueField(shardsets, "below_repair_watermark")))
+	t.add("shardsets.unrecoverable", fmtCount(unrecoverable))
+
+	// Unknown top-level fields from a newer coordinator are still shown.
 	var extra []string
 	for key := range status {
 		if !shown[key] {
@@ -474,57 +510,173 @@ func printRepairStatus(w io.Writer, g *globalOpts, status map[string]any) error 
 	}
 	sortStrings(extra)
 	for _, key := range extra {
-		t.add(key, formatRepairValue(key, status[key]))
+		t.add(key, fmtRepairUnknown(status[key]))
 	}
+
 	fmt.Fprintln(w, "source: coordinator /v1/repair/status")
 	t.render(w)
+
+	// shardsets.unrecoverable is the only number that means data loss has
+	// already happened (fewer than geo_n reachable groups). Make it impossible
+	// to mistake for another counter.
+	if n, ok := countValue(unrecoverable); ok && n > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "DATA LOSS: %d shard set(s) are UNRECOVERABLE (fewer than geo_n reachable groups). Escalate immediately: those objects cannot be reconstructed by repair.\n", n)
+	}
+	if n, ok := countValue(failed); ok && n > 0 {
+		fmt.Fprintf(w, "WARNING: %d repair job(s) have failed; see last_error.\n", n)
+	}
 	return nil
 }
 
-// formatRepairValue renders the documented fields humanly: bytes as MiB/GiB,
-// age as a duration, throttled as yes/no.
-func formatRepairValue(key string, v any) string {
-	switch key {
-	case "bytes_repaired_last_24h":
-		switch n := v.(type) {
-		case float64:
-			return humanBytes(int64(n))
-		case json.Number:
-			if i, err := n.Int64(); err == nil {
-				return humanBytes(i)
-			}
+// mapValue returns a JSON object field only when it is actually present and an
+// object; null is treated as absent.
+func mapValue(v any) (map[string]any, bool) {
+	m, ok := v.(map[string]any)
+	return m, ok && m != nil
+}
+
+// queueField returns a nested field; missing keys and null both yield nil, and
+// nil is rendered as "unknown".
+func queueField(m map[string]any, key string) any {
+	if m == nil {
+		return nil
+	}
+	return m[key]
+}
+
+func fmtCount(v any) string {
+	if v == nil {
+		return "unknown"
+	}
+	switch n := v.(type) {
+	case float64:
+		if n == float64(int64(n)) {
+			return strconv.FormatInt(int64(n), 10)
 		}
-	case "oldest_pending_age":
-		switch age := v.(type) {
-		case string:
-			if d, err := time.ParseDuration(age); err == nil {
-				return d.String()
-			}
-			return age
-		case float64:
-			// Go marshals time.Duration as integer nanoseconds; small integers
-			// are treated as seconds for hand-written fixtures.
-			if age >= float64(time.Millisecond) {
-				return time.Duration(int64(age)).Round(time.Second).String()
-			}
-			return fmt.Sprintf("%.0fs", age)
-		case json.Number:
-			if i, err := age.Int64(); err == nil {
-				if i >= int64(time.Millisecond) {
-					return time.Duration(i).Round(time.Second).String()
-				}
-				return fmt.Sprintf("%ds", i)
-			}
+		return strconv.FormatFloat(n, 'f', 2, 64)
+	case int:
+		return strconv.Itoa(n)
+	case int64:
+		return strconv.FormatInt(n, 10)
+	case json.Number:
+		return n.String()
+	case string:
+		return n
+	default:
+		return fmtRepairUnknown(v)
+	}
+}
+
+// countValue extracts an integer when the field is known.
+func countValue(v any) (int64, bool) {
+	switch n := v.(type) {
+	case float64:
+		if n == float64(int64(n)) {
+			return int64(n), true
 		}
-	case "throttled":
-		if b, ok := v.(bool); ok {
-			if b {
-				return "yes"
-			}
-			return "no"
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return i, true
 		}
 	}
-	return fmt.Sprint(v)
+	return 0, false
+}
+
+// countSum adds two integer fields, reporting "unknown" when either null.
+func countSum(a, b any) (int64, bool) {
+	av, ok := countValue(a)
+	if !ok {
+		return 0, false
+	}
+	bv, ok := countValue(b)
+	if !ok {
+		return 0, false
+	}
+	return av + bv, true
+}
+
+// fmtAgeSeconds renders a *_seconds field as a duration; null is "unknown".
+// ISO-8601-style duration strings are accepted too, for forward compatibility.
+func fmtAgeSeconds(v any) string {
+	if v == nil {
+		return "unknown"
+	}
+	switch age := v.(type) {
+	case string:
+		if d, err := time.ParseDuration(age); err == nil {
+			return d.String()
+		}
+		return age
+	case float64:
+		if age < 0 {
+			return "unknown"
+		}
+		return (time.Duration(age * float64(time.Second))).Round(time.Second).String()
+	case json.Number:
+		if f, err := age.Float64(); err == nil && f >= 0 {
+			return (time.Duration(f * float64(time.Second))).Round(time.Second).String()
+		}
+	}
+	return fmtCount(v)
+}
+
+// fmtBytes renders a byte counter; null is "unknown".
+func fmtBytes(v any) string {
+	if v == nil {
+		return "unknown"
+	}
+	if n, ok := countValue(v); ok {
+		return humanBytes(n)
+	}
+	return fmtCount(v)
+}
+
+// fmtBool renders a tri-state flag: true=yes, false=no, null=unknown. A null
+// must never read as "no".
+func fmtBool(v any) string {
+	if v == nil {
+		return "unknown"
+	}
+	if b, ok := v.(bool); ok {
+		if b {
+			return "yes"
+		}
+		return "no"
+	}
+	return fmtCount(v)
+}
+
+// fmtTextDash renders free text; null means "nothing recorded" and prints "-".
+func fmtTextDash(v any) string {
+	if v == nil {
+		return "-"
+	}
+	if s, ok := v.(string); ok {
+		if strings.TrimSpace(s) == "" {
+			return "-"
+		}
+		return s
+	}
+	return fmtRepairUnknown(v)
+}
+
+// fmtRepairUnknown renders an unexpected value (a future nested object, etc.)
+// compactly instead of Go's map[...] formatting.
+func fmtRepairUnknown(v any) string {
+	if v == nil {
+		return "unknown"
+	}
+	switch v.(type) {
+	case map[string]any, []any:
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Sprint(v)
+		}
+		return string(raw)
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 func sortStrings(s []string) {

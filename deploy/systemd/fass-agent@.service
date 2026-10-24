@@ -1,0 +1,63 @@
+[Unit]
+Description=FASS storage agent for disk %i (one agent per disk)
+Documentation=file:/usr/local/share/doc/fass/09-deployment.md
+# The disk is expected at /var/lib/fass/disks/%i by convention; if your mount
+# point differs, override this and ReadWritePaths with a drop-in:
+#   /etc/systemd/system/fass-agent@disk0.service.d/override.conf
+RequiresMountsFor=/var/lib/fass/disks/%i
+After=network-online.target local-fs.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=fass
+Group=fass
+EnvironmentFile=/etc/fass/agent-%i.env
+
+# Fail before exec if the environment file is incomplete or the disk directory
+# is missing. Identity is deliberately NOT re-implemented here: the agent owns
+# its on-disk identity (state.json) and refuses to start on a mismatch, which is
+# the single source of truth. Let it fail closed.
+ExecStartPre=/bin/sh -c 'test -n "$$FASS_AGENT_DISK" && test -n "$$FASS_AGENT_PORT" && test -n "$$FASS_AGENT_NEXUS_ID" && test -n "$$FASS_AGENT_NODE_ID" && test -n "$$FASS_COORDINATOR_URL" && test -n "$$FASS_AGENT_SECRET" && test -d "$$FASS_AGENT_DISK"'
+
+# The agent reads flags only (no env configuration yet). Values are expanded by
+# systemd from the EnvironmentFile. NOTE: the one-time announce secret therefore
+# appears in the process command line; it is consumed once on first announce,
+# but restrict access to the service user/host until a --secret-file flag lands
+# (see docs/09-deployment.md §"Known product gaps").
+ExecStart=/usr/local/bin/fass-agent \
+    --disk=${FASS_AGENT_DISK} \
+    --port=${FASS_AGENT_PORT} \
+    --nexus-id=${FASS_AGENT_NEXUS_ID} \
+    --node-id=${FASS_AGENT_NODE_ID} \
+    --coordinator-url=${FASS_COORDINATOR_URL} \
+    --secret=${FASS_AGENT_SECRET} \
+    --reserve-pct=${FASS_AGENT_RESERVE_PCT}
+
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+LimitNOFILE=1048576
+UMask=0077
+
+# Hardening. The agent only needs its own disk path writable.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+ReadWritePaths=/var/lib/fass/disks/%i
+
+[Install]
+WantedBy=multi-user.target

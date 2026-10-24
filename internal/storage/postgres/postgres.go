@@ -26,7 +26,8 @@ import (
 	"fmt"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 // Config describes one PostgreSQL primary.
@@ -68,10 +69,16 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	}
 	cfg.withDefaults()
 
-	db, err := sql.Open("pgx", cfg.DSN)
+	connCfg, err := pgx.ParseConfig(cfg.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: open: %w", err)
+		return nil, fmt.Errorf("postgres: parse DSN: %w", err)
 	}
+	// statement_timeout is a per-session setting: put it in the startup packet so
+	// every pooled connection has it, instead of SET-ing one pooled connection.
+	if _, ok := connCfg.RuntimeParams["statement_timeout"]; !ok {
+		connCfg.RuntimeParams["statement_timeout"] = fmt.Sprintf("%d", cfg.StatementTime.Milliseconds())
+	}
+	db := stdlib.OpenDB(*connCfg)
 	db.SetMaxOpenConns(cfg.MaxOpenConns)
 	db.SetMaxIdleConns(cfg.MaxIdleConns)
 	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
@@ -81,12 +88,6 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	if err := db.PingContext(pingCtx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("postgres: ping: %w", err)
-	}
-	// Statement safety net: a query that cannot complete in 5s is a bug or a
-	// lock convoy, and either way it must not hold a gateway request forever.
-	if _, err := db.ExecContext(pingCtx, fmt.Sprintf("SET statement_timeout = %d", cfg.StatementTime.Milliseconds())); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("postgres: set statement_timeout: %w", err)
 	}
 	return &DB{DB: db, statementTime: cfg.StatementTime}, nil
 }

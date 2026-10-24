@@ -25,7 +25,7 @@ func mustOpen(t *testing.T, dir string) *DB {
 
 func put(t *testing.T, db *DB, key, val string) {
 	t.Helper()
-	err := db.Update(context.Background(), func(tx *WriteTx) error {
+	err := db.Update(context.Background(), func(tx Writer) error {
 		return tx.Put(spacesTest, []byte(key), []byte(val))
 	})
 	if err != nil {
@@ -36,7 +36,7 @@ func put(t *testing.T, db *DB, key, val string) {
 func get(t *testing.T, db *DB, key string) (string, error) {
 	t.Helper()
 	var out string
-	err := db.View(context.Background(), func(tx *ReadTx) error {
+	err := db.View(context.Background(), func(tx Reader) error {
 		raw, err := tx.Get(spacesTest, []byte(key))
 		if err != nil {
 			return err
@@ -125,7 +125,7 @@ func TestCompactionPreservesState(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		put(t, db, fmt.Sprintf("key-%02d", i), fmt.Sprintf("value-%d", i))
 	}
-	if err := db.Update(context.Background(), func(tx *WriteTx) error {
+	if err := db.Update(context.Background(), func(tx Writer) error {
 		return tx.Delete(spacesTest, []byte("key-00"))
 	}); err != nil {
 		t.Fatalf("delete: %v", err)
@@ -160,7 +160,7 @@ func TestCompactionPreservesState(t *testing.T) {
 func TestMigrateRefusesNewerSchema(t *testing.T) {
 	db := mustOpen(t, t.TempDir())
 	defer db.Close()
-	if err := db.Update(context.Background(), func(tx *WriteTx) error {
+	if err := db.Update(context.Background(), func(tx Writer) error {
 		return tx.Put(metaTest, schemaVersionKey, []byte("99"))
 	}); err != nil {
 		t.Fatalf("seed version: %v", err)
@@ -192,7 +192,7 @@ func TestScanOrderingAndDelete(t *testing.T) {
 		put(t, db, k, "v-"+k)
 	}
 	var order []string
-	err := db.View(context.Background(), func(tx *ReadTx) error {
+	err := db.View(context.Background(), func(tx Reader) error {
 		return tx.Scan(spacesTest, nil, func(k, _ []byte) error {
 			order = append(order, string(k))
 			return nil
@@ -213,7 +213,7 @@ func TestScanOrderingAndDelete(t *testing.T) {
 
 	// Prefix scans and early stop.
 	var prefixed int
-	if err := db.View(context.Background(), func(tx *ReadTx) error {
+	if err := db.View(context.Background(), func(tx Reader) error {
 		return tx.Scan(spacesTest, []byte("a"), func(_, _ []byte) error {
 			prefixed++
 			return nil
@@ -221,14 +221,14 @@ func TestScanOrderingAndDelete(t *testing.T) {
 	}); err != nil || prefixed != 2 {
 		t.Fatalf("prefix scan = %d, %v", prefixed, err)
 	}
-	if err := db.View(context.Background(), func(tx *ReadTx) error {
+	if err := db.View(context.Background(), func(tx Reader) error {
 		return tx.Scan(spacesTest, nil, func(_, _ []byte) error { return StopScan() })
 	}); err != nil {
 		t.Fatalf("stop scan: %v", err)
 	}
 
 	// Read-your-writes inside a transaction and rollback on error.
-	err = db.Update(context.Background(), func(tx *WriteTx) error {
+	err = db.Update(context.Background(), func(tx Writer) error {
 		if err := tx.Put(spacesTest, []byte("inside"), []byte("1")); err != nil {
 			return err
 		}
@@ -265,7 +265,7 @@ func TestConcurrentReadersWithWriter(t *testing.T) {
 					return
 				default:
 				}
-				_ = db.View(ctx, func(tx *ReadTx) error {
+				_ = db.View(ctx, func(tx Reader) error {
 					return tx.Scan(spacesTest, nil, func(_, _ []byte) error { return nil })
 				})
 			}

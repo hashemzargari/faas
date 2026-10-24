@@ -123,7 +123,7 @@ func (db *DB) Close() error {
 // The callback must use the provided transaction for all reads; calling back into
 // View or Update from inside it can deadlock against a waiting writer and is not
 // supported.
-func (db *DB) View(ctx context.Context, fn func(*ReadTx) error) error {
+func (db *DB) View(ctx context.Context, fn func(Reader) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -141,7 +141,7 @@ func (db *DB) View(ctx context.Context, fn func(*ReadTx) error) error {
 //
 // The callback must use the provided transaction for all reads and writes; it
 // must not call View or Update (see View).
-func (db *DB) Update(ctx context.Context, fn func(*WriteTx) error) error {
+func (db *DB) Update(ctx context.Context, fn func(Writer) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -346,13 +346,6 @@ func (tx *WriteTx) Delete(space, key []byte) error {
 // PostgreSQL representations isomorphic.
 // ---------------------------------------------------------------------------
 
-// Reader is the read surface shared by View and Update transactions, so typed
-// helpers work in both.
-type Reader interface {
-	Get(space, key []byte) ([]byte, error)
-	Scan(space, prefix []byte, fn func(key, value []byte) error) error
-}
-
 // GetJSON decodes the JSON record at (space, key) into T.
 func GetJSON[T any](tx Reader, space, key []byte) (T, error) {
 	var out T
@@ -367,7 +360,7 @@ func GetJSON[T any](tx Reader, space, key []byte) (T, error) {
 }
 
 // PutJSON encodes v as JSON at (space, key).
-func PutJSON[T any](tx *WriteTx, space, key []byte, v T) error {
+func PutJSON[T any](tx Writer, space, key []byte, v T) error {
 	raw, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("storage: encode %s/%q: %w", space, key, err)
@@ -392,6 +385,10 @@ func ScanJSON[T any](tx Reader, space, prefix []byte, fn func(key []byte, v T) e
 // ---------------------------------------------------------------------------
 
 var errStop = errors.New("storage: stop scan")
+
+// ErrStopScan is the sentinel returned by StopScan. Backends recognise it via
+// errors.Is so a callback can end a scan early without an error.
+var ErrStopScan = errStop
 
 // StopScan stops a Scan early without reporting an error. Usage:
 //

@@ -52,14 +52,28 @@ serviceAccount:
 
 coordinator:
   enabled: true
-  # -- MUST stay 1: the storage backend is an embedded single-writer store.
+  # -- 1 with the embedded store (single writer). With dbDriver=postgres you may
+  # scale this for control-plane HA; the chart then rolls the pods one at a time.
   replicas: 1
+  # -- Persistence backend: "embedded" (dev/small, single writer) or
+  # "postgres" (production; the coordinator supports --db-driver=postgres and an
+  # explicit `fass-coordinator migrate` subcommand).
+  dbDriver: embedded
+  db:
+    # -- REQUIRED when dbDriver=postgres: Secret containing the DSN
+    # (postgres://user:pass@host:5432/fass?sslmode=require).
+    existingSecret: ""
+    dsnKey: dsn
+  # -- Apply PostgreSQL migrations on start. Production should leave this false:
+  # a helm pre-install/pre-upgrade Job runs `fass-coordinator migrate` instead.
+  dbMigrateOnStart: false
   listenPort: 7000
   dataDir: /var/lib/fass
   logLevel: info
   logFormat: json
   maintenance: false
   gc: true
+  # -- Only used with dbDriver=embedded. PostgreSQL stores metadata externally.
   persistence:
     enabled: true
     # -- Use an existing PVC instead of creating one.
@@ -68,12 +82,6 @@ coordinator:
     accessModes:
       - ReadWriteOnce
     size: 20Gi
-  # -- NOT IMPLEMENTED BY THIS FASS RELEASE. The coordinator has no PostgreSQL
-  # backend or DSN flag yet; enabling this fails the render with an explanation.
-  postgres:
-    enabled: false
-    existingSecret: ""
-    dsnKey: dsn
   resources:
     requests:
       cpu: 250m
@@ -104,13 +112,15 @@ gateway:
   devMode: false
   keySeed:
     # -- REQUIRED unless devMode. Secret key holding the hex tenant key seed.
-    existingSecret: ""
+    # The default is an obvious placeholder so `helm lint` can render; replace
+    # it (or use one of the values-*.yaml files) before installing.
+    existingSecret: "CHANGEME-fass-gateway-key-seed"
     secretKey: key-seed
   tls:
     # -- Gateway terminates TLS itself when enabled; the Secret must contain a
     # tls.crt/tls.key pair (or set certKey/keyKey).
     enabled: true
-    existingSecret: ""
+    existingSecret: "CHANGEME-fass-gateway-tls"
     certKey: tls.crt
     keyKey: tls.key
   # -- Optional Smart Data Placement policy (JSON) in an existing ConfigMap.
@@ -145,8 +155,8 @@ console:
   readOnly: true
   auth:
     # -- REQUIRED. Secret with the HTTP Basic credentials (keys: console-user,
-    # console-password).
-    existingSecret: ""
+    # console-password). Obvious placeholder by default so `helm lint` renders.
+    existingSecret: "CHANGEME-fass-console-auth"
     userKey: console-user
     passwordKey: console-password
   resources:
@@ -165,7 +175,10 @@ console:
   affinity: {}
 
 agents:
-  enabled: true
+  # -- Agents are site-specific (node names, disk mounts, per-node announce
+  # secrets), so the default values deploy none. Enable in a per-site values
+  # file and fill agents.nodes; see values-three-site.yaml.
+  enabled: false
   # -- Coordinator URL the agents announce to. Empty = the in-chart coordinator
   # Service (single-cluster install). For a per-site release point this at the
   # site-A coordinator, e.g. https://coordinator.fass.internal:7000.

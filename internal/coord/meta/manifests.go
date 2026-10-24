@@ -104,7 +104,7 @@ func decodeManifestBlob(blob []byte) (contract.Manifest, error) {
 
 // putManifestBlob stores a manifest blob unless the identical content is
 // already present (content addressing makes that a no-op).
-func putManifestBlob(tx *storage.WriteTx, hash string, blob []byte) error {
+func putManifestBlob(tx storage.Writer, hash string, blob []byte) error {
 	if len(blob) > MaxManifestBlob {
 		return coerr.Invalidf("manifest blob is %d bytes, exceeding the %d-byte page limit", len(blob), MaxManifestBlob)
 	}
@@ -202,7 +202,7 @@ func (s *Service) ChunkTable(ctx context.Context, manifestHash string) ([]contra
 		return nil, err
 	}
 	var chunks []contract.ChunkRef
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		blob, err := tx.Get(spaceManifests, []byte(manifestHash))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchManifest", "manifest blob %s does not exist", manifestHash)

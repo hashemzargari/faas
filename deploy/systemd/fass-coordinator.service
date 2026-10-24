@@ -1,0 +1,41 @@
+[Unit]
+Description=FASS coordinator (control plane)
+Documentation=file:/usr/local/share/doc/fass/09-deployment.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=fass
+Group=fass
+EnvironmentFile=/etc/fass/coordinator.env
+# Configuration comes from /etc/fass/coordinator.env (FASS_COORDINATOR_*).
+ExecStart=/usr/local/bin/fass-coordinator
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+LimitNOFILE=1048576
+UMask=0077
+
+# Hardening. The embedded store lives in /var/lib/fass; everything else is
+# read-only to the service.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+ReadWritePaths=/var/lib/fass
+
+[Install]
+WantedBy=multi-user.target

@@ -72,7 +72,7 @@ func (s *Service) CreateUpload(ctx context.Context, bucket, key string, meta con
 		return "", err
 	}
 	uploadID := contract.UploadID(id.New())
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		cfg, err := s.bucketConfigTx(tx, bucket)
 		if err != nil {
 			return err
@@ -129,7 +129,7 @@ func (s *Service) CommitPart(ctx context.Context, up contract.UploadID, partNumb
 	if err := validatePartChunks(chunks); err != nil {
 		return err
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		if !tx.Has(spaceUploads, []byte(up)) {
 			return coerr.ErrNoSuchUpload
 		}
@@ -151,7 +151,7 @@ func (s *Service) ListParts(ctx context.Context, up contract.UploadID) ([]contra
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		if !tx.Has(spaceUploads, []byte(up)) {
 			return coerr.ErrNoSuchUpload
 		}
@@ -175,7 +175,7 @@ func (s *Service) ListUploads(ctx context.Context, bucketID contract.BucketID) (
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		return storage.ScanJSON[uploadRecord](tx, spaceUploadIndex, bucketPrefix(bucketID), func(_ []byte, rec uploadRecord) error {
 			out = append(out, contract.UploadInfo{
 				UploadID:  rec.UploadID,
@@ -206,7 +206,7 @@ func (s *Service) CompleteUpload(ctx context.Context, up contract.UploadID) (con
 	}
 	var upload uploadRecord
 	var parts []partRecord
-	if err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	if err := s.db.View(ctx, func(tx storage.Reader) error {
 		rec, err := storage.GetJSON[uploadRecord](tx, spaceUploads, []byte(up))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrNoSuchUpload
@@ -288,7 +288,7 @@ func (s *Service) CompleteUpload(ctx context.Context, up contract.UploadID) (con
 
 // AbortUpload removes the session and its parts.
 func (s *Service) AbortUpload(ctx context.Context, up contract.UploadID) error {
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		rec, err := storage.GetJSON[uploadRecord](tx, spaceUploads, []byte(up))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrNoSuchUpload

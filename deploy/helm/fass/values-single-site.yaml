@@ -1,0 +1,152 @@
+# Placeholder Secret names and image coordinates — replace every `example`/
+# `changeme`-style value before installing. Helm never creates these Secrets.
+
+# Single-site values: flat RC geo 1+0 / local 16+4, one Nexus.
+# Teaches the same code path without geo redundancy; survives node/disk loss,
+# NOT site loss. Use values-three-site.yaml for a real install.
+
+image:
+  repository: registry.example.com/fass
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+redundancy:
+  geoN: 1
+  geoK: 0
+  localN: 16
+  localK: 4
+  aag: 2
+
+coordinator:
+  # Single-site can run on the embedded store (replicas must stay 1). For HA
+  # control plane switch to dbDriver: postgres + a DSN Secret and scale replicas.
+  dbDriver: embedded
+  persistence:
+    size: 20Gi
+
+gateway:
+  replicas: 2
+  tls:
+    enabled: true
+    existingSecret: fass-gateway-tls
+  keySeed:
+    existingSecret: fass-gateway-key-seed
+
+console:
+  auth:
+    existingSecret: fass-console-auth
+
+agents:
+  enabled: true
+  # One pinned Deployment per node; one container per disk.
+  nodes:
+    - name: node-s1
+      nexus: nexus-a
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-s1-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-s1-disk1
+    - name: node-s2
+      nexus: nexus-a
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-s2-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-s2-disk1
+    - name: node-s3
+      nexus: nexus-a
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-s3-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-s3-disk1
+    - name: node-s4
+      nexus: nexus-a
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-s4-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-s4-disk1
+    - name: node-s5
+      nexus: nexus-a
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-s5-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-s5-disk1
+    - name: node-s6
+      nexus: nexus-a
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-s6-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-s6-disk1
+    - name: node-s7
+      nexus: nexus-a
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-s7-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-s7-disk1
+    - name: node-s8
+      nexus: nexus-a
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-s8-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-s8-disk1
+    - name: node-s9
+      nexus: nexus-a
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-s9-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-s9-disk1
+    - name: node-s10
+      nexus: nexus-a
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-s10-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-s10-disk1

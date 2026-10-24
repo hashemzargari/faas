@@ -1,0 +1,118 @@
+# Placeholder Secret names and image coordinates — replace every `example`/
+# `changeme`-style value before installing. Helm never creates these Secrets.
+
+# Dev / evaluation values: one small cluster (e.g. kind or minikube).
+#   helm install fass ./deploy/helm/fass -f deploy/helm/fass/values-dev.yaml
+#
+# This is NOT production: the gateway mints an ephemeral key seed (data is
+# unreadable after restart), TLS is disabled, the coordinator store is
+# ephemeral and the console allows write actions.
+
+image:
+  repository: fass
+  tag: dev
+  pullPolicy: IfNotPresent
+
+redundancy:
+  geoN: 2
+  geoK: 1
+  localN: 3
+  localK: 1
+  aag: 2
+
+coordinator:
+  persistence:
+    enabled: false
+  logLevel: debug
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 1Gi}
+
+gateway:
+  replicas: 1
+  devMode: true
+  defaultRedundancyClass: dev-rc
+  chunkSize: 6291456
+  tls:
+    enabled: false
+  offloaderWorkers: 4
+  shardParallel: 8
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {memory: 2Gi}
+
+console:
+  readOnly: false
+  auth:
+    existingSecret: fass-console-auth
+
+agents:
+  enabled: true
+  # One pinned Deployment per node; one container per disk.
+  nodes:
+    - name: node-a1
+      nexus: nexus-a
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-a1-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-a1-disk1
+    - name: node-a2
+      nexus: nexus-a
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-a2-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-a2-disk1
+    - name: node-b1
+      nexus: nexus-b
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-b1-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-b1-disk1
+    - name: node-b2
+      nexus: nexus-b
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-b2-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-b2-disk1
+    - name: node-c1
+      nexus: nexus-c
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-c1-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-c1-disk1
+    - name: node-c2
+      nexus: nexus-c
+      disks:
+        - name: disk0
+          hostPath: /var/lib/fass/disks/disk0
+          port: 7100
+          existingSecret: fass-agent-node-c2-disk0
+        - name: disk1
+          hostPath: /var/lib/fass/disks/disk1
+          port: 7101
+          existingSecret: fass-agent-node-c2-disk1

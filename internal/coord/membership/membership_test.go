@@ -21,7 +21,7 @@ import (
 type fixture struct {
 	svc *membership.Service
 	now time.Time
-	db  *storage.DB
+	db  storage.Store
 	sw  membership.Swarm
 }
 

@@ -31,7 +31,95 @@ import (
 	"github.com/fass-storage/fass/internal/coord/membership"
 	"github.com/fass-storage/fass/internal/coord/placement"
 	"github.com/fass-storage/fass/internal/coord/recovery"
+	"github.com/fass-storage/fass/internal/storage"
+	"github.com/fass-storage/fass/internal/storage/postgres"
 )
+
+// openStore opens the configured persistence backend. Embedded remains the dev
+// default; PostgreSQL requires an explicit DSN and never migrates implicitly
+// unless --db-migrate-on-start=true is set (production should run the migrate
+// subcommand instead: a process restart must not mutate a schema).
+func openStore(ctx context.Context, cfg config) (storage.Store, error) {
+	switch cfg.dbDriver {
+	case "", "embedded":
+		db, err := storage.Open(cfg.dataDir)
+		if err != nil {
+			return nil, err
+		}
+		if err := storage.Migrate(ctx, db); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		return db, nil
+	case "postgres":
+		if cfg.dbDSN == "" {
+			return nil, fmt.Errorf("--db-driver=postgres requires --db-dsn (or FASS_COORDINATOR_DB_DSN)")
+		}
+		pgCfg := postgres.Config{
+			DSN:             cfg.dbDSN,
+			MaxOpenConns:    cfg.dbMaxOpenConns,
+			MaxIdleConns:    cfg.dbMaxIdleConns,
+			ConnMaxLifetime: cfg.dbConnMaxLife,
+			StatementTime:   cfg.dbStmtTimeout,
+		}
+		if cfg.dbMigrateOnBoot {
+			db, err := postgres.Open(ctx, pgCfg)
+			if err != nil {
+				return nil, err
+			}
+			if err := db.Migrate(ctx); err != nil {
+				_ = db.Close()
+				return nil, fmt.Errorf("postgres: apply migrations: %w", err)
+			}
+			_ = db.Close()
+		}
+		kv, err := postgres.OpenKV(ctx, pgCfg)
+		if err != nil {
+			return nil, err
+		}
+		return kv, nil
+	default:
+		return nil, fmt.Errorf("unknown --db-driver %q (want embedded or postgres)", cfg.dbDriver)
+	}
+}
+
+// runMigrate applies PostgreSQL migrations explicitly: `fass-coordinator migrate
+// --db-dsn ...`. It is the production path; the server itself defaults to not
+// migrating.
+func runMigrate(args []string) error {
+	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
+	dsn := fs.String("db-dsn", envString("FASS_COORDINATOR_DB_DSN", ""), "PostgreSQL DSN")
+	stmtTimeout := fs.Duration("db-statement-timeout", envDuration("FASS_COORDINATOR_DB_STATEMENT_TIMEOUT", 30*time.Second), "statement_timeout for the migration session")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dsn == "" {
+		return fmt.Errorf("migrate: --db-dsn (or FASS_COORDINATOR_DB_DSN) is required")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	db, err := postgres.Open(ctx, postgres.Config{DSN: *dsn, StatementTime: *stmtTimeout})
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	v, err := db.SchemaVersionOf(ctx)
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	fmt.Printf("fass-coordinator: schema migrated to version %d\n", v)
+	return nil
+}
+
+func envString(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
 // version is stamped by the build ("-X main.version=...").
 var version = "dev"
@@ -71,9 +159,20 @@ type config struct {
 	// never scans on request.
 	repairBudgetMBps      int
 	repairRefreshInterval time.Duration
+	// Persistence backend: embedded (default, dev) or postgres (production).
+	dbDriver        string
+	dbDSN           string
+	dbMigrateOnBoot bool
+	dbMaxOpenConns  int
+	dbMaxIdleConns  int
+	dbConnMaxLife   time.Duration
+	dbStmtTimeout   time.Duration
 }
 
 func run(args []string) error {
+	if len(args) > 0 && args[0] == "migrate" {
+		return runMigrate(args[1:])
+	}
 	cfg, err := parseConfig(args)
 	if err != nil {
 		return err
@@ -93,7 +192,11 @@ func run(args []string) error {
 		now = func() time.Time { return time.Now().Add(offset) }
 		logger.Warn("DEV CLOCK OFFSET ACTIVE: coordinator clock is shifted (dev-bootstrap only)", "offset", offset.String())
 	}
-	svc, err := coord.Open(ctx, cfg.dataDir, coord.Config{
+	store, err := openStore(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("open coordinator store: %w", err)
+	}
+	svc := coord.NewWithStore(store, true, coord.Config{
 		Now:         now,
 		Maintenance: cfg.maintenance,
 		Membership: membership.Config{
@@ -104,9 +207,6 @@ func run(args []string) error {
 		Placement: placement.DefaultConfig(),
 		Logger:    logger,
 	})
-	if err != nil {
-		return fmt.Errorf("open coordinator: %w", err)
-	}
 	defer svc.Close()
 
 	go svc.RunMaintenance(ctx)
@@ -234,6 +334,13 @@ func parseConfig(args []string) (config, error) {
 	fs.BoolVar(&cfg.lifecycleEnabled, "lifecycle", envBoolDefault("FASS_COORDINATOR_LIFECYCLE", true), "run the S3 lifecycle expiry sweep")
 	fs.DurationVar(&cfg.lifecycleInterval, "lifecycle-interval", envDuration("FASS_COORDINATOR_LIFECYCLE_INTERVAL", lifecycle.DefaultInterval), "lifecycle sweep interval")
 	fs.DurationVar(&cfg.devClockOffset, "dev-clock-offset", envDuration("FASS_COORDINATOR_DEV_CLOCK_OFFSET", 0), "DEV ONLY (requires --dev-bootstrap): shift the coordinator clock by this duration; used by the compat suite to test lifecycle without waiting days")
+	fs.StringVar(&cfg.dbDriver, "db-driver", envString("FASS_COORDINATOR_DB_DRIVER", "embedded"), "persistence backend: embedded (dev WAL store) or postgres")
+	fs.StringVar(&cfg.dbDSN, "db-dsn", envString("FASS_COORDINATOR_DB_DSN", ""), "PostgreSQL DSN (required for --db-driver=postgres); a bad DSN fails at startup, never at the first request")
+	fs.BoolVar(&cfg.dbMigrateOnBoot, "db-migrate-on-start", envBoolDefault("FASS_COORDINATOR_DB_MIGRATE_ON_START", false), "apply PostgreSQL migrations at startup (default false: production must run the migrate subcommand explicitly)")
+	fs.IntVar(&cfg.dbMaxOpenConns, "db-max-open-conns", envInt("FASS_COORDINATOR_DB_MAX_OPEN_CONNS", 40), "PostgreSQL connection pool: maximum open connections")
+	fs.IntVar(&cfg.dbMaxIdleConns, "db-max-idle-conns", envInt("FASS_COORDINATOR_DB_MAX_IDLE_CONNS", 10), "PostgreSQL connection pool: maximum idle connections")
+	fs.DurationVar(&cfg.dbConnMaxLife, "db-conn-max-lifetime", envDuration("FASS_COORDINATOR_DB_CONN_MAX_LIFETIME", 30*time.Minute), "PostgreSQL connection maximum lifetime")
+	fs.DurationVar(&cfg.dbStmtTimeout, "db-statement-timeout", envDuration("FASS_COORDINATOR_DB_STATEMENT_TIMEOUT", 5*time.Second), "PostgreSQL statement_timeout for every pooled connection")
 	fs.IntVar(&cfg.repairBudgetMBps, "repair-per-site-budget-mbps", envInt("FASS_COORDINATOR_REPAIR_BUDGET_MBPS", 200), "inter-site repair bandwidth budget reported by /v1/repair/status (0 = not configured, reported as null)")
 	fs.DurationVar(&cfg.repairRefreshInterval, "repair-refresh-interval", envDuration("FASS_COORDINATOR_REPAIR_REFRESH_INTERVAL", time.Minute), "how often the background refresher rebuilds the shard-set redundancy inventory")
 	if err := fs.Parse(args); err != nil {

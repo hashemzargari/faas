@@ -1,0 +1,53 @@
+{{- $fullname := include "fass.fullname" . }}
+FASS {{ .Chart.AppVersion }} installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Components rendered:
+{{- if .Values.coordinator.enabled }}
+  * coordinator: {{ $fullname }}-coordinator:{{ .Values.coordinator.listenPort }} (replicas: {{ .Values.coordinator.replicas }}, store: {{ if eq .Values.coordinator.dbDriver "postgres" }}postgresql (migrate hook){{ else if .Values.coordinator.persistence.enabled }}PVC{{ else }}emptyDir (EPHEMERAL){{ end }})
+{{- end }}
+{{- if .Values.gateway.enabled }}
+  * gateway: {{ $fullname }}-gateway:{{ .Values.gateway.listenPort }} (replicas: {{ .Values.gateway.replicas }}, TLS: {{ .Values.gateway.tls.enabled }})
+{{- end }}
+{{- if .Values.console.enabled }}
+  * console: {{ $fullname }}-console:{{ .Values.console.listenPort }} (read-only: {{ .Values.console.readOnly }})
+{{- end }}
+{{- if .Values.agents.enabled }}
+  * agents: {{ len .Values.agents.nodes }} pinned node deployment(s), one container per disk
+{{- else }}
+  * agents: DISABLED (values.yaml defaults deploy none; use a per-site values file)
+{{- end }}
+
+Before this is usable:
+
+ 1. Replace every placeholder Secret name (CHANGEME-*). The chart never creates
+    Secrets. Required:
+      - gateway key seed      (gateway.keySeed.existingSecret; losing it makes existing data unreadable)
+      - gateway TLS cert/key  (gateway.tls.existingSecret, unless tls.enabled=false behind an LB)
+      - console basic auth    (console.auth.existingSecret: console-user / console-password)
+      - one announce Secret per disk (agents.nodes[].disks[].existingSecret)
+      - PostgreSQL DSN           (coordinator.db.existingSecret, when dbDriver=postgres)
+{{- if .Values.agents.enabled }}
+
+ 2. Register each disk with the coordinator and store its one-time secret. The
+    node id MUST equal the Kubernetes node name (the chart passes it as
+    --node-id):
+      curl -sS -X POST http://<coordinator>:{{ .Values.coordinator.listenPort }}/v1/agents/pending \
+        -H 'Content-Type: application/json' \
+        -d '{"node_id":"<node-name>","disk_id":"disk0"}'
+    then create the Secret from the returned "secret".
+
+ 3. Prepare the host disk directories on every agent node (owned by uid 65532):
+      install -d -o 65532 -g 65532 -m 0750 /var/lib/fass/disks/disk0 ...
+{{- end }}
+
+ 4. Create the Redundancy Class + Ring + buckets through the coordinator API
+    (the chart does not create cluster metadata). See docs/09-deployment.md.
+
+Verify:
+  kubectl -n {{ .Release.Namespace }} get pods
+  fass --endpoint http://<gateway-host>:{{ .Values.gateway.listenPort }} health
+  fass cluster status
+  curl -fsS http://<coordinator>:{{ .Values.coordinator.listenPort }}/v1/repair/status
+
+Upgrade order is coordinator -> gateways -> agents. Read
+docs/09-deployment.md before upgrading or changing the RC.

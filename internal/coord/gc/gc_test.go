@@ -80,7 +80,7 @@ func (f *fakeDeleter) totalCalls() int {
 }
 
 type fixture struct {
-	db     *storage.DB
+	db     storage.Store
 	m      *meta.Service
 	bucket contract.BucketConfig
 	now    time.Time
@@ -329,7 +329,7 @@ func TestGCMissingManifestLeavesEntryQueued(t *testing.T) {
 		t.Fatalf("manifest hash missing from deletion entry")
 	}
 	// Simulate metadata damage: the chunk table is gone.
-	if err := f.m.DB().Update(ctx, func(tx *storage.WriteTx) error {
+	if err := f.m.DB().Update(ctx, func(tx storage.Writer) error {
 		return tx.Delete([]byte("manifest_blobs"), []byte(items[0].ManifestHash))
 	}); err != nil {
 		t.Fatalf("drop manifest: %v", err)

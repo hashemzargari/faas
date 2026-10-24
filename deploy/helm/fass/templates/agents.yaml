@@ -1,0 +1,148 @@
+{{- if .Values.agents.enabled }}
+{{- $root := . }}
+{{- $a := .Values.agents }}
+{{- $coordURL := include "fass.effectiveCoordinatorURL" (dict "root" . "url" $a.coordinatorURL) }}
+{{- $labels := include "fass.labels" . }}
+{{- range $node := $a.nodes }}
+{{- $deployName := printf "%s-agent-%s" (include "fass.fullname" $root) $node.name | trunc 63 | trimSuffix "-" }}
+{{- $selectors := dict "root" $root "component" "agent" }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $deployName }}
+  labels:
+    {{- $labels | nindent 4 }}
+    app.kubernetes.io/component: agent
+    fass.io/nexus: {{ $node.nexus | quote }}
+    fass.io/node: {{ $node.name | quote }}
+spec:
+  # One pod per node, pinned by nodeSelector; Recreate so two agent processes
+  # never race for the same disk during a rollout.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "fass.selectorLabels" $selectors | nindent 6 }}
+      fass.io/node: {{ $node.name | quote }}
+  template:
+    metadata:
+      labels:
+        {{- include "fass.selectorLabels" $selectors | nindent 8 }}
+        fass.io/nexus: {{ $node.nexus | quote }}
+        fass.io/node: {{ $node.name | quote }}
+        {{- with $a.podLabels }}{{ toYaml . | nindent 8 }}{{ end }}
+      {{- with $a.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ default (include "fass.fullname" $root) $root.Values.serviceAccount.name }}
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $a.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        {{- toYaml $root.Values.podSecurityContext | nindent 8 }}
+      nodeSelector:
+        # Derived from agents.nodes[].name so a pod only runs on the node whose
+        # name is announced as --node-id. Extra labels from values are ANDed.
+        kubernetes.io/hostname: {{ $node.name | quote }}
+        {{- with $node.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      tolerations:
+        {{- $tolerations := concat ($a.tolerations | default list) ($node.tolerations | default list) }}
+        {{- if $tolerations }}
+        {{- toYaml $tolerations | nindent 8 }}
+        {{- else }} []
+        {{- end }}
+      containers:
+        {{- range $i, $disk := $node.disks }}
+        {{- $port := include "fass.agentPort" (dict "root" $root "disk" $disk "index" $i) }}
+        - name: agent-{{ $i }}
+          image: {{ include "fass.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          command: ["/usr/local/bin/fass-agent"]
+          args:
+            - --disk=/data/{{ $disk.name }}
+            - --port={{ $port }}
+            - --nexus-id={{ $node.nexus }}
+            - --node-id={{ $node.name }}
+            - --hostname=$(FASS_AGENT_HOST_IP)
+            - --coordinator-url={{ $coordURL }}
+            - --secret=$(FASS_AGENT_SECRET)
+            - --reserve-pct={{ $a.reservePercent }}
+            - --repair={{ $a.repair }}
+            - --scrub={{ $a.scrub }}
+            - --heartbeat-interval={{ $a.heartbeatInterval }}
+            {{- if $disk.diskId }}
+            - --disk-id={{ $disk.diskId }}
+            {{- end }}
+            {{- range $a.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            # The agent reads flags only (no env configuration yet); Kubernetes
+            # expands $(FASS_AGENT_SECRET) into argv from this secretKeyRef, so
+            # the one-time announce secret is never in values.yaml or the Helm
+            # release. A --secret-file flag is a pending product gap.
+            - name: FASS_AGENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $disk.existingSecret }}
+                  key: {{ $disk.secretKey | default "secret" }}
+            - name: FASS_AGENT_HOST_IP
+              valueFrom:
+                fieldRef:
+                  {{- if $a.hostNetwork }}
+                  fieldPath: status.hostIP
+                  {{- else }}
+                  fieldPath: status.podIP
+                  {{- end }}
+          ports:
+            - name: agent-{{ $i }}
+              containerPort: {{ $port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /v1/healthz
+              port: agent-{{ $i }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /v1/healthz
+              port: agent-{{ $i }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml $a.resources | nindent 12 }}
+          volumeMounts:
+            - name: disk-{{ $i }}
+              mountPath: /data/{{ $disk.name }}
+        {{- end }}
+      volumes:
+        {{- range $i, $disk := $node.disks }}
+        - name: disk-{{ $i }}
+          hostPath:
+            path: {{ $disk.hostPath | quote }}
+            type: Directory
+        {{- end }}
+{{- end }}
+{{- end }}

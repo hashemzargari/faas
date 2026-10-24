@@ -108,14 +108,14 @@ type Statement struct {
 
 // Service is the auth service.
 type Service struct {
-	db   *storage.DB
+	db   storage.Store
 	meta *meta.Service
 	now  func() time.Time
 }
 
 // New creates the auth service. meta is used for bucket ownership and ACL
 // fallback.
-func New(db *storage.DB, m *meta.Service) *Service {
+func New(db storage.Store, m *meta.Service) *Service {
 	return &Service{db: db, meta: m, now: time.Now}
 }
 
@@ -190,7 +190,7 @@ func (s *Service) CreateAccessKey(ctx context.Context, spec AccessKeySpec) (Acce
 		CreatedAt:   s.now().UTC(),
 		ExpiresAt:   spec.ExpiresAt,
 	}
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		if tx.Has(spaceAccessKeys, []byte(keyID)) {
 			return coerr.E(409, coerr.CodeConflict, "access key %q already exists", keyID)
 		}
@@ -209,7 +209,7 @@ func (s *Service) GetAccessKey(ctx context.Context, keyID string) (AccessKey, er
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		rec, err := storage.GetJSON[AccessKey](tx, spaceAccessKeys, []byte(keyID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrAccessDenied
@@ -229,7 +229,7 @@ func (s *Service) ListAccessKeys(ctx context.Context, tenant contract.TenantID, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		return storage.ScanJSON[AccessKey](tx, spaceAccessKeys, nil, func(_ []byte, k AccessKey) error {
 			if tenant != "" && k.TenantID != tenant {
 				return nil
@@ -249,7 +249,7 @@ func (s *Service) SetAccessKeyStatus(ctx context.Context, keyID, status string) 
 	if status != StatusActive && status != StatusInactive {
 		return coerr.Invalidf("status must be Active or Inactive")
 	}
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		rec, err := storage.GetJSON[AccessKey](tx, spaceAccessKeys, []byte(keyID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.ErrAccessDenied
@@ -264,7 +264,7 @@ func (s *Service) SetAccessKeyStatus(ctx context.Context, keyID, status string) 
 
 // DeleteAccessKey removes a key.
 func (s *Service) DeleteAccessKey(ctx context.Context, keyID string) error {
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		if !tx.Has(spaceAccessKeys, []byte(keyID)) {
 			return coerr.ErrAccessDenied
 		}
@@ -400,7 +400,7 @@ func (s *Service) policiesFor(ctx context.Context, key AccessKey) ([]Policy, err
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		return storage.ScanJSON[Policy](tx, spacePolicies, nil, func(_ []byte, p Policy) error {
 			switch p.Scope {
 			case ScopeAccessKey:
@@ -522,7 +522,7 @@ func (s *Service) PutPolicy(ctx context.Context, p Policy) (Policy, error) {
 		p.ID = id.New()
 	}
 	p.CreatedAt = s.now().UTC()
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		return storage.PutJSON(tx, spacePolicies, []byte(p.ID), p)
 	})
 	return p, err
@@ -534,7 +534,7 @@ func (s *Service) GetPolicy(ctx context.Context, policyID string) (Policy, error
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		rec, err := storage.GetJSON[Policy](tx, spacePolicies, []byte(policyID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return coerr.E(404, "NoSuchPolicy", "policy %q does not exist", policyID)
@@ -554,7 +554,7 @@ func (s *Service) ListPolicies(ctx context.Context) ([]Policy, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		return storage.ScanJSON[Policy](tx, spacePolicies, nil, func(_ []byte, p Policy) error {
 			out = append(out, p)
 			return nil
@@ -565,7 +565,7 @@ func (s *Service) ListPolicies(ctx context.Context) ([]Policy, error) {
 
 // DeletePolicy removes an IAM policy.
 func (s *Service) DeletePolicy(ctx context.Context, policyID string) error {
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		if !tx.Has(spacePolicies, []byte(policyID)) {
 			return coerr.E(404, "NoSuchPolicy", "policy %q does not exist", policyID)
 		}
@@ -622,7 +622,7 @@ func (s *Service) PutBucketPolicy(ctx context.Context, bucket string, p Policy) 
 		p.ID = id.New()
 	}
 	p.CreatedAt = s.now().UTC()
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		return storage.PutJSON(tx, spaceBucketPolicy, []byte(bucket), p)
 	})
 	return p, err
@@ -634,7 +634,7 @@ func (s *Service) GetBucketPolicy(ctx context.Context, bucket string) (*Policy, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		rec, err := storage.GetJSON[Policy](tx, spaceBucketPolicy, []byte(bucket))
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil
@@ -650,7 +650,7 @@ func (s *Service) GetBucketPolicy(ctx context.Context, bucket string) (*Policy, 
 
 // DeleteBucketPolicy removes a bucket policy.
 func (s *Service) DeleteBucketPolicy(ctx context.Context, bucket string) error {
-	return s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	return s.db.Update(ctx, func(tx storage.Writer) error {
 		if !tx.Has(spaceBucketPolicy, []byte(bucket)) {
 			return ErrNoBucketPolicy
 		}

@@ -25,12 +25,12 @@ var (
 
 // Migrate brings the store up to SchemaVersion. It is idempotent and safe to run
 // on every boot, before any other component touches the store.
-func Migrate(ctx context.Context, db *DB) error {
+func Migrate(ctx context.Context, db Store) error {
 	if db == nil {
 		return fmt.Errorf("storage: nil db")
 	}
 	var current int
-	err := db.View(ctx, func(tx *ReadTx) error {
+	err := db.View(ctx, func(tx Reader) error {
 		raw, err := tx.Get(metaSpace, schemaVersionKey)
 		if err == ErrNotFound {
 			return nil
@@ -52,7 +52,7 @@ func Migrate(ctx context.Context, db *DB) error {
 		if !ok {
 			return fmt.Errorf("storage: no migration for schema version %d", v)
 		}
-		if err := db.Update(ctx, func(tx *WriteTx) error {
+		if err := db.Update(ctx, func(tx Writer) error {
 			if err := migrate(ctx, tx); err != nil {
 				return err
 			}
@@ -66,9 +66,9 @@ func Migrate(ctx context.Context, db *DB) error {
 
 // SchemaVersionOf returns the schema version recorded in the store (0 if the
 // store has never been migrated).
-func SchemaVersionOf(ctx context.Context, db *DB) (int, error) {
+func SchemaVersionOf(ctx context.Context, db Store) (int, error) {
 	var v int
-	err := db.View(ctx, func(tx *ReadTx) error {
+	err := db.View(ctx, func(tx Reader) error {
 		raw, err := tx.Get(metaSpace, schemaVersionKey)
 		if err == ErrNotFound {
 			return nil
@@ -87,6 +87,6 @@ func SchemaVersionOf(ctx context.Context, db *DB) (int, error) {
 // v1 is the initial layout: the relational tables live in docs/schema.sql; the
 // embedded engine's key spaces are documented there too and are created
 // lazily, so v1 has no work beyond recording the version.
-var migrations = map[int]func(context.Context, *WriteTx) error{
-	1: func(ctx context.Context, tx *WriteTx) error { return nil },
+var migrations = map[int]func(context.Context, Writer) error{
+	1: func(ctx context.Context, tx Writer) error { return nil },
 }

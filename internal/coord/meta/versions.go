@@ -33,7 +33,7 @@ func (s *Service) ListVersions(ctx context.Context, bucketID contract.BucketID) 
 		return nil, err
 	}
 	var out []VersionInfo
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		latest := make(map[string]uint64)
 		if err := storage.ScanJSON[latestRecord](tx, spaceLatest, bucketPrefix(bucketID), func(_ []byte, rec latestRecord) error {
 			latest[rec.Key] = rec.Seq
@@ -79,7 +79,7 @@ func (s *Service) ExpireVersion(ctx context.Context, bucketID contract.BucketID,
 		return false, coerr.Invalidf("bucket_id, key and version_id are required")
 	}
 	var expired bool
-	err := s.db.Update(ctx, func(tx *storage.WriteTx) error {
+	err := s.db.Update(ctx, func(tx storage.Writer) error {
 		rec, err := storage.GetJSON[versionRecord](tx, spaceVersionIDs, versionIDKey(bucketID, key, versionID))
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil

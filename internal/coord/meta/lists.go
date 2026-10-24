@@ -93,7 +93,7 @@ func (s *Service) resolveMarker(ctx context.Context, bucketID contract.BucketID,
 		return cur, nil
 	}
 	var seq uint64
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		rec, err := storage.GetJSON[versionRecord](tx, spaceVersionIDs, versionIDKey(bucketID, keyMarker, versionIDMarker))
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil
@@ -257,7 +257,7 @@ func (s *Service) collectLatest(ctx context.Context, req contract.ListRequest) (
 	var out []candidate
 	seenPrefix := make(map[string]bool)
 	scanPrefix := append(bucketPrefix(req.BucketID), req.Prefix...)
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		return storage.ScanJSON[latestRecord](tx, spaceLatest, scanPrefix, func(k []byte, rec latestRecord) error {
 			key := strings.TrimSuffix(string(k[len(bucketPrefix(req.BucketID)):]), "\x00")
 			if !strings.HasPrefix(key, req.Prefix) {
@@ -302,7 +302,7 @@ func (s *Service) collectVersions(ctx context.Context, req contract.ListRequest)
 	latestByKey := make(map[string]uint64)
 	base := bucketPrefix(req.BucketID)
 	scanPrefix := append(append([]byte(nil), base...), req.Prefix...)
-	err := s.db.View(ctx, func(tx *storage.ReadTx) error {
+	err := s.db.View(ctx, func(tx storage.Reader) error {
 		if err := storage.ScanJSON[latestRecord](tx, spaceLatest, base, func(_ []byte, rec latestRecord) error {
 			latestByKey[rec.Key] = rec.Seq
 			return nil

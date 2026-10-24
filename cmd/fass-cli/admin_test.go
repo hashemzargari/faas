@@ -229,13 +229,14 @@ func TestRepairStatusFromCoordinator(t *testing.T) {
 			writeJSONForTest(w, snap)
 		case "/v1/repair/status":
 			writeJSONForTest(w, map[string]any{
-				"pending":                 3,
-				"running":                 1,
-				"failed":                  2,
-				"oldest_pending_age":      45.0,
-				"bytes_repaired_last_24h": 3 << 20,
-				"throttled":               true,
-				"future_field":            "kept",
+				"queue":                      map[string]any{"pending": 3, "running": 1, "failed": 2},
+				"oldest_pending_age_seconds": 45,
+				"bytes_repaired_last_24h":    3 << 20,
+				"throttled":                  true,
+				"per_site_budget_mbps":       200,
+				"last_error":                 "shard fetch timeout: agent 3f2a",
+				"shardsets":                  map[string]any{"below_threshold": 17, "below_repair_watermark": 3, "unrecoverable": 0},
+				"future_field":               "kept",
 			})
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -252,8 +253,9 @@ func TestRepairStatusFromCoordinator(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatalf("invalid JSON: %v\n%s", err, out)
 	}
-	if got["pending"] != 3.0 || got["running"] != 1.0 || got["failed"] != 2.0 {
-		t.Fatalf("queue counters = %v", got)
+	queue, ok := got["queue"].(map[string]any)
+	if !ok || queue["pending"] != 3.0 || queue["running"] != 1.0 || queue["failed"] != 2.0 {
+		t.Fatalf("queue = %v", got["queue"])
 	}
 	if got["throttled"] != true || got["future_field"] != "kept" {
 		t.Fatalf("fields dropped: %v", got)
@@ -263,10 +265,73 @@ func TestRepairStatusFromCoordinator(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("human exit %d", code)
 	}
-	for _, want := range []string{"source: coordinator /v1/repair/status", "oldest_pending_age", "3.0 MiB", "throttled", "yes"} {
+	for _, want := range []string{
+		"source: coordinator /v1/repair/status",
+		"queue pending", "3",
+		"queue running", "1",
+		"queue failed", "2",
+		"queue backlog (pending+running)", "4",
+		"oldest_pending_age_seconds", "45s",
+		"3.0 MiB",
+		"throttled", "yes",
+		"shardsets.below_threshold", "17",
+		"shardsets.unrecoverable", "0",
+		"future_field",
+	} {
 		if !strings.Contains(human, want) {
 			t.Errorf("human repair status missing %q:\n%s", want, human)
 		}
+	}
+	if strings.Contains(human, "DATA LOSS") {
+		t.Errorf("unexpected data-loss warning when unrecoverable=0:\n%s", human)
+	}
+}
+
+func TestRepairStatusNullsAndUnrecoverable(t *testing.T) {
+	coord := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/topology":
+			writeJSONForTest(w, devTopology())
+		case "/v1/repair/status":
+			// Fresh coordinator: several fields are honestly unknown (null).
+			fmt.Fprint(w, `{"queue":{"pending":0,"running":0,"failed":0},`+
+				`"oldest_pending_age_seconds":null,"bytes_repaired_last_24h":0,`+
+				`"throttled":null,"per_site_budget_mbps":200,"last_error":null,`+
+				`"shardsets":{"below_threshold":0,"below_repair_watermark":0,"unrecoverable":2}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer coord.Close()
+	adminEnv(t, coord.URL)
+
+	human, _, code := runCLI(t, "repair", "status")
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	// null must render as unknown/- — never as 0 or "no".
+	line := func(prefix string) string {
+		for _, l := range strings.Split(human, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(l), prefix) {
+				return l
+			}
+		}
+		return ""
+	}
+	if l := line("throttled"); !strings.Contains(l, "unknown") {
+		t.Errorf("null throttled should render as unknown, got %q:\n%s", l, human)
+	}
+	if l := line("throttled"); strings.Contains(l, " no") {
+		t.Errorf("null throttled must not render as 'no', got %q", l)
+	}
+	if l := line("oldest_pending_age_seconds"); !strings.Contains(l, "unknown") {
+		t.Errorf("null oldest_pending_age_seconds should render as unknown, got %q", l)
+	}
+	if l := line("last_error"); l == "" || !strings.HasSuffix(strings.TrimSpace(l), "-") {
+		t.Errorf("null last_error should render as '-', got %q", l)
+	}
+	if !strings.Contains(human, "DATA LOSS") || !strings.Contains(human, "2 shard set(s)") {
+		t.Errorf("unrecoverable shard sets must be surfaced prominently:\n%s", human)
 	}
 }
 
