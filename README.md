@@ -144,6 +144,7 @@ Measured on a single shared dev box — **order-of-magnitude evidence, not capac
 
 | Doc | Contents |
 |---|---|
+| [OMM Architecture Scan](.omm/overall-architecture/diagram.mmd) | Interactive, recursive architecture map (viewable via `omm view`) |
 | [01 — Reverse-engineering Cubbit](docs/01-reverse-engineering.md) | Design input: an evidence-based reading of publicly documented third-party architecture, with sources and explicit INFERRED markers |
 | [02 — Architecture](docs/02-architecture.md) | Control vs data plane, flows, consistency, failure domains, ADRs |
 | [03 — Data plane](docs/03-data-plane.md) | Chunking, two-tier Reed–Solomon, key hierarchy, placement, repair, durability math |
