@@ -1,0 +1,11 @@
+graph LR
+    transport["Transport/Server\ninternal/agent/transport/"]
+    store["Store/Disk\ninternal/agent/store/"]
+    repair["Repair\ninternal/agent/repair/"]
+    scrub["Scrub\ninternal/agent/scrub/"]
+    shard["Shard Management\ninternal/agent/shard/"]
+
+    transport --> store
+    repair --> store
+    scrub --> store
+    store --> shard

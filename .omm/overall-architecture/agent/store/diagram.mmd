@@ -1,0 +1,9 @@
+graph TD
+    index["Index\ninternal/agent/store/index.go"]
+    disk["Disk I/O\ninternal/agent/store/disk_linux.go"]
+    state["State\ninternal/agent/store/state.go"]
+    header["Header\ninternal/agent/store/header.go"]
+
+    index --> disk
+    state --> disk
+    header --> disk

@@ -1,0 +1,10 @@
+created: 2026-10-25T10:17:34.963Z
+updated: 2026-10-25T10:17:34.963Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: header
+children: []
+parentPath:
+  - agent
+  - store

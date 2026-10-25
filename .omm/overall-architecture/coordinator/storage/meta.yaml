@@ -1,0 +1,9 @@
+created: 2026-10-25T10:13:05.238Z
+updated: 2026-10-25T10:13:05.238Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: storage
+children: []
+parentPath:
+  - coordinator

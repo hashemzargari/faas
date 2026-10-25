@@ -1,0 +1,11 @@
+graph LR
+    s3-api["S3 API\ninternal/gateway/s3/"]
+    sigv4["SigV4 Auth\ninternal/gateway/sigv4/"]
+    offloader["Offloader\ninternal/gateway/offloader/"]
+    coord-client["Coord Client\ninternal/gateway/coordclient/"]
+    sdp["Smart Data Placement\ninternal/gateway/sdp/"]
+
+    s3-api --> sigv4
+    s3-api --> offloader
+    s3-api --> coord-client
+    offloader --> sdp

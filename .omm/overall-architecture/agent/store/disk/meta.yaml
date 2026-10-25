@@ -1,0 +1,10 @@
+created: 2026-10-25T10:17:31.664Z
+updated: 2026-10-25T10:17:31.664Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: disk
+children: []
+parentPath:
+  - agent
+  - store

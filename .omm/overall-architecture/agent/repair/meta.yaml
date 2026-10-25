@@ -1,0 +1,9 @@
+created: 2026-10-25T10:13:09.471Z
+updated: 2026-10-25T10:13:09.471Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: repair
+children: []
+parentPath:
+  - agent

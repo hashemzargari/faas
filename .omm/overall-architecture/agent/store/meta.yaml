@@ -1,0 +1,13 @@
+created: 2026-10-25T10:13:08.065Z
+updated: 2026-10-25T10:17:28.831Z
+update_count: 2
+last_field: diagram
+kind: nested-class
+title: store
+children:
+  - disk
+  - header
+  - index
+  - state
+parentPath:
+  - agent

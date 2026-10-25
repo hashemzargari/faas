@@ -1,0 +1,13 @@
+created: 2026-10-25T10:12:37.579Z
+updated: 2026-10-25T10:12:39.539Z
+update_count: 2
+last_field: diagram
+kind: nested-class
+title: gateway
+children:
+  - coord-client
+  - offloader
+  - s3-api
+  - sdp
+  - sigv4
+parentPath: []

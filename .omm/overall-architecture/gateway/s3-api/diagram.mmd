@@ -1,0 +1,9 @@
+graph TD
+    handlers["Handlers\ninternal/gateway/s3/handlers_*.go"]
+    ops["Operations\ninternal/gateway/s3/operations.go"]
+    xml["XML Parsing\ninternal/gateway/s3/xml.go"]
+    helpers["Helpers\ninternal/gateway/s3/helpers.go"]
+
+    handlers --> ops
+    handlers --> xml
+    ops --> helpers

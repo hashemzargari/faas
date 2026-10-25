@@ -1,0 +1,9 @@
+created: 2026-10-25T10:12:52.685Z
+updated: 2026-10-25T10:12:52.686Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: sigv4
+children: []
+parentPath:
+  - gateway

@@ -1,0 +1,13 @@
+graph LR
+    api["API\ninternal/coord/api/"]
+    meta["Metadata\ninternal/coord/meta/"]
+    placement["Placement\ninternal/coord/placement/"]
+    membership["Membership\ninternal/coord/membership/"]
+    recovery["Recovery\ninternal/coord/recovery/"]
+    storage["Postgres Storage\ninternal/storage/postgres/"]
+
+    api --> meta
+    api --> placement
+    meta --> storage
+    placement --> membership
+    recovery --> meta

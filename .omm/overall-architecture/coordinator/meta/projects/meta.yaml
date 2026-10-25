@@ -1,0 +1,10 @@
+created: 2026-10-25T10:17:24.374Z
+updated: 2026-10-25T10:17:24.375Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: projects
+children: []
+parentPath:
+  - coordinator
+  - meta

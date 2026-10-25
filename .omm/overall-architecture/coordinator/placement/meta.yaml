@@ -1,0 +1,9 @@
+created: 2026-10-25T10:13:01.201Z
+updated: 2026-10-25T10:13:01.202Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: placement
+children: []
+parentPath:
+  - coordinator

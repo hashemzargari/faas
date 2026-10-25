@@ -1,0 +1,9 @@
+created: 2026-10-25T10:12:54.120Z
+updated: 2026-10-25T10:12:54.120Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: offloader
+children: []
+parentPath:
+  - gateway

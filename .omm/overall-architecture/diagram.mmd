@@ -1,0 +1,14 @@
+graph LR
+    gateway["Gateway\ninternal/gateway/"]
+    coordinator["Coordinator\ninternal/coord/"]
+    agent["Agent\ninternal/agent/"]
+    bridge["Bridge\ninternal/bridge/"]
+    console["Console\ninternal/console/"]
+    storage["Storage\ninternal/storage/"]
+
+    gateway -->|"S3 API"| coordinator
+    gateway -->|"Forward Data"| agent
+    coordinator -->|"Control Plane"| agent
+    bridge -->|"External S3"| gateway
+    console -->|"Admin API"| coordinator
+    coordinator -->|"Persist Meta"| storage

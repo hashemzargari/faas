@@ -1,0 +1,12 @@
+created: 2026-10-25T10:12:50.722Z
+updated: 2026-10-25T10:17:14.890Z
+update_count: 2
+last_field: diagram
+kind: nested-class
+title: s3-api
+children:
+  - handlers
+  - ops
+  - xml
+parentPath:
+  - gateway

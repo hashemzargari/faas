@@ -1,0 +1,9 @@
+created: 2026-10-25T10:13:06.712Z
+updated: 2026-10-25T10:13:06.712Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: transport
+children: []
+parentPath:
+  - agent

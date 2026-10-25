@@ -1,0 +1,10 @@
+created: 2026-10-25T10:17:18.036Z
+updated: 2026-10-25T10:17:18.036Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: ops
+children: []
+parentPath:
+  - gateway
+  - s3-api

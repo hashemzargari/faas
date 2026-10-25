@@ -1,0 +1,10 @@
+graph TD
+    objects["Object Manifests\ninternal/coord/meta/objects.go"]
+    projects["Project Management\ninternal/coord/meta/projects.go"]
+    parity["Parity Sets\ninternal/coord/meta/parity/"]
+    versions["Versioning\ninternal/coord/meta/versions.go"]
+    subres["Subresources\ninternal/coord/meta/subresources.go"]
+
+    objects --> parity
+    objects --> versions
+    projects --> objects

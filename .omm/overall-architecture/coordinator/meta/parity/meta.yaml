@@ -1,0 +1,10 @@
+created: 2026-10-25T10:17:25.877Z
+updated: 2026-10-25T10:17:25.877Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: parity
+children: []
+parentPath:
+  - coordinator
+  - meta

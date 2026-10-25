@@ -1,0 +1,13 @@
+created: 2026-10-25T10:12:34.138Z
+updated: 2026-10-25T10:12:35.796Z
+update_count: 2
+last_field: description
+git_commit: 1c93e83
+git_branch: main
+children:
+  - agent
+  - bridge
+  - console
+  - coordinator
+  - gateway
+  - storage
